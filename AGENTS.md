@@ -4,7 +4,7 @@
 
 `ave-whisper-api`는 AVE 프로젝트의 STT API 모듈이다.
 
-`faster-whisper`를 사용해 음성을 텍스트로 변환하며, RunPod, Vast.ai, Modal 등 다양한 GPU 백엔드 환경에서 실행할 수 있도록 구성한다.
+`faster-whisper`를 사용해 음성을 텍스트로 변환하며, 다양한 GPU 백엔드 환경에서 실행할 수 있도록 구성한다.
 
 ## 기본 원칙
 

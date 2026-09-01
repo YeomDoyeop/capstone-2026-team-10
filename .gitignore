@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Type checkers and linters
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Downloaded model and local processing files
+models/
+hf-cache/
+tmp/
+*.audio
+*.wav
+
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
