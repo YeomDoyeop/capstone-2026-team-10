@@ -1,5 +1,4 @@
 @echo off
-chcp 65001 >nul
 setlocal
 
 title AVE Workspace Setup
@@ -14,13 +13,13 @@ echo.
 
 where git >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] Git이 설치되어 있지 않거나 PATH에 등록되어 있지 않습니다.
+    echo [ERROR] Git is not installed or is not available in PATH.
     echo.
     goto :end
 )
 
 if not exist "%MODULES_DIR%" (
-    echo [CREATE] modules 디렉토리를 생성합니다.
+    echo [CREATE] Creating the modules directory.
     mkdir "%MODULES_DIR%"
 )
 
@@ -37,12 +36,12 @@ set REPO_URL=%~2
 set DEST=%MODULES_DIR%\%REPO_NAME%
 
 if exist "%DEST%\.git" (
-    echo [SKIP] %REPO_NAME% 저장소가 이미 존재합니다.
+    echo [SKIP] The %REPO_NAME% repository already exists.
     exit /b 0
 )
 
 if exist "%DEST%" (
-    echo [SKIP] %DEST% 디렉토리가 이미 존재합니다.
+    echo [SKIP] The %DEST% directory already exists.
     exit /b 0
 )
 
