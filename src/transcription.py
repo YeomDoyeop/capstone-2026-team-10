@@ -7,6 +7,7 @@ from faster_whisper import WhisperModel
 
 from .input_audio import AudioDownloadError, apply_speed, download_audio
 from .request import RequestValidationError, parse_request
+from .timestamps import restore_original_timestamps
 
 
 MODEL_NAME = "large-v3"
@@ -46,10 +47,11 @@ def transcribe(value: Any) -> dict[str, Any]:
                 {"start": round(segment.start, 3), "end": round(segment.end, 3), "text": segment.text.strip()}
                 for segment in segments
             ]
+            result_segments, duration = restore_original_timestamps(result_segments, info.duration, request.speed)
             return {
                 "text": "".join(segment["text"] for segment in result_segments).strip(),
                 "language": info.language,
-                "duration": round(info.duration, 3),
+                "duration": duration,
                 "segments": result_segments,
             }
     except (RequestValidationError, AudioDownloadError) as error:
