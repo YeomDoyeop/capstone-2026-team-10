@@ -14,8 +14,8 @@ class AudioDownloadError(ValueError):
 
 def download_audio(audio_url: str, directory: Path) -> Path:
     current_url = audio_url
-    timeout = int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "60"))
-    maximum_bytes = int(os.environ.get("MAX_DOWNLOAD_BYTES", str(512 * 1024 * 1024)))
+    timeout = int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "600"))
+    maximum_bytes = int(os.environ.get("MAX_DOWNLOAD_BYTES", str(1024 * 1024 * 1024)))
 
     for _ in range(4):
         _validate_public_https_url(current_url)
