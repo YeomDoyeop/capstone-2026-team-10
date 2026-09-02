@@ -42,4 +42,8 @@ modules/
 
 ## 워크스페이스 구성
 
-새로운 개발 환경에서는 워크스페이스 구성 스크립트를 사용하여 필요한 모듈 저장소를 `modules/` 아래에 가져오는 것을 기본 방식으로 한다.
+새 개발 환경에서는 루트의 `setup.bat`를 실행해 필요한 모듈 저장소를 `modules/` 아래로 내려받을 수 있다. 스크립트는 이미 존재하는 모듈 디렉터리를 건너뛴다.
+
+## 현재 기준 안내
+
+프로젝트 전체 처리 흐름과 저장 원칙은 [SYSTEM_GUIDELINES.md](SYSTEM_GUIDELINES.md)를, 모듈의 현재 책임과 데이터 경계는 [CURRENT_ARCHITECTURE.md](CURRENT_ARCHITECTURE.md)를 따른다. `setup.bat`는 저장소를 준비하는 용도이며, 클라이언트 프로그램의 실행 진입점은 아니다.
