@@ -1,0 +1,38 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      AVE_PUBLIC_BASE_URL: https://${AVE_DOMAIN:?AVE_DOMAIN 값을 설정하세요.}
+      STT_FILES_DIR: /srv/ave-stt/files
+    volumes:
+      - ${STT_FILES_DIR:?STT_FILES_DIR 값을 설정하세요.}:/srv/ave-stt/files
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      AVE_DOMAIN: ${AVE_DOMAIN:?AVE_DOMAIN 값을 설정하세요.}
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    volumes:
+      - ${STT_FILES_DIR:?STT_FILES_DIR 값을 설정하세요.}:/srv/ave-stt/files:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+
+volumes:
+  caddy_data:
+  caddy_config:

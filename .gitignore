@@ -1,0 +1,27 @@
+# Python 실행 환경과 테스트 산출물
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 배포 환경별 비밀 값과 런타임 파일
+.env
+.env.*
+!.env.example
+deploy/stt-files/
+*.log
+
+# IDE와 운영체제 파일
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

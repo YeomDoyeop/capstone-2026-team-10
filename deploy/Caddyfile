@@ -1,0 +1,18 @@
+{$AVE_DOMAIN} {
+    encode zstd gzip
+
+    handle_path /files/* {
+        root * /srv/ave-stt/files
+        file_server
+        header {
+            X-Content-Type-Options "nosniff"
+            X-Frame-Options "DENY"
+            Referrer-Policy "no-referrer"
+            Cache-Control "no-store"
+        }
+    }
+
+    handle {
+        reverse_proxy api:8000
+    }
+}
