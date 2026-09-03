@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-JobStatus = Literal["queued", "collecting", "analyzing", "rendering", "completed", "failed"]
+JobStatus = Literal["queued", "collecting", "analyzing", "rendering", "completed", "failed", "cancelled"]
 
 
 class AuthUserResponse(BaseModel):
@@ -21,7 +21,7 @@ class AuthConfigResponse(BaseModel):
 
 
 class AnalysisJobCreateRequest(BaseModel):
-    client_job_id: str = Field(min_length=1, max_length=100)
+    client_job_id: str | None = Field(default=None, min_length=1, max_length=100)
     source_id: str = Field(min_length=1, max_length=200)
     source_url: str | None = Field(default=None, max_length=2_000)
     title: str | None = Field(default=None, max_length=1_000)
@@ -74,6 +74,21 @@ class RemoteTranscriptionRequest(BaseModel):
     initial_prompt: str | None = Field(default=None, max_length=1_000)
     hotwords: str | None = Field(default=None, max_length=1_000)
     speed: float = Field(default=1.0, ge=1.0, le=4.0)
+    track_progress: bool = False
+    client_job_id: str | None = Field(default=None, min_length=1, max_length=100)
+    server_job_id: str | None = Field(default=None, max_length=100)
+
+
+class RemoteTranscriptionStartResponse(BaseModel):
+    job_id: str
+    status: str
+    progress: int
+    message: str
+    lease_expires_at: str | None = None
+
+
+class RemoteTranscriptionStatusResponse(RemoteTranscriptionStartResponse):
+    result: dict[str, Any] | None = None
 
 
 class LLMGenerateRequest(BaseModel):

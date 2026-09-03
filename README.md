@@ -26,9 +26,12 @@ API 세부 계약과 DB 스키마는 `docs/`에서 관리한다.
 * `PATCH /api/analysis-jobs/{job_id}`: 로컬 수집·분석·렌더링 상태 기록
 * `PUT /api/analysis-jobs/{job_id}/result`: 구간별 스크립트 중요도, 채팅 밀도, 댓글 타임스탬프 집계, 히트맵, 음향 분석값, 추천·선택 이력 저장
 * `POST /api/llm/generate`: Gemini 또는 DeepSeek API 호출
-* `POST /api/stt-files`, `POST /api/stt/transcriptions`: 임시 MP3 업로드와 원격 Whisper 전사
+* `POST /api/stt-files`, `POST /api/stt/transcriptions`: 임시 MP3 업로드와 lease 기반 원격 Whisper 전사
+* `POST /api/stt/transcriptions/{job_id}/heartbeat`, `POST /api/stt/transcriptions/{job_id}/cancel`: heartbeat와 취소 전파
 
 원본·렌더링 영상과 클라이언트 로컬 경로는 이 API로 전송하지 않는다. Whisper용 MP3는 전사 요청이 끝나면 서버가 삭제한다.
+
+Whisper 작업은 `transcription_jobs` 테이블에 영속 저장한다. 로컬 클라이언트 heartbeat가 `TRANSCRIPTION_LEASE_SECONDS`(기본 60초) 동안 끊기면 서버가 RunPod 작업을 취소하고 임시 MP3를 정리한다. `TRANSCRIPTION_LEASE_SWEEP_SECONDS`(기본 15초)는 만료 정리 주기다. 배포 전에 갱신된 `docs/supabase_schema.sql`을 적용해야 한다.
 
 ## Ubuntu VM 배포
 

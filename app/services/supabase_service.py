@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
@@ -63,3 +64,24 @@ def get_result(user_id: str, job_id: str) -> dict[str, Any] | None:
         return None
     response = get_service_client().table("analysis_results").select("*").eq("job_id", job_id).execute()
     return response.data[0] if response.data else None
+
+
+def create_transcription_job(user_id: str, values: dict[str, Any]) -> dict[str, Any]:
+    response = get_service_client().table("transcription_jobs").insert({"user_id": user_id, **values}).execute()
+    return response.data[0]
+
+
+def get_transcription_job(user_id: str, runpod_job_id: str) -> dict[str, Any] | None:
+    response = get_service_client().table("transcription_jobs").select("*").eq("runpod_job_id", runpod_job_id).eq("user_id", user_id).execute()
+    return response.data[0] if response.data else None
+
+
+def update_transcription_job(user_id: str, runpod_job_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
+    updated_values = {**values, "updated_at": datetime.now(timezone.utc).isoformat()}
+    response = get_service_client().table("transcription_jobs").update(updated_values).eq("runpod_job_id", runpod_job_id).eq("user_id", user_id).execute()
+    return response.data[0] if response.data else None
+
+
+def get_expired_transcription_jobs(cutoff: str) -> list[dict[str, Any]]:
+    response = get_service_client().table("transcription_jobs").select("*").in_("status", ["queued", "in_progress", "cancel_requested"]).lt("lease_expires_at", cutoff).execute()
+    return response.data or []

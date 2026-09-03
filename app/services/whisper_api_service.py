@@ -18,6 +18,52 @@ class WhisperAPIError(RuntimeError):
     pass
 
 
+def _endpoint_and_headers() -> tuple[str, dict[str, str]]:
+    endpoint_id = get_whisper_runpod_endpoint_id()
+    api_key = get_runpod_api_key()
+    if not endpoint_id or not api_key:
+        raise WhisperAPIError("WHISPER_RUNPOD_ENDPOINT_ID와 RUNPOD_API_KEY를 서버 .env에 설정하세요.")
+    return f"https://api.runpod.ai/v2/{endpoint_id}", {"Authorization": f"Bearer {api_key}"}
+
+
+def start_transcription_with_whisper_api(
+    audio_url: str, *, language: str, initial_prompt: str | None, hotwords: str | None, speed: float
+) -> str:
+    endpoint, headers = _endpoint_and_headers()
+    payload = {"input": {"audio_url": audio_url, "language": language, "initial_prompt": initial_prompt, "hotwords": hotwords, "speed": speed}}
+    try:
+        response = requests.post(f"{endpoint}/run", json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        job_id = response.json().get("id")
+    except (requests.RequestException, ValueError, AttributeError) as exc:
+        raise WhisperAPIError("Whisper API 작업 요청에 실패했습니다.") from exc
+    if not isinstance(job_id, str) or not job_id:
+        raise WhisperAPIError("Whisper API가 작업 ID를 반환하지 않았습니다.")
+    return job_id
+
+
+def get_transcription_status(runpod_job_id: str) -> dict[str, Any]:
+    endpoint, headers = _endpoint_and_headers()
+    try:
+        response = requests.get(f"{endpoint}/status/{runpod_job_id}", headers=headers, timeout=30)
+        response.raise_for_status()
+        status = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise WhisperAPIError("Whisper API 작업 상태를 조회하지 못했습니다.") from exc
+    if not isinstance(status, dict):
+        raise WhisperAPIError("Whisper API 상태 응답이 올바르지 않습니다.")
+    return status
+
+
+def cancel_transcription(runpod_job_id: str) -> None:
+    endpoint, headers = _endpoint_and_headers()
+    try:
+        response = requests.post(f"{endpoint}/cancel/{runpod_job_id}", headers=headers, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise WhisperAPIError("Whisper API 작업 취소에 실패했습니다.") from exc
+
+
 def transcribe_with_whisper_api(audio_url: str, *, language: str, initial_prompt: str | None, hotwords: str | None, speed: float) -> dict[str, Any]:
     endpoint_id = get_whisper_runpod_endpoint_id()
     api_key = get_runpod_api_key()

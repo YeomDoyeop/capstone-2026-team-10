@@ -44,3 +44,11 @@ def get_runpod_api_key() -> str:
 
 def get_whisper_runpod_timeout_seconds() -> int:
     return int(os.getenv("WHISPER_RUNPOD_TIMEOUT_SECONDS", "3600"))
+
+
+def get_transcription_lease_seconds() -> int:
+    return int(os.getenv("TRANSCRIPTION_LEASE_SECONDS", "60"))
+
+
+def get_transcription_lease_sweep_seconds() -> int:
+    return int(os.getenv("TRANSCRIPTION_LEASE_SWEEP_SECONDS", "15"))

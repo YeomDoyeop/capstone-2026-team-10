@@ -30,7 +30,7 @@
 }
 ```
 
-상태 값은 `queued`, `collecting`, `analyzing`, `rendering`, `completed`, `failed`이다.
+상태 값은 `queued`, `collecting`, `analyzing`, `rendering`, `completed`, `failed`, `cancelled`이다. `cancelled`는 로컬 작업 취소가 서버 이력까지 확정됐을 때 사용한다.
 
 ## 분석 결과 저장
 
@@ -80,6 +80,12 @@
 
 ## 원격 Whisper 전사
 
-클라이언트는 `POST /api/stt-files`의 multipart `file` 필드에 FFmpeg로 추출한 MP3를 보낸다. 응답의 `file_id`를 `POST /api/stt/transcriptions`에 전달하면 서버가 RunPod의 `ave-whisper-api`를 호출한다.
+클라이언트는 `POST /api/stt-files`의 multipart `file` 필드에 FFmpeg로 추출한 MP3를 보낸다. 응답의 `file_id`를 `POST /api/stt/transcriptions`에 전달하면 서버가 RunPod의 `ave-whisper-api`를 호출한다. 진행도 조회를 사용하는 클라이언트는 `track_progress: true`와 로컬 작업 ID인 `client_job_id`(= `local_job_id`), 서버 분석 이력 ID인 `server_job_id`를 포함한다. 서버는 이 ID 연결, RunPod 작업 ID, 사용자, phase/status, 임시 파일 ID, heartbeat/lease·취소 시각을 `transcription_jobs`에 영속 저장한다.
+
+`GET /api/stt/transcriptions/{job_id}/events`는 `text/event-stream`으로 RunPod worker가 보고한 `progress`(0~100)와 상태 메시지를 `status` 이벤트로 전달한다. AVE Server는 이 스트림을 생성하는 동안 RunPod에는 REST 상태 조회를 사용한다. `GET /api/stt/transcriptions/{job_id}`는 진단·호환용 REST 상태 조회로 유지한다. 로컬 클라이언트는 `POST /api/stt/transcriptions/{job_id}/heartbeat`를 10초마다 호출해 lease를 연장한다. 서버는 `TRANSCRIPTION_LEASE_SECONDS`(기본 60초) 동안 heartbeat가 없으면 RunPod 작업을 취소하고 임시 MP3를 삭제한다. 만료 후 도착한 상태 조회·heartbeat는 lease를 다시 연장하지 않고 즉시 취소 정리를 시작하며, 별도 sweep도 `TRANSCRIPTION_LEASE_SWEEP_SECONDS`마다 같은 정리를 수행한다.
+
+`POST /api/stt/transcriptions/{job_id}/cancel`은 소유자가 명시적으로 작업을 취소하는 API다. 완료·실패·취소 작업에 대한 반복 호출도 현재 terminal 상태를 반환한다. 취소 요청은 RunPod `/cancel`로 전파된다. 전사 결과 `result`는 완료를 처음 감지한 `GET /api/stt/transcriptions/{job_id}` 응답에 포함된다.
+
+전사 작업 상태는 `queued → in_progress → completed|failed|cancelled`로 전이한다. 취소 요청 중 RunPod 응답을 기다리는 상태는 `cancel_requested`이며, 서버 재시작 뒤에도 `transcription_jobs`에서 이어서 정리한다.
 
 전사 요청 성공·실패와 무관하게 서버는 해당 임시 MP3를 삭제한다. `/files/` URL은 RunPod worker의 일시적 다운로드 용도이며, 클라이언트가 직접 SFTP로 접근하지 않는다.
