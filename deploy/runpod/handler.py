@@ -8,7 +8,10 @@ from src.transcription import transcribe
 
 
 def handler(job: dict[str, Any]) -> dict[str, Any]:
-    return transcribe(job.get("input"))
+    def report(progress: int, message: str) -> None:
+        runpod.serverless.progress_update(job, {"progress": progress, "message": message})
+
+    return transcribe(job.get("input"), progress_callback=report)
 
 
 if __name__ == "__main__":

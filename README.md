@@ -49,7 +49,9 @@ tests/               입력 및 오디오 처리 단위 테스트
 | --- | --- | --- |
 | `MODEL_CACHE_DIR` | `/models` | faster-whisper 모델 캐시 경로 |
 | `MAX_DOWNLOAD_BYTES` | `1073741824` | 입력 오디오 최대 다운로드 크기 (1 GiB) |
-| `DOWNLOAD_TIMEOUT_SECONDS` | `600` | URL 연결/다운로드 제한 시간 (10분) |
+| `DOWNLOAD_CONNECT_TIMEOUT_SECONDS` | `15` | URL 연결과 TLS 협상 제한 시간(초) |
+| `DOWNLOAD_READ_TIMEOUT_SECONDS` | `60` | 다운로드 중 새 데이터 수신 제한 시간(초) |
+| `DOWNLOAD_MAX_ATTEMPTS` | `3` | 네트워크 오류 발생 시 다운로드 재시도 횟수 |
 
 ## 테스트
 
@@ -168,7 +170,9 @@ Invoke-RestMethod `
   -Headers $headers
 ```
 
-응답의 `status`가 `COMPLETED`가 될 때까지 다시 조회합니다. 전사 결과는 `output`에 있습니다. 짧은 작업만 즉시 결과가 필요한 경우 `/run` 대신 `/runsync`를 사용할 수 있지만, 모델 기동 시간을 고려하면 일반 전사 요청에는 `/run`과 상태 조회 방식을 권장합니다.
+응답의 `status`가 `COMPLETED`가 될 때까지 다시 조회합니다. 전사 결과는 `output`에 있습니다. worker는 오디오 다운로드, 배속 적용, 전사 구간 처리 단계마다 RunPod progress update를 기록하므로 상태 응답의 `progress`에서 진행률과 메시지를 확인할 수 있습니다. 짧은 작업만 즉시 결과가 필요한 경우 `/run` 대신 `/runsync`를 사용할 수 있지만, 모델 기동 시간을 고려하면 일반 전사 요청에는 `/run`과 상태 조회 방식을 권장합니다.
+
+AVE Server는 사용자의 명시 취소 또는 heartbeat lease 만료 시 RunPod의 `POST /cancel/{job_id}`를 호출합니다. worker 내부의 동기 다운로드·전사 호출은 해당 호출 중간에 즉시 중단되지 않을 수 있으므로, 취소 후에는 RunPod 상태와 AVE Server의 최종 상태를 함께 확인해야 합니다.
 
 ### 6. 오류 확인 순서
 
