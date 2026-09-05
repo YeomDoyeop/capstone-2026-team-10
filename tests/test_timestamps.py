@@ -14,12 +14,13 @@ class RestoreOriginalTimestampsTest(unittest.TestCase):
         self.assertEqual(segments, [{"start": 2.468, "end": 4.69, "text": "테스트"}])
         self.assertEqual(duration, 6.912)
 
-    def test_keeps_values_when_speed_is_one(self) -> None:
-        source_segments = [{"start": 1.0, "end": 2.0, "text": "테스트"}]
+    def test_normalizes_key_order_when_speed_is_one(self) -> None:
+        source_segments = [{"end": 2.0, "text": "테스트", "start": 1.0}]
 
         segments, duration = restore_original_timestamps(source_segments, 2.0, 1.0)
 
-        self.assertIs(segments, source_segments)
+        self.assertEqual(segments, [{"start": 1.0, "end": 2.0, "text": "테스트"}])
+        self.assertEqual(list(segments[0]), ["start", "end", "text"])
         self.assertEqual(duration, 2.0)
 
 
