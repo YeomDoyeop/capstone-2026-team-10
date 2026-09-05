@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-JobStatus = Literal["queued", "collecting", "analyzing", "rendering", "completed", "failed", "cancelled"]
+JobStatus = Literal["completed"]
 
 
 class AuthUserResponse(BaseModel):
@@ -26,14 +26,6 @@ class AnalysisJobCreateRequest(BaseModel):
     source_url: str | None = Field(default=None, max_length=2_000)
     title: str | None = Field(default=None, max_length=1_000)
     duration_ms: int | None = Field(default=None, ge=0)
-
-
-class AnalysisJobStatusRequest(BaseModel):
-    status: JobStatus
-    progress: int = Field(ge=0, le=100)
-    error_message: str | None = Field(default=None, max_length=4_000)
-
-
 class SegmentAnalysis(BaseModel):
     segment_index: int = Field(ge=0)
     start_ms: int = Field(ge=0)
@@ -92,7 +84,7 @@ class RemoteTranscriptionStatusResponse(RemoteTranscriptionStartResponse):
 
 
 class LLMGenerateRequest(BaseModel):
-    provider: Literal["gemini", "deepseek"] = "gemini"
+    provider: Literal["gemini", "deepseek"] = "deepseek"
     model: str | None = Field(default=None, max_length=200)
     system: str = Field(min_length=1, max_length=100_000)
     prompt: str = Field(min_length=1, max_length=2_000_000)

@@ -9,7 +9,9 @@ import requests
 
 
 class LLMGatewayError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, unavailable: bool = False):
+        super().__init__(message)
+        self.unavailable = unavailable
 
 
 def generate_json(provider: str, system: str, prompt: str, *, model: str | None, response_schema: dict[str, Any] | None) -> str:
@@ -28,6 +30,16 @@ def generate_json(provider: str, system: str, prompt: str, *, model: str | None,
         response = requests.post("https://api.deepseek.com/chat/completions", headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json={"model": selected_model, "messages": [{"role": "system", "content": system + "\n설명이나 코드펜스 없이 유효한 JSON만 반환하세요."}, {"role": "user", "content": prompt}], "temperature": 0.15, "response_format": {"type": "json_object"}, "max_tokens": 8192, "stream": False}, timeout=120)
     else:
         raise LLMGatewayError("지원하지 않는 LLM 공급자입니다.")
+    if response.status_code == 429:
+        raise LLMGatewayError(
+            f"{provider.upper()} API 요청 한도에 도달했습니다(HTTP 429). 무료 사용량 한도를 확인한 뒤 잠시 후 다시 시도하세요.",
+            unavailable=True,
+        )
+    if response.status_code == 503:
+        raise LLMGatewayError(
+            f"{provider.upper()} API를 현재 사용할 수 없습니다(HTTP 503). 무료 사용량 한도 또는 공급자 일시 장애일 수 있습니다.",
+            unavailable=True,
+        )
     try:
         response.raise_for_status()
         return response.json()["candidates"][0]["content"]["parts"][0]["text"] if provider == "gemini" else response.json()["choices"][0]["message"]["content"]

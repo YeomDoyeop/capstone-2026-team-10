@@ -17,7 +17,6 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.schemas import (
     AnalysisJobCreateRequest,
     AnalysisJobResponse,
-    AnalysisJobStatusRequest,
     AnalysisResultRequest,
     AuthConfigResponse,
     AuthUserResponse,
@@ -27,18 +26,24 @@ from app.schemas import (
     RemoteTranscriptionStatusResponse,
     TemporaryAudioResponse,
 )
-from app.config import get_public_base_url, get_stt_file_max_bytes, get_stt_files_dir, get_supabase_anon_key, get_supabase_url, get_transcription_lease_seconds, get_transcription_lease_sweep_seconds
+from app.config import get_public_base_url, get_stt_file_max_bytes, get_stt_files_dir, get_supabase_anon_key, get_supabase_url, get_transcription_lease_seconds, get_transcription_lease_sweep_seconds, get_transcription_result_ttl_seconds
 from app.services.supabase_service import (
     create_transcription_job,
+    clear_transcription_cancel_request,
+    clear_expired_transcription_cancel_requests,
     create_job,
     get_expired_transcription_jobs,
+    get_expired_transcription_results,
     get_auth_client,
     get_job,
     get_result,
     get_transcription_job,
+    get_active_transcription_job_by_client_id,
+    is_transcription_cancel_requested,
+    request_transcription_cancel,
+    delete_transcription_job,
     is_auth_configured,
     is_storage_configured,
-    update_job,
     update_transcription_job,
     upsert_result,
 )
@@ -63,6 +68,22 @@ app = FastAPI(title="AVE 서버 API", lifespan=lifespan)
 auth_scheme = HTTPBearer(auto_error=False)
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 logger = logging.getLogger(__name__)
+TRANSCRIPTION_CANCEL_REQUEST_TTL_SECONDS = 600
+
+
+def _normalized_transcript(output: dict) -> dict:
+    segments = output.get("segments")
+    if not isinstance(segments, list):
+        raise ValueError("segments가 없습니다.")
+    normalized = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            raise ValueError("segment 형식이 올바르지 않습니다.")
+        start, end, text = segment.get("start"), segment.get("end"), segment.get("text")
+        if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, (int, float)) or not isinstance(end, (int, float)) or not isinstance(text, str) or end < start:
+            raise ValueError("segment 값이 올바르지 않습니다.")
+        normalized.append({"start": round(float(start), 3), "end": round(float(end), 3), "text": text})
+    return {**output, "segments": normalized}
 
 
 def _user_value(user: object, key: str):
@@ -118,7 +139,7 @@ async def generate_llm_response(request: LLMGenerateRequest, user=Depends(get_cu
     try:
         text = await asyncio.to_thread(generate_json, request.provider, request.system, request.prompt, model=request.model, response_schema=request.response_schema)
     except LLMGatewayError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=503 if exc.unavailable else 502, detail=str(exc)) from exc
     return {"text": text}
 
 
@@ -153,6 +174,14 @@ def _lease_values() -> dict[str, str]:
         "last_heartbeat_at": now.isoformat(),
         "lease_expires_at": (now + timedelta(seconds=get_transcription_lease_seconds())).isoformat(),
     }
+
+
+def _cancel_request_expires_at() -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=TRANSCRIPTION_CANCEL_REQUEST_TTL_SECONDS)).isoformat()
+
+
+async def _delete_transient_transcription(job: dict) -> None:
+    await asyncio.to_thread(delete_transcription_job, str(job["user_id"]), str(job["runpod_job_id"]))
 
 
 def _lease_has_expired(job: dict) -> bool:
@@ -218,7 +247,13 @@ async def _sweep_expired_transcriptions() -> None:
     try:
         expired = await asyncio.to_thread(get_expired_transcription_jobs, datetime.now(timezone.utc).isoformat())
         for job in expired:
-            await _cancel_persisted_transcription(job, "클라이언트 heartbeat가 만료되어 Whisper 작업을 취소했습니다.")
+            job = await _cancel_persisted_transcription(job, "클라이언트 heartbeat가 만료되어 Whisper 작업을 취소했습니다.")
+            if job.get("status") in {"cancelled", "failed"}:
+                await _delete_transient_transcription(job)
+        result_expired = await asyncio.to_thread(get_expired_transcription_results, datetime.now(timezone.utc).isoformat())
+        for job in result_expired:
+            await _delete_transient_transcription(job)
+        await asyncio.to_thread(clear_expired_transcription_cancel_requests, datetime.now(timezone.utc).isoformat())
     except Exception:
         logger.exception("만료된 Whisper 작업 정리에 실패했습니다.")
 
@@ -277,6 +312,11 @@ async def transcribe_temporary_audio(request: RemoteTranscriptionRequest, user=D
     if not request.client_job_id:
         raise HTTPException(status_code=422, detail="진행도 추적 전사에는 client_job_id가 필요합니다.")
     _require_storage()
+    user_id = str(_user_value(user, "id"))
+    if await asyncio.to_thread(is_transcription_cancel_requested, user_id, request.client_job_id):
+        audio_path.unlink(missing_ok=True)
+        await asyncio.to_thread(clear_transcription_cancel_request, user_id, request.client_job_id)
+        raise HTTPException(status_code=409, detail="취소된 Whisper 전사 요청입니다.")
     try:
         runpod_job_id = await asyncio.to_thread(
             start_transcription_with_whisper_api,
@@ -301,7 +341,7 @@ async def transcribe_temporary_audio(request: RemoteTranscriptionRequest, user=D
             "message": "Whisper 전사 작업을 대기열에 등록했습니다.",
             **_lease_values(),
         }
-        await asyncio.to_thread(create_transcription_job, str(_user_value(user, "id")), values)
+        await asyncio.to_thread(create_transcription_job, user_id, values)
     except Exception as exc:
         try:
             await asyncio.to_thread(cancel_transcription, runpod_job_id)
@@ -309,6 +349,12 @@ async def transcribe_temporary_audio(request: RemoteTranscriptionRequest, user=D
             logger.warning("저장 실패 후 RunPod 전사 작업을 취소하지 못했습니다: %s", runpod_job_id)
         audio_path.unlink(missing_ok=True)
         raise HTTPException(status_code=503, detail="Whisper 작업 추적을 저장하지 못했습니다.") from exc
+    if await asyncio.to_thread(is_transcription_cancel_requested, user_id, request.client_job_id):
+        job = await _cancel_persisted_transcription(values | {"user_id": user_id}, "클라이언트가 Whisper 전사 준비 중 취소했습니다.")
+        await asyncio.to_thread(clear_transcription_cancel_request, user_id, request.client_job_id)
+        if job.get("status") in {"cancelled", "completed", "failed"}:
+            await _delete_transient_transcription(job)
+        raise HTTPException(status_code=409, detail="취소된 Whisper 전사 요청입니다.")
     return JSONResponse(status_code=202, content={"job_id": runpod_job_id, "status": "queued", "progress": 0, "message": "Whisper 전사 작업을 대기열에 등록했습니다.", "lease_expires_at": values["lease_expires_at"]})
 
 
@@ -320,10 +366,17 @@ async def read_transcription_status(job_id: str, user=Depends(get_current_user))
     if job is None:
         raise HTTPException(status_code=404, detail="전사 작업을 찾을 수 없습니다.")
     if job.get("status") in {"cancelled", "completed", "failed"}:
-        return {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 100), "message": job.get("message") or "Whisper 전사 작업이 종료되었습니다.", "lease_expires_at": job.get("lease_expires_at")}
+        response = {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 100), "message": job.get("message") or "Whisper 전사 작업이 종료되었습니다.", "lease_expires_at": job.get("lease_expires_at")}
+        if job.get("status") == "completed" and isinstance(job.get("result"), dict):
+            response["result"] = _normalized_transcript(job["result"])
+            return response
+        await _delete_transient_transcription(job)
+        return response
     if _lease_has_expired(job):
         job = await _cancel_persisted_transcription(job, "클라이언트 heartbeat가 만료되어 Whisper 작업을 취소했습니다.")
-        return {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 0), "message": job.get("message") or "Whisper 전사 취소를 요청했습니다.", "lease_expires_at": job.get("lease_expires_at")}
+        response = {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 0), "message": job.get("message") or "Whisper 전사 취소를 요청했습니다.", "lease_expires_at": job.get("lease_expires_at")}
+        await _delete_transient_transcription(job)
+        return response
     try:
         runpod_status = await asyncio.to_thread(get_transcription_status, job_id)
     except WhisperAPIError as exc:
@@ -348,18 +401,42 @@ async def read_transcription_status(job_id: str, user=Depends(get_current_user))
         if not isinstance(output, dict) or not isinstance(output.get("segments"), list):
             _temporary_audio_path(str(job["file_id"])).unlink(missing_ok=True)
             await asyncio.to_thread(update_transcription_job, user_id, job_id, {"status": "failed", "progress": 100, "message": "Whisper API 응답 형식이 올바르지 않습니다.", "completed_at": datetime.now(timezone.utc).isoformat()})
+            await _delete_transient_transcription(job)
             raise HTTPException(status_code=502, detail="Whisper API 응답 형식이 올바르지 않습니다.")
         if isinstance(output.get("error"), dict):
             response.update(status="failed", progress=100, message=str(output["error"].get("message") or "Whisper 전사에 실패했습니다."))
         else:
-            response.update(status="completed", progress=100, message="Whisper 전사가 완료되었습니다.", result=output)
+            try:
+                normalized_output = _normalized_transcript(output)
+            except ValueError as exc:
+                _temporary_audio_path(str(job["file_id"])).unlink(missing_ok=True)
+                await asyncio.to_thread(update_transcription_job, user_id, job_id, {"status": "failed", "progress": 100, "message": "Whisper API 전사 결과 형식이 올바르지 않습니다.", "completed_at": datetime.now(timezone.utc).isoformat()})
+                await _delete_transient_transcription(job)
+                raise HTTPException(status_code=502, detail="Whisper API 전사 결과 형식이 올바르지 않습니다.") from exc
+            response.update(status="completed", progress=100, message="Whisper 전사가 완료되었습니다.", result=normalized_output)
     elif state in {"FAILED", "CANCELLED", "TIMED_OUT"}:
         response.update(status="cancelled" if state == "CANCELLED" else "failed", progress=100, message=str(runpod_status.get("error") or "Whisper 전사에 실패했습니다."))
     if state in {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}:
         _temporary_audio_path(str(job["file_id"])).unlink(missing_ok=True)
         values.update(status=response["status"], progress=100, message=response["message"], completed_at=datetime.now(timezone.utc).isoformat())
+        if response["status"] == "completed":
+            values.update(result=response["result"], result_expires_at=(datetime.now(timezone.utc) + timedelta(seconds=get_transcription_result_ttl_seconds())).isoformat())
     await asyncio.to_thread(update_transcription_job, user_id, job_id, values)
+    if state in {"FAILED", "CANCELLED", "TIMED_OUT"}:
+        await _delete_transient_transcription(job)
     return response
+
+
+@app.post("/api/stt/transcriptions/{job_id}/ack")
+async def acknowledge_transcription_result(job_id: str, user=Depends(get_current_user)):
+    _require_storage()
+    job = await asyncio.to_thread(get_transcription_job, str(_user_value(user, "id")), job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="전사 작업을 찾을 수 없습니다.")
+    if job.get("status") != "completed" or not isinstance(job.get("result"), dict):
+        raise HTTPException(status_code=409, detail="확인할 완료 전사 결과가 없습니다.")
+    await _delete_transient_transcription(job)
+    return {"job_id": job_id, "status": "acknowledged"}
 
 
 @app.get("/api/stt/transcriptions/{job_id}/events")
@@ -388,10 +465,16 @@ async def heartbeat_transcription(job_id: str, user=Depends(get_current_user)):
     if job is None:
         raise HTTPException(status_code=404, detail="전사 작업을 찾을 수 없습니다.")
     if job.get("status") in {"completed", "failed", "cancelled"}:
-        return {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 100), "message": job.get("message") or "Whisper 전사 작업이 종료되었습니다.", "lease_expires_at": job.get("lease_expires_at")}
+        response = {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 100), "message": job.get("message") or "Whisper 전사 작업이 종료되었습니다.", "lease_expires_at": job.get("lease_expires_at")}
+        if job.get("status") == "completed" and isinstance(job.get("result"), dict):
+            return response
+        await _delete_transient_transcription(job)
+        return response
     if _lease_has_expired(job):
         job = await _cancel_persisted_transcription(job, "클라이언트 heartbeat가 만료되어 Whisper 작업을 취소했습니다.")
-        return {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 0), "message": job.get("message") or "Whisper 전사 취소를 요청했습니다.", "lease_expires_at": job.get("lease_expires_at")}
+        response = {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 0), "message": job.get("message") or "Whisper 전사 취소를 요청했습니다.", "lease_expires_at": job.get("lease_expires_at")}
+        await _delete_transient_transcription(job)
+        return response
     values = _lease_values()
     job = await asyncio.to_thread(update_transcription_job, user_id, job_id, values) or job
     return {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 0), "message": job.get("message") or "Whisper 전사를 준비하는 중입니다.", "lease_expires_at": job.get("lease_expires_at")}
@@ -404,7 +487,26 @@ async def cancel_transcription_job(job_id: str, user=Depends(get_current_user)):
     if job is None:
         raise HTTPException(status_code=404, detail="전사 작업을 찾을 수 없습니다.")
     job = await _cancel_persisted_transcription(job, "클라이언트 요청으로 Whisper 작업을 취소했습니다.")
-    return {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 0), "message": job.get("message") or "Whisper 전사 취소를 요청했습니다.", "lease_expires_at": job.get("lease_expires_at")}
+    response = {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 0), "message": job.get("message") or "Whisper 전사 취소를 요청했습니다.", "lease_expires_at": job.get("lease_expires_at")}
+    if job.get("status") in {"cancelled", "completed", "failed"}:
+        await _delete_transient_transcription(job)
+    return response
+
+
+@app.post("/api/stt/transcriptions/client/{client_job_id}/cancel")
+async def cancel_transcription_by_client_job_id(client_job_id: str, user=Depends(get_current_user)):
+    """RunPod ID가 아직 없는 전사 시작 경합을 포함해 취소 의도를 보관한다."""
+    _require_storage()
+    user_id = str(_user_value(user, "id"))
+    await asyncio.to_thread(request_transcription_cancel, user_id, client_job_id, _cancel_request_expires_at())
+    job = await asyncio.to_thread(get_active_transcription_job_by_client_id, user_id, client_job_id)
+    if job is not None:
+        job = await _cancel_persisted_transcription(job, "클라이언트 요청으로 Whisper 작업을 취소했습니다.")
+        await asyncio.to_thread(clear_transcription_cancel_request, user_id, client_job_id)
+        if job.get("status") in {"cancelled", "completed", "failed"}:
+            await _delete_transient_transcription(job)
+        return {"job_id": job["runpod_job_id"], "status": job["status"], "message": job.get("message") or "Whisper 전사 작업을 취소했습니다."}
+    return {"client_job_id": client_job_id, "status": "cancel_requested", "message": "Whisper 전사 준비 단계의 취소를 등록했습니다."}
 
 
 @app.post("/api/analysis-jobs", response_model=AnalysisJobResponse, status_code=201)
@@ -416,8 +518,9 @@ async def create_analysis_job(request: AnalysisJobCreateRequest, user=Depends(ge
             {
                 "id": str(uuid4()),
                 **request.model_dump(),
-                "status": "queued",
-                "progress": 0,
+                "status": "completed",
+                "progress": 100,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
             },
         )
     except Exception as exc:
@@ -433,18 +536,6 @@ async def create_analysis_job(request: AnalysisJobCreateRequest, user=Depends(ge
 async def read_analysis_job(job_id: str, user=Depends(get_current_user)):
     _require_storage()
     job = get_job(str(_user_value(user, "id")), job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
-    return _job_response(job)
-
-
-@app.patch("/api/analysis-jobs/{job_id}", response_model=AnalysisJobResponse)
-async def update_analysis_job(job_id: str, request: AnalysisJobStatusRequest, user=Depends(get_current_user)):
-    _require_storage()
-    values = request.model_dump()
-    if request.status in {"completed", "failed", "cancelled"}:
-        values["completed_at"] = datetime.now(timezone.utc).isoformat()
-    job = update_job(str(_user_value(user, "id")), job_id, values)
     if job is None:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
     return _job_response(job)

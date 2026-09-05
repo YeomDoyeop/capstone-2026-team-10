@@ -52,3 +52,7 @@ def get_transcription_lease_seconds() -> int:
 
 def get_transcription_lease_sweep_seconds() -> int:
     return int(os.getenv("TRANSCRIPTION_LEASE_SWEEP_SECONDS", "15"))
+
+
+def get_transcription_result_ttl_seconds() -> int:
+    return int(os.getenv("TRANSCRIPTION_RESULT_TTL_SECONDS", "900"))
