@@ -6,7 +6,11 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
-from app.config import get_supabase_anon_key, get_supabase_service_role_key, get_supabase_url
+from app.config import (
+    get_supabase_anon_key,
+    get_supabase_service_role_key,
+    get_supabase_url,
+)
 
 try:
     from supabase import Client, create_client
@@ -38,7 +42,12 @@ def get_service_client() -> Client:
 
 
 def create_job(user_id: str, values: dict[str, Any]) -> dict[str, Any]:
-    response = get_service_client().table("analysis_jobs").insert({"user_id": user_id, **values}).execute()
+    response = (
+        get_service_client()
+        .table("analysis_jobs")
+        .insert({"user_id": user_id, **values})
+        .execute()
+    )
     return response.data[0]
 
 
@@ -62,35 +71,69 @@ def get_job_by_client_id(user_id: str, client_job_id: str) -> dict[str, Any] | N
 
 
 def get_job(user_id: str, job_id: str) -> dict[str, Any] | None:
-    response = get_service_client().table("analysis_jobs").select("*").eq("id", job_id).eq("user_id", user_id).execute()
+    response = (
+        get_service_client()
+        .table("analysis_jobs")
+        .select("*")
+        .eq("id", job_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
     return response.data[0] if response.data else None
 
 
-def upsert_result(user_id: str, job_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
+def upsert_result(
+    user_id: str, job_id: str, values: dict[str, Any]
+) -> dict[str, Any] | None:
     if get_job(user_id, job_id) is None:
         return None
-    response = get_service_client().table("analysis_results").upsert({"job_id": job_id, **values}, on_conflict="job_id").execute()
+    response = (
+        get_service_client()
+        .table("analysis_results")
+        .upsert({"job_id": job_id, **values}, on_conflict="job_id")
+        .execute()
+    )
     return response.data[0] if response.data else None
 
 
 def get_result(user_id: str, job_id: str) -> dict[str, Any] | None:
     if get_job(user_id, job_id) is None:
         return None
-    response = get_service_client().table("analysis_results").select("*").eq("job_id", job_id).execute()
+    response = (
+        get_service_client()
+        .table("analysis_results")
+        .select("*")
+        .eq("job_id", job_id)
+        .execute()
+    )
     return response.data[0] if response.data else None
 
 
 def create_transcription_job(user_id: str, values: dict[str, Any]) -> dict[str, Any]:
-    response = get_service_client().table("transcription_jobs").insert({"user_id": user_id, **values}).execute()
+    response = (
+        get_service_client()
+        .table("transcription_jobs")
+        .insert({"user_id": user_id, **values})
+        .execute()
+    )
     return response.data[0]
 
 
 def get_transcription_job(user_id: str, runpod_job_id: str) -> dict[str, Any] | None:
-    response = get_service_client().table("transcription_jobs").select("*").eq("runpod_job_id", runpod_job_id).eq("user_id", user_id).execute()
+    response = (
+        get_service_client()
+        .table("transcription_jobs")
+        .select("*")
+        .eq("runpod_job_id", runpod_job_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
     return response.data[0] if response.data else None
 
 
-def get_active_transcription_job_by_client_id(user_id: str, client_job_id: str) -> dict[str, Any] | None:
+def get_active_transcription_job_by_client_id(
+    user_id: str, client_job_id: str
+) -> dict[str, Any] | None:
     response = (
         get_service_client()
         .table("transcription_jobs")
@@ -105,7 +148,9 @@ def get_active_transcription_job_by_client_id(user_id: str, client_job_id: str) 
     return response.data[0] if response.data else None
 
 
-def request_transcription_cancel(user_id: str, client_job_id: str, expires_at: str) -> None:
+def request_transcription_cancel(
+    user_id: str, client_job_id: str, expires_at: str
+) -> None:
     get_service_client().table("transcription_cancel_requests").upsert(
         {"user_id": user_id, "client_job_id": client_job_id, "expires_at": expires_at},
         on_conflict="user_id,client_job_id",
@@ -127,28 +172,58 @@ def is_transcription_cancel_requested(user_id: str, client_job_id: str) -> bool:
 
 
 def clear_transcription_cancel_request(user_id: str, client_job_id: str) -> None:
-    get_service_client().table("transcription_cancel_requests").delete().eq("user_id", user_id).eq("client_job_id", client_job_id).execute()
+    get_service_client().table("transcription_cancel_requests").delete().eq(
+        "user_id", user_id
+    ).eq("client_job_id", client_job_id).execute()
 
 
 def clear_expired_transcription_cancel_requests(cutoff: str) -> None:
-    get_service_client().table("transcription_cancel_requests").delete().lt("expires_at", cutoff).execute()
+    get_service_client().table("transcription_cancel_requests").delete().lt(
+        "expires_at", cutoff
+    ).execute()
 
 
 def delete_transcription_job(user_id: str, runpod_job_id: str) -> None:
-    get_service_client().table("transcription_jobs").delete().eq("user_id", user_id).eq("runpod_job_id", runpod_job_id).execute()
+    get_service_client().table("transcription_jobs").delete().eq("user_id", user_id).eq(
+        "runpod_job_id", runpod_job_id
+    ).execute()
 
 
-def update_transcription_job(user_id: str, runpod_job_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
+def update_transcription_job(
+    user_id: str, runpod_job_id: str, values: dict[str, Any]
+) -> dict[str, Any] | None:
     updated_values = {**values, "updated_at": datetime.now(timezone.utc).isoformat()}
-    response = get_service_client().table("transcription_jobs").update(updated_values).eq("runpod_job_id", runpod_job_id).eq("user_id", user_id).execute()
+    response = (
+        get_service_client()
+        .table("transcription_jobs")
+        .update(updated_values)
+        .eq("runpod_job_id", runpod_job_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
     return response.data[0] if response.data else None
 
 
 def get_expired_transcription_jobs(cutoff: str) -> list[dict[str, Any]]:
-    response = get_service_client().table("transcription_jobs").select("*").in_("status", ["queued", "in_progress", "cancel_requested"]).lt("lease_expires_at", cutoff).execute()
+    response = (
+        get_service_client()
+        .table("transcription_jobs")
+        .select("*")
+        .in_("status", ["queued", "in_progress", "cancel_requested"])
+        .lt("lease_expires_at", cutoff)
+        .execute()
+    )
     return response.data or []
 
 
 def get_expired_transcription_results(cutoff: str) -> list[dict[str, Any]]:
-    response = get_service_client().table("transcription_jobs").select("*").eq("status", "completed").not_.is_("result_expires_at", "null").lt("result_expires_at", cutoff).execute()
+    response = (
+        get_service_client()
+        .table("transcription_jobs")
+        .select("*")
+        .eq("status", "completed")
+        .not_.is_("result_expires_at", "null")
+        .lt("result_expires_at", cutoff)
+        .execute()
+    )
     return response.data or []

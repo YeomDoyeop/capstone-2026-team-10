@@ -6,7 +6,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-
 JobStatus = Literal["completed"]
 
 
@@ -26,6 +25,8 @@ class AnalysisJobCreateRequest(BaseModel):
     source_url: str | None = Field(default=None, max_length=2_000)
     title: str | None = Field(default=None, max_length=1_000)
     duration_ms: int | None = Field(default=None, ge=0)
+
+
 class SegmentAnalysis(BaseModel):
     segment_index: int = Field(ge=0)
     start_ms: int = Field(ge=0)

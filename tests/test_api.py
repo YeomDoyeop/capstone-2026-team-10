@@ -5,7 +5,12 @@ from fastapi.testclient import TestClient
 from pathlib import Path
 import pytest
 
-from app.main import _cancel_persisted_transcription, _lease_has_expired, app, get_current_user
+from app.main import (
+    _cancel_persisted_transcription,
+    _lease_has_expired,
+    app,
+    get_current_user,
+)
 from app.services.whisper_api_service import WhisperAPIError
 
 
@@ -15,8 +20,18 @@ def _mock_transcription_store(monkeypatch):
     monkeypatch.setattr("app.main.is_storage_configured", lambda: True)
     monkeypatch.setattr("app.main.get_expired_transcription_jobs", lambda _: [])
     monkeypatch.setattr("app.main.get_expired_transcription_results", lambda _: [])
-    monkeypatch.setattr("app.main.create_transcription_job", lambda user_id, values: jobs.setdefault(values["runpod_job_id"], {"user_id": user_id, **values}))
-    monkeypatch.setattr("app.main.get_transcription_job", lambda user_id, job_id: jobs.get(job_id) if jobs.get(job_id, {}).get("user_id") == user_id else None)
+    monkeypatch.setattr(
+        "app.main.create_transcription_job",
+        lambda user_id, values: jobs.setdefault(
+            values["runpod_job_id"], {"user_id": user_id, **values}
+        ),
+    )
+    monkeypatch.setattr(
+        "app.main.get_transcription_job",
+        lambda user_id, job_id: (
+            jobs.get(job_id) if jobs.get(job_id, {}).get("user_id") == user_id else None
+        ),
+    )
     monkeypatch.setattr(
         "app.main.get_active_transcription_job_by_client_id",
         lambda user_id, client_job_id: next(
@@ -30,11 +45,33 @@ def _mock_transcription_store(monkeypatch):
             None,
         ),
     )
-    monkeypatch.setattr("app.main.request_transcription_cancel", lambda user_id, client_job_id, expires_at: cancel_requests.add((user_id, client_job_id)))
-    monkeypatch.setattr("app.main.is_transcription_cancel_requested", lambda user_id, client_job_id: (user_id, client_job_id) in cancel_requests)
-    monkeypatch.setattr("app.main.clear_transcription_cancel_request", lambda user_id, client_job_id: cancel_requests.discard((user_id, client_job_id)))
-    monkeypatch.setattr("app.main.clear_expired_transcription_cancel_requests", lambda _: None)
-    monkeypatch.setattr("app.main.delete_transcription_job", lambda user_id, job_id: jobs.pop(job_id, None) if jobs.get(job_id, {}).get("user_id") == user_id else None)
+    monkeypatch.setattr(
+        "app.main.request_transcription_cancel",
+        lambda user_id, client_job_id, expires_at: cancel_requests.add(
+            (user_id, client_job_id)
+        ),
+    )
+    monkeypatch.setattr(
+        "app.main.is_transcription_cancel_requested",
+        lambda user_id, client_job_id: (user_id, client_job_id) in cancel_requests,
+    )
+    monkeypatch.setattr(
+        "app.main.clear_transcription_cancel_request",
+        lambda user_id, client_job_id: cancel_requests.discard(
+            (user_id, client_job_id)
+        ),
+    )
+    monkeypatch.setattr(
+        "app.main.clear_expired_transcription_cancel_requests", lambda _: None
+    )
+    monkeypatch.setattr(
+        "app.main.delete_transcription_job",
+        lambda user_id, job_id: (
+            jobs.pop(job_id, None)
+            if jobs.get(job_id, {}).get("user_id") == user_id
+            else None
+        ),
+    )
 
     def update(user_id, job_id, values):
         job = jobs.get(job_id)
@@ -63,7 +100,10 @@ def test_api_requires_bearer_token():
 
 
 def test_create_analysis_job_records_client_reference(monkeypatch):
-    app.dependency_overrides[get_current_user] = lambda: {"id": "user-001", "email": "user@example.com"}
+    app.dependency_overrides[get_current_user] = lambda: {
+        "id": "user-001",
+        "email": "user@example.com",
+    }
     monkeypatch.setattr("app.main.is_storage_configured", lambda: True)
     monkeypatch.setattr("app.main.get_job_by_client_id", lambda *_: None)
 
@@ -80,7 +120,11 @@ def test_create_analysis_job_records_client_reference(monkeypatch):
     with TestClient(app) as client:
         response = client.post(
             "/api/analysis-jobs",
-            json={"client_job_id": "local-job-001", "source_id": "video-001", "duration_ms": 60000},
+            json={
+                "client_job_id": "local-job-001",
+                "source_id": "video-001",
+                "duration_ms": 60000,
+            },
         )
     app.dependency_overrides.clear()
 
@@ -93,12 +137,28 @@ def test_create_analysis_job_records_client_reference(monkeypatch):
 def test_create_analysis_job_returns_existing_client_job(monkeypatch):
     app.dependency_overrides[get_current_user] = lambda: {"id": "user-001"}
     monkeypatch.setattr("app.main.is_storage_configured", lambda: True)
-    existing = {"id": "server-job-001", "client_job_id": "local-job-001", "status": "completed", "progress": 100}
-    monkeypatch.setattr("app.main.get_job_by_client_id", lambda user_id, client_job_id: existing)
-    monkeypatch.setattr("app.main.create_job", lambda *_: pytest.fail("기존 작업에는 INSERT하면 안 됩니다."))
+    existing = {
+        "id": "server-job-001",
+        "client_job_id": "local-job-001",
+        "status": "completed",
+        "progress": 100,
+    }
+    monkeypatch.setattr(
+        "app.main.get_job_by_client_id", lambda user_id, client_job_id: existing
+    )
+    monkeypatch.setattr(
+        "app.main.create_job",
+        lambda *_: pytest.fail("기존 작업에는 INSERT하면 안 됩니다."),
+    )
     with TestClient(app) as client:
-        first = client.post("/api/analysis-jobs", json={"client_job_id": "local-job-001", "source_id": "video-001"})
-        retry = client.post("/api/analysis-jobs", json={"client_job_id": "local-job-001", "source_id": "video-001"})
+        first = client.post(
+            "/api/analysis-jobs",
+            json={"client_job_id": "local-job-001", "source_id": "video-001"},
+        )
+        retry = client.post(
+            "/api/analysis-jobs",
+            json={"client_job_id": "local-job-001", "source_id": "video-001"},
+        )
     app.dependency_overrides.clear()
 
     assert first.status_code == 201
@@ -106,19 +166,34 @@ def test_create_analysis_job_returns_existing_client_job(monkeypatch):
     assert first.json() == retry.json() == existing
 
 
-def test_create_analysis_job_recovers_unique_conflict_from_concurrent_request(monkeypatch):
+def test_create_analysis_job_recovers_unique_conflict_from_concurrent_request(
+    monkeypatch,
+):
     app.dependency_overrides[get_current_user] = lambda: {"id": "user-001"}
     monkeypatch.setattr("app.main.is_storage_configured", lambda: True)
-    existing = {"id": "server-job-race", "client_job_id": "local-job-race", "status": "completed", "progress": 100}
+    existing = {
+        "id": "server-job-race",
+        "client_job_id": "local-job-race",
+        "status": "completed",
+        "progress": 100,
+    }
     lookups = iter([None, existing])
     monkeypatch.setattr("app.main.get_job_by_client_id", lambda *_: next(lookups))
 
     class UniqueViolation(Exception):
         code = "23505"
 
-    monkeypatch.setattr("app.main.create_job", lambda *_: (_ for _ in ()).throw(UniqueViolation("duplicate key value violates unique constraint")))
+    monkeypatch.setattr(
+        "app.main.create_job",
+        lambda *_: (_ for _ in ()).throw(
+            UniqueViolation("duplicate key value violates unique constraint")
+        ),
+    )
     with TestClient(app) as client:
-        response = client.post("/api/analysis-jobs", json={"client_job_id": "local-job-race", "source_id": "video-001"})
+        response = client.post(
+            "/api/analysis-jobs",
+            json={"client_job_id": "local-job-race", "source_id": "video-001"},
+        )
     app.dependency_overrides.clear()
 
     assert response.status_code == 201
@@ -149,9 +224,15 @@ def test_save_analysis_result_retries_are_upserts(monkeypatch):
 def test_analysis_job_reports_service_key_error_without_schema_message(monkeypatch):
     app.dependency_overrides[get_current_user] = lambda: {"id": "user-001"}
     monkeypatch.setattr("app.main.is_storage_configured", lambda: True)
-    monkeypatch.setattr("app.main.get_job_by_client_id", lambda *_: (_ for _ in ()).throw(RuntimeError("Invalid API key")))
+    monkeypatch.setattr(
+        "app.main.get_job_by_client_id",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("Invalid API key")),
+    )
     with TestClient(app) as client:
-        response = client.post("/api/analysis-jobs", json={"client_job_id": "local-job-001", "source_id": "video-001"})
+        response = client.post(
+            "/api/analysis-jobs",
+            json={"client_job_id": "local-job-001", "source_id": "video-001"},
+        )
     app.dependency_overrides.clear()
 
     assert response.status_code == 503
@@ -181,16 +262,37 @@ def test_transcription_status_returns_runpod_progress_and_result(monkeypatch, tm
     audio_path = Path(tmp_path) / "audio.mp3"
     audio_path.write_bytes(b"audio")
     monkeypatch.setattr("app.main._temporary_audio_path", lambda _: audio_path)
-    monkeypatch.setattr("app.main.get_public_base_url", lambda: "https://server.example")
-    monkeypatch.setattr("app.main.start_transcription_with_whisper_api", lambda *args, **kwargs: "runpod-001")
+    monkeypatch.setattr(
+        "app.main.get_public_base_url", lambda: "https://server.example"
+    )
+    monkeypatch.setattr(
+        "app.main.start_transcription_with_whisper_api",
+        lambda *args, **kwargs: "runpod-001",
+    )
     monkeypatch.setattr(
         "app.main.get_transcription_status",
-        lambda _: {"status": "IN_PROGRESS", "progress": {"progress": 67, "message": "Whisper가 음성을 전사하는 중입니다."}},
+        lambda _: {
+            "status": "IN_PROGRESS",
+            "progress": {
+                "progress": 67,
+                "message": "Whisper가 음성을 전사하는 중입니다.",
+            },
+        },
     )
     with TestClient(app) as client:
-        started = client.post("/api/stt/transcriptions", json={"file_id": "a" * 32, "client_job_id": "local-001", "track_progress": True})
+        started = client.post(
+            "/api/stt/transcriptions",
+            json={
+                "file_id": "a" * 32,
+                "client_job_id": "local-001",
+                "track_progress": True,
+            },
+        )
         progress = client.get("/api/stt/transcriptions/runpod-001")
-        monkeypatch.setattr("app.main.get_transcription_status", lambda _: {"status": "COMPLETED", "output": {"segments": []}})
+        monkeypatch.setattr(
+            "app.main.get_transcription_status",
+            lambda _: {"status": "COMPLETED", "output": {"segments": []}},
+        )
         completed = client.get("/api/stt/transcriptions/runpod-001")
     app.dependency_overrides.clear()
     assert started.status_code == 202
@@ -200,35 +302,66 @@ def test_transcription_status_returns_runpod_progress_and_result(monkeypatch, tm
     assert not audio_path.exists()
 
 
-def test_completed_transcription_result_survives_reconnect_until_ack(monkeypatch, tmp_path):
+def test_completed_transcription_result_survives_reconnect_until_ack(
+    monkeypatch, tmp_path
+):
     app.dependency_overrides[get_current_user] = lambda: {"id": "user-001"}
     jobs, _ = _mock_transcription_store(monkeypatch)
     audio_path = Path(tmp_path) / "audio.mp3"
     audio_path.write_bytes(b"audio")
     monkeypatch.setattr("app.main._temporary_audio_path", lambda _: audio_path)
-    monkeypatch.setattr("app.main.get_public_base_url", lambda: "https://server.example")
-    monkeypatch.setattr("app.main.start_transcription_with_whisper_api", lambda *args, **kwargs: "runpod-ack")
+    monkeypatch.setattr(
+        "app.main.get_public_base_url", lambda: "https://server.example"
+    )
+    monkeypatch.setattr(
+        "app.main.start_transcription_with_whisper_api",
+        lambda *args, **kwargs: "runpod-ack",
+    )
     monkeypatch.setattr(
         "app.main.get_transcription_status",
-        lambda _: {"status": "COMPLETED", "output": {
-            "segments": [{"start": 1, "end": 2, "text": " 테스트", "words": [
-                {"start": 1, "end": 2, "word": " 테스트"},
-            ]}],
-            "engine": "whisperx-aligned-word-v1",
-            "alignment": "ctc-forced-alignment-with-words",
-        }},
+        lambda _: {
+            "status": "COMPLETED",
+            "output": {
+                "segments": [
+                    {
+                        "start": 1,
+                        "end": 2,
+                        "text": " 테스트",
+                        "words": [
+                            {"start": 1, "end": 2, "word": " 테스트"},
+                        ],
+                    }
+                ],
+                "engine": "whisperx-aligned-word-v1",
+                "alignment": "ctc-forced-alignment-with-words",
+            },
+        },
     )
     with TestClient(app) as client:
-        client.post("/api/stt/transcriptions", json={"file_id": "a" * 32, "client_job_id": "local-ack", "track_progress": True})
+        client.post(
+            "/api/stt/transcriptions",
+            json={
+                "file_id": "a" * 32,
+                "client_job_id": "local-ack",
+                "track_progress": True,
+            },
+        )
         completed = client.get("/api/stt/transcriptions/runpod-ack")
         reconnected = client.get("/api/stt/transcriptions/runpod-ack")
         acknowledged = client.post("/api/stt/transcriptions/runpod-ack/ack")
     app.dependency_overrides.clear()
 
     expected = {
-        "segments": [{"start": 1.0, "end": 2.0, "text": " 테스트", "words": [
-            {"start": 1.0, "end": 2.0, "word": " 테스트"},
-        ]}],
+        "segments": [
+            {
+                "start": 1.0,
+                "end": 2.0,
+                "text": " 테스트",
+                "words": [
+                    {"start": 1.0, "end": 2.0, "word": " 테스트"},
+                ],
+            }
+        ],
         "engine": "whisperx-aligned-word-v1",
         "alignment": "ctc-forced-alignment-with-words",
     }
@@ -244,14 +377,32 @@ def test_transcription_status_reads_progress_from_runpod_output(monkeypatch, tmp
     audio_path = Path(tmp_path) / "audio.mp3"
     audio_path.write_bytes(b"audio")
     monkeypatch.setattr("app.main._temporary_audio_path", lambda _: audio_path)
-    monkeypatch.setattr("app.main.get_public_base_url", lambda: "https://server.example")
-    monkeypatch.setattr("app.main.start_transcription_with_whisper_api", lambda *args, **kwargs: "runpod-002")
+    monkeypatch.setattr(
+        "app.main.get_public_base_url", lambda: "https://server.example"
+    )
+    monkeypatch.setattr(
+        "app.main.start_transcription_with_whisper_api",
+        lambda *args, **kwargs: "runpod-002",
+    )
     monkeypatch.setattr(
         "app.main.get_transcription_status",
-        lambda _: {"status": "IN_PROGRESS", "output": {"progress": 67, "message": "Whisper가 음성을 전사하는 중입니다."}},
+        lambda _: {
+            "status": "IN_PROGRESS",
+            "output": {
+                "progress": 67,
+                "message": "Whisper가 음성을 전사하는 중입니다.",
+            },
+        },
     )
     with TestClient(app) as client:
-        client.post("/api/stt/transcriptions", json={"file_id": "a" * 32, "client_job_id": "local-002", "track_progress": True})
+        client.post(
+            "/api/stt/transcriptions",
+            json={
+                "file_id": "a" * 32,
+                "client_job_id": "local-002",
+                "track_progress": True,
+            },
+        )
         response = client.get("/api/stt/transcriptions/runpod-002")
     app.dependency_overrides.clear()
 
@@ -260,18 +411,34 @@ def test_transcription_status_reads_progress_from_runpod_output(monkeypatch, tmp
     assert response.json()["message"] == "Whisper가 음성을 전사하는 중입니다."
 
 
-def test_transcription_heartbeat_and_cancel_are_owned_and_idempotent(monkeypatch, tmp_path):
+def test_transcription_heartbeat_and_cancel_are_owned_and_idempotent(
+    monkeypatch, tmp_path
+):
     app.dependency_overrides[get_current_user] = lambda: {"id": "user-001"}
     jobs, _ = _mock_transcription_store(monkeypatch)
     audio_path = Path(tmp_path) / "audio.mp3"
     audio_path.write_bytes(b"audio")
     monkeypatch.setattr("app.main._temporary_audio_path", lambda _: audio_path)
-    monkeypatch.setattr("app.main.get_public_base_url", lambda: "https://server.example")
-    monkeypatch.setattr("app.main.start_transcription_with_whisper_api", lambda *args, **kwargs: "runpod-cancel")
+    monkeypatch.setattr(
+        "app.main.get_public_base_url", lambda: "https://server.example"
+    )
+    monkeypatch.setattr(
+        "app.main.start_transcription_with_whisper_api",
+        lambda *args, **kwargs: "runpod-cancel",
+    )
     cancelled = []
-    monkeypatch.setattr("app.main.cancel_transcription", lambda job_id: cancelled.append(job_id))
+    monkeypatch.setattr(
+        "app.main.cancel_transcription", lambda job_id: cancelled.append(job_id)
+    )
     with TestClient(app) as client:
-        started = client.post("/api/stt/transcriptions", json={"file_id": "a" * 32, "client_job_id": "local-cancel", "track_progress": True})
+        started = client.post(
+            "/api/stt/transcriptions",
+            json={
+                "file_id": "a" * 32,
+                "client_job_id": "local-cancel",
+                "track_progress": True,
+            },
+        )
         heartbeat = client.post("/api/stt/transcriptions/runpod-cancel/heartbeat")
         first = client.post("/api/stt/transcriptions/runpod-cancel/cancel")
         second = client.post("/api/stt/transcriptions/runpod-cancel/cancel")
@@ -294,10 +461,22 @@ def test_cancel_before_runpod_start_prevents_remote_request(monkeypatch, tmp_pat
     audio_path.write_bytes(b"audio")
     monkeypatch.setattr("app.main._temporary_audio_path", lambda _: audio_path)
     started = []
-    monkeypatch.setattr("app.main.start_transcription_with_whisper_api", lambda *args, **kwargs: started.append(True) or "runpod-never")
+    monkeypatch.setattr(
+        "app.main.start_transcription_with_whisper_api",
+        lambda *args, **kwargs: started.append(True) or "runpod-never",
+    )
     with TestClient(app) as client:
-        cancelled = client.post("/api/stt/transcriptions/client/local-before-start/cancel")
-        response = client.post("/api/stt/transcriptions", json={"file_id": "a" * 32, "client_job_id": "local-before-start", "track_progress": True})
+        cancelled = client.post(
+            "/api/stt/transcriptions/client/local-before-start/cancel"
+        )
+        response = client.post(
+            "/api/stt/transcriptions",
+            json={
+                "file_id": "a" * 32,
+                "client_job_id": "local-before-start",
+                "track_progress": True,
+            },
+        )
     app.dependency_overrides.clear()
 
     assert cancelled.status_code == 200
@@ -321,9 +500,13 @@ def test_cancel_by_client_job_id_cancels_persisted_runpod_job(monkeypatch, tmp_p
     }
     monkeypatch.setattr("app.main._temporary_audio_path", lambda _: audio_path)
     cancelled = []
-    monkeypatch.setattr("app.main.cancel_transcription", lambda job_id: cancelled.append(job_id))
+    monkeypatch.setattr(
+        "app.main.cancel_transcription", lambda job_id: cancelled.append(job_id)
+    )
     with TestClient(app) as client:
-        response = client.post("/api/stt/transcriptions/client/local-client-cancel/cancel")
+        response = client.post(
+            "/api/stt/transcriptions/client/local-client-cancel/cancel"
+        )
     app.dependency_overrides.clear()
 
     assert response.status_code == 200
@@ -333,17 +516,31 @@ def test_cancel_by_client_job_id_cancels_persisted_runpod_job(monkeypatch, tmp_p
     assert not audio_path.exists()
 
 
-def test_transcription_rejects_another_users_heartbeat_and_cancel(monkeypatch, tmp_path):
+def test_transcription_rejects_another_users_heartbeat_and_cancel(
+    monkeypatch, tmp_path
+):
     current_user = {"id": "user-001"}
     app.dependency_overrides[get_current_user] = lambda: current_user
     _mock_transcription_store(monkeypatch)
     audio_path = Path(tmp_path) / "audio.mp3"
     audio_path.write_bytes(b"audio")
     monkeypatch.setattr("app.main._temporary_audio_path", lambda _: audio_path)
-    monkeypatch.setattr("app.main.get_public_base_url", lambda: "https://server.example")
-    monkeypatch.setattr("app.main.start_transcription_with_whisper_api", lambda *args, **kwargs: "runpod-owned")
+    monkeypatch.setattr(
+        "app.main.get_public_base_url", lambda: "https://server.example"
+    )
+    monkeypatch.setattr(
+        "app.main.start_transcription_with_whisper_api",
+        lambda *args, **kwargs: "runpod-owned",
+    )
     with TestClient(app) as client:
-        started = client.post("/api/stt/transcriptions", json={"file_id": "a" * 32, "client_job_id": "local-owned", "track_progress": True})
+        started = client.post(
+            "/api/stt/transcriptions",
+            json={
+                "file_id": "a" * 32,
+                "client_job_id": "local-owned",
+                "track_progress": True,
+            },
+        )
         current_user["id"] = "user-002"
         heartbeat = client.post("/api/stt/transcriptions/runpod-owned/heartbeat")
         cancelled = client.post("/api/stt/transcriptions/runpod-owned/cancel")
@@ -355,7 +552,9 @@ def test_transcription_rejects_another_users_heartbeat_and_cancel(monkeypatch, t
     assert audio_path.exists()
 
 
-def test_expired_lease_cancels_runpod_and_removes_temporary_audio(monkeypatch, tmp_path):
+def test_expired_lease_cancels_runpod_and_removes_temporary_audio(
+    monkeypatch, tmp_path
+):
     jobs, _ = _mock_transcription_store(monkeypatch)
     audio_path = Path(tmp_path) / "audio.mp3"
     audio_path.write_bytes(b"audio")
@@ -370,7 +569,9 @@ def test_expired_lease_cancels_runpod_and_removes_temporary_audio(monkeypatch, t
     )
     monkeypatch.setattr("app.main._temporary_audio_path", lambda _: audio_path)
     cancelled = []
-    monkeypatch.setattr("app.main.cancel_transcription", lambda job_id: cancelled.append(job_id))
+    monkeypatch.setattr(
+        "app.main.cancel_transcription", lambda job_id: cancelled.append(job_id)
+    )
 
     result = asyncio.run(_cancel_persisted_transcription(job, "lease 만료"))
 
@@ -394,8 +595,13 @@ def test_cancel_race_with_completed_runpod_keeps_completed_state(monkeypatch, tm
         },
     )
     monkeypatch.setattr("app.main._temporary_audio_path", lambda _: audio_path)
-    monkeypatch.setattr("app.main.cancel_transcription", lambda _: (_ for _ in ()).throw(WhisperAPIError("already terminal")))
-    monkeypatch.setattr("app.main.get_transcription_status", lambda _: {"status": "COMPLETED"})
+    monkeypatch.setattr(
+        "app.main.cancel_transcription",
+        lambda _: (_ for _ in ()).throw(WhisperAPIError("already terminal")),
+    )
+    monkeypatch.setattr(
+        "app.main.get_transcription_status", lambda _: {"status": "COMPLETED"}
+    )
 
     result = asyncio.run(_cancel_persisted_transcription(job, "사용자 취소"))
 
@@ -405,5 +611,19 @@ def test_cancel_race_with_completed_runpod_keeps_completed_state(monkeypatch, tm
 
 
 def test_lease_expiration_is_detected_before_a_late_heartbeat():
-    assert _lease_has_expired({"runpod_job_id": "expired", "lease_expires_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()})
-    assert not _lease_has_expired({"runpod_job_id": "active", "lease_expires_at": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()})
+    assert _lease_has_expired(
+        {
+            "runpod_job_id": "expired",
+            "lease_expires_at": (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        }
+    )
+    assert not _lease_has_expired(
+        {
+            "runpod_job_id": "active",
+            "lease_expires_at": (
+                datetime.now(timezone.utc) + timedelta(seconds=1)
+            ).isoformat(),
+        }
+    )
