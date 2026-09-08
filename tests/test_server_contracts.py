@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from app.services.llm_gateway import LLMGateway
-from app.services.server_job_service import create_job, save_result
+import pytest
+
+from app.services.server_job_service import _score, create_job, save_result
 
 
 class FakeResponse:
@@ -64,7 +66,7 @@ def test_job_result_sends_only_analysis_data_to_server(monkeypatch):
                     "start": 1.5,
                     "end": 4.0,
                     "text": "중요 발언",
-                    "llm_score": 0.9,
+                    "llm_score": 900,
                     "final_score": 0.8,
                 }
             ],
@@ -77,4 +79,35 @@ def test_job_result_sends_only_analysis_data_to_server(monkeypatch):
     assert result_request["headers"]["Authorization"] == "Bearer session"
     assert result_request["json"]["script"] is None
     assert result_request["json"]["segments"][0]["start_ms"] == 1500
+    assert result_request["json"]["segments"][0]["script_importance"] == 0.9
+    assert result_request["json"]["segments"][0]["final_score"] == 0.9
     assert "video_path" not in result_request["json"]
+
+
+def test_repeated_result_sync_reuses_same_server_job(monkeypatch):
+    monkeypatch.setenv("AVE_SERVER_URL", "https://ave-server.example.test")
+    requests: list[dict] = []
+
+    def fake_request(method, url, **kwargs):
+        requests.append({"method": method, "url": url, **kwargs})
+        return FakeResponse({"id": "server-job-existing"})
+
+    monkeypatch.setattr("app.services.server_job_service.requests.request", fake_request)
+    result = {"candidates": []}
+    for _ in range(2):
+        job_id = create_job("Bearer session", client_job_id="local-job", source_id="youtube-id", source_url="https://www.youtube.com/watch?v=youtube-id")
+        save_result("Bearer session", job_id, result)
+
+    assert [request["method"] for request in requests] == ["POST", "PUT", "POST", "PUT"]
+    assert [request["url"] for request in requests if request["method"] == "PUT"] == [
+        "https://ave-server.example.test/api/analysis-jobs/server-job-existing/result",
+        "https://ave-server.example.test/api/analysis-jobs/server-job-existing/result",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(0, 0.0), (500, 0.5), (1000, 1.0), (-5, 0.0), (1200, 1.0), ("bad", None)],
+)
+def test_server_score_normalizes_client_scale(raw, expected):
+    assert _score(raw) == expected

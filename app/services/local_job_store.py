@@ -44,12 +44,14 @@ class LocalJobStore:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    def save_completed(self, job_id: str, result: dict[str, Any]) -> None:
+    def save_completed(
+        self, job_id: str, result: dict[str, Any], *, owner_id: str | None = None
+    ) -> None:
         completed_at = datetime.now(timezone.utc).isoformat()
         plan = result.get("analysis_plan") if isinstance(result.get("analysis_plan"), dict) else {}
         persisted_plan = {
             key: value for key, value in plan.items()
-            if key in {"genre", "llm_provider", "transcription_source", "target_seconds", "chapters", "selected_segment_ids", "recommended_segment_ids", "clips", "render_mode"}
+            if key in {"genre", "llm_provider", "transcription_source", "target_seconds", "chapters", "selected_segment_ids", "recommended_segment_ids", "clips"}
         }
         if isinstance(persisted_plan.get("clips"), list):
             persisted_plan["clips"] = [
@@ -58,13 +60,14 @@ class LocalJobStore:
             ]
         persisted = {
             "job_id": job_id,
+            "owner_id": owner_id,
             "status": "completed",
             "phase": "completed",
             "progress": 100,
             "message": "AI 영상 편집이 완료되었습니다.",
             "result": {
                 key: value for key, value in result.items()
-                if key in {"rendered_filename", "rendered_video_path", "render_mode", "vod_video_id", "selected_segment_ids", "selected_duration_seconds"}
+                if key in {"rendered_filename", "rendered_video_path", "vod_video_id", "selected_segment_ids", "selected_duration_seconds"}
             },
             "analysis_plan": persisted_plan,
             "completed_at": completed_at,

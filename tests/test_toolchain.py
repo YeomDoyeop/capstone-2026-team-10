@@ -36,16 +36,21 @@ def test_ytdlp_binary_converts_project_options_to_cli(monkeypatch, tmp_path):
     info = YoutubeDL({
         "skip_download": True,
         "writeinfojson": True,
+        "writecomments": False,
         "outtmpl": str(tmp_path / "%(id)s.%(ext)s"),
         "writesubtitles": True,
         "writeautomaticsub": True,
         "subtitleslangs": ["ko"],
         "subtitlesformat": "vtt",
-        "extractor_args": {"youtube": {"player_client": ["web_embedded"]}},
+        "extractor_args": {"youtube": {"player_client": ["web_embedded"], "lang": ["ko"], "max_comments": ["0"]}},
     }).extract_info("https://www.youtube.com/watch?v=dQw4w9WgXcQ", download=True)
 
     assert info["id"] == "video-id"
     assert "--write-info-json" in captured
+    assert "--ignore-config" in captured
+    assert "--no-write-comments" in captured
+    assert "youtube:max_comments=0" in captured
     assert "--write-subs" in captured
     assert "--sub-langs" in captured
     assert "--extractor-args" in captured
+    assert "youtube:lang=ko" in captured

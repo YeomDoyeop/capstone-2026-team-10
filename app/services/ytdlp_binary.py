@@ -31,7 +31,7 @@ class YoutubeDL:
         return urlopen(Request(url, headers=headers), timeout=30)
 
     def extract_info(self, url: str, download: bool = True) -> dict:
-        arguments = [str(ytdlp()), "--no-warnings", "--no-playlist", "--print-json"]
+        arguments = [str(ytdlp()), "--ignore-config", "--no-warnings", "--no-playlist", "--print-json"]
         arguments.extend(self._option_arguments())
         if not download:
             arguments.append("--skip-download")
@@ -67,10 +67,21 @@ class YoutubeDL:
             arguments.append("--write-info-json")
         if value.get("writecomments"):
             arguments.append("--write-comments")
+        elif "writecomments" in value:
+            arguments.append("--no-write-comments")
         if output := value.get("outtmpl"):
             arguments.extend(["--output", str(output)])
         if format_selector := value.get("format"):
             arguments.extend(["--format", str(format_selector)])
+        if value.get("extractaudio"):
+            arguments.append("--extract-audio")
+        if audio_format := value.get("audioformat"):
+            arguments.extend(["--audio-format", str(audio_format)])
+        audio_quality = value.get("audioquality")
+        if audio_quality is not None:
+            arguments.extend(["--audio-quality", str(audio_quality)])
+        if ffmpeg_location := value.get("ffmpeg_location"):
+            arguments.extend(["--ffmpeg-location", str(ffmpeg_location)])
         if value.get("writesubtitles"):
             arguments.append("--write-subs")
         if value.get("writeautomaticsub"):
@@ -94,8 +105,12 @@ class YoutubeDL:
         youtube_args = extractor_args.get("youtube") or {}
         if clients := youtube_args.get("player_client"):
             arguments.extend(["--extractor-args", f"youtube:player_client={','.join(clients)}"])
+        if languages := youtube_args.get("lang"):
+            arguments.extend(["--extractor-args", f"youtube:lang={','.join(languages)}"])
         if comment_sort := youtube_args.get("comment_sort"):
             arguments.extend(["--extractor-args", f"youtube:comment_sort={','.join(comment_sort)}"])
+        if max_comments := youtube_args.get("max_comments"):
+            arguments.extend(["--extractor-args", f"youtube:max_comments={','.join(max_comments)}"])
         runtimes = value.get("js_runtimes") or {}
         if "node" in runtimes:
             arguments.extend(["--js-runtimes", "node"])

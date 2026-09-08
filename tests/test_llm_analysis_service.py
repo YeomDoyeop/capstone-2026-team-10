@@ -1,6 +1,6 @@
 import json
 
-from app.services.llm_analysis_service import CHAPTER_SYSTEM, GENRE_GUIDES, SECTION_SYSTEM, LLMAnalysisError, LLMAnalysisService
+from app.services.llm_analysis_service import CHAPTER_SYSTEM, GENRE_GUIDES, SECTION_SYSTEM, SUBTITLE_SPLIT_SYSTEM, WHISPER_SETTINGS_SYSTEM, LLMAnalysisError, LLMAnalysisService
 
 
 def test_prompts_define_summary_and_precise_score_contract():
@@ -9,6 +9,89 @@ def test_prompts_define_summary_and_precise_score_contract():
     assert "summary" in CHAPTER_SYSTEM and "title" not in CHAPTER_SYSTEM
     assert "summary" not in SECTION_SYSTEM and "reason" not in SECTION_SYSTEM
     assert "균등 분할" in CHAPTER_SYSTEM and "문장마다 기계적으로" in SECTION_SYSTEM
+
+
+def test_whisper_settings_uses_strict_json_and_keeps_proper_nouns_as_hotwords(monkeypatch):
+    agent = object.__new__(LLMAnalysisService)
+    captured: dict = {}
+
+    def request(system, prompt, **kwargs):
+        captured.update({"system": system, "prompt": json.loads(prompt), **kwargs})
+        return kwargs["validator"]({"hotwords": [
+            {"text": "AVE", "entity_type": "service"},
+            {"text": "OpenAI", "entity_type": "organization"},
+            {"text": "AVE", "entity_type": "service"},
+        ]})
+
+    monkeypatch.setattr(agent, "_request_json", request)
+    result = agent.recommend_whisper_settings({"title": "AVE와 OpenAI", "description": "", "chapters": [], "channel": "", "categories": [], "tags": []})
+    assert "고유명사" in WHISPER_SETTINGS_SYSTEM and "JSON 외 텍스트" in WHISPER_SETTINGS_SYSTEM
+    assert "특정 대상" in WHISPER_SETTINGS_SYSTEM and "고유명사" in WHISPER_SETTINGS_SYSTEM
+    assert "개발자" not in WHISPER_SETTINGS_SYSTEM and "인공지능" not in WHISPER_SETTINGS_SYSTEM
+    assert captured["prompt"]["title"] == "AVE와 OpenAI"
+    assert captured["response_schema"]["additionalProperties"] is False
+    assert result == {"hotwords": "AVE, OpenAI"}
+
+
+def test_whisper_settings_rejects_hotword_not_present_in_metadata():
+    try:
+        LLMAnalysisService._validated_whisper_settings(
+            {"hotwords": [{"text": "추측한 회사명", "entity_type": "organization"}]},
+            metadata_text='{"title":"AVE 인터뷰"}',
+        )
+    except LLMAnalysisError as exc:
+        assert "원문 표기" in str(exc)
+    else:
+        raise AssertionError("메타데이터에 없는 핫워드를 허용하면 안 됩니다.")
+
+
+def test_whisper_settings_rejects_unclassified_hotword():
+    try:
+        LLMAnalysisService._validated_whisper_settings(
+            {"hotwords": [{"text": "고유명사하나"}]},
+            metadata_text="고유명사하나",
+        )
+    except LLMAnalysisError as exc:
+        assert "개체 유형" in str(exc)
+    else:
+        raise AssertionError("개체 유형 없는 핫워드를 허용하면 안 됩니다.")
+
+
+def test_subtitle_split_requires_contiguous_word_ranges(monkeypatch):
+    agent = object.__new__(LLMAnalysisService)
+    captured = {}
+
+    def request(system, prompt, **kwargs):
+        captured["system"] = system
+        captured["prompt"] = json.loads(prompt)
+        return kwargs["validator"]({"indexes": [1]})
+
+    monkeypatch.setattr(agent, "_request_json", request)
+    result = agent.split_subtitle_words([{"word": value} for value in ["하나", " 둘", " 셋", " 넷"]], 2)
+
+    assert result[-1]["end_word"] == 3
+    assert captured["prompt"]["target_count"] == 2
+    assert "20자" in SUBTITLE_SPLIT_SYSTEM
+
+
+def test_subtitle_split_converts_boundary_indexes_to_contiguous_ranges(monkeypatch):
+    agent = object.__new__(LLMAnalysisService)
+    monkeypatch.setattr(
+        agent,
+        "_request_json",
+        lambda *_args, **kwargs: kwargs["validator"]({"indexes": [1, 3]}),
+    )
+
+    result = agent.split_subtitle_words(
+        [{"word": value} for value in ["가나다", "라마", "바사", "아자", "차카", "타파하"]],
+        3,
+    )
+
+    assert result == [
+        {"start_word": 0, "end_word": 1},
+        {"start_word": 2, "end_word": 3},
+        {"start_word": 4, "end_word": 5},
+    ]
 
 
 def test_structure_requires_contiguous_ids_and_summaries(monkeypatch):
@@ -61,7 +144,7 @@ def test_request_json_retries_after_range_error():
     assert result[0]["start_id"] == 0 and agent.gateway.calls == 2
 
 
-def test_request_json_stops_after_ten_invalid_responses():
+def test_request_json_stops_after_twenty_invalid_responses():
     class Gateway:
         def __init__(self): self.calls = 0
         def request_json(self, *_args, **_kwargs):
@@ -71,10 +154,10 @@ def test_request_json_stops_after_ten_invalid_responses():
     try:
         agent._request_json("계약", "입력")
     except LLMAnalysisError as exc:
-        assert "열 번" in str(exc)
+        assert "스무 번" in str(exc)
     else:
         raise AssertionError("ten invalid responses must fail")
-    assert agent.gateway.calls == 10
+    assert agent.gateway.calls == 20
 
 
 def test_chapter_score_requires_an_integer_in_range():

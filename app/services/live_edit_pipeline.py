@@ -7,8 +7,9 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import textwrap
+import threading
+import time
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -17,13 +18,31 @@ from uuid import uuid4
 
 from app.config import get_media_root
 from app.services.toolchain import ToolchainError, ffmpeg as get_ffmpeg
-from app.services.server_media_service import ServerMediaError, TranscriptionCancelledError, acknowledge_transcription_result, transcribe_uploaded_audio, upload_audio_for_transcription
+from app.services.server_media_service import AccessTokenSource, ServerMediaError, TranscriptionCancelledError, _access_token, acknowledge_transcription_result, prepare_whisper_audio, transcribe_uploaded_audio, upload_audio_for_transcription
+
+
+SUBTITLE_FONT_NAME = "Dotum"
+SUBTITLE_FONT_SIZE = 16
+SUBTITLE_MARGIN_BOTTOM = 12
+SUBTITLE_LINE_WIDTH = 30
+SUBTITLE_MIN_DURATION_SECONDS = 0.08
+WHISPER_LONG_SEGMENT_CHARACTERS = 25
+WHISPER_SPLIT_TARGET_CHARACTERS = 20
+WHISPER_PRIORITY_GAP_SECONDS = 0.5
+WHISPER_PUNCTUATION_PROMPTS = {
+    "ko": "문장은 자연스럽게 이어지고, 의미가 바뀌면 정확히 구분됩니다.",
+    "en": "Sentences flow naturally, and punctuation is used accurately.",
+    "zh": "句子自然连贯，语义变化时会准确断句。",
+    "ja": "文章は自然に続き、意味の変化に合わせて正確に区切られます。",
+}
 from app.services.llm_analysis_service import LLMAnalysisError, LLMAnalysisService
 from app.services.youtube_importer import YouTubeImporter
-from app.services.live_youtube_service import LiveYouTubeError, extract_video_id, load_prepared_transcript
+from app.services.live_youtube_service import LiveYouTubeError, extract_video_id, load_prepared_transcript, prepared_metadata_paths
 
 
 EDIT_GENRES = {"ai_news", "stock", "game"}
+_ATOMIC_WRITE_LOCKS: dict[Path, threading.Lock] = {}
+_ATOMIC_WRITE_LOCKS_GUARD = threading.Lock()
 
 
 class LiveEditPipelineError(RuntimeError):
@@ -31,6 +50,18 @@ class LiveEditPipelineError(RuntimeError):
 
 
 class LiveEditCancelled(LiveEditPipelineError):
+    pass
+
+
+def fixed_whisper_initial_prompt(language: str | None) -> str:
+    """Return a content-neutral punctuation example for a known language."""
+
+    return WHISPER_PUNCTUATION_PROMPTS.get(language or "", "")
+
+
+class LiveEditPaused(LiveEditPipelineError):
+    """LLM retry exhaustion with a reusable on-disk request checkpoint."""
+
     pass
 
 
@@ -51,6 +82,133 @@ def _time_seconds(value: str | int | float) -> float:
         raise ValueError("시간 값 형식이 올바르지 않습니다.")
     hours, minutes, seconds = parts
     return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+
+
+def _whisper_transcript_path(media_root: Path, job_id: str) -> Path:
+    """Return the job-local path used for a prepared Whisper transcript."""
+
+    if not job_id or Path(job_id).name != job_id:
+        raise LiveEditPipelineError("잘못된 편집 작업 ID입니다.")
+    return media_root / "yt-edit" / job_id / f"{job_id}.whisper-transcript.json"
+
+
+def _nonspace_length(value: str) -> int:
+    return len(re.sub(r"\s+", "", value))
+
+
+def _word_text_spans(text: str, words: list[dict[str, Any]]) -> list[tuple[int, int]] | None:
+    """WhisperX 단어를 원본 세그먼트 문자열에 순서대로 대응시킨다."""
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for word in words:
+        value = str(word.get("word") or "").strip()
+        if not value:
+            return None
+        start = text.find(value, cursor)
+        if start < 0:
+            return None
+        end = start + len(value)
+        spans.append((start, end))
+        cursor = end
+    return spans
+
+
+def _split_whisper_segment(
+    segment: dict[str, Any],
+    analysis_service: LLMAnalysisService,
+    *,
+    cancel_callback: Callable[[], None] | None = None,
+) -> list[dict[str, Any]]:
+    text = str(segment.get("text") or "").strip()
+    words = segment.get("words")
+    if _nonspace_length(text) <= WHISPER_LONG_SEGMENT_CHARACTERS or not isinstance(words, list) or len(words) < 2:
+        return [{"start": float(segment["start"]), "end": float(segment["end"]), "text": text}]
+    if any(
+        not isinstance(word, dict)
+        or not isinstance(word.get("start"), (int, float))
+        or not isinstance(word.get("end"), (int, float))
+        or not str(word.get("word") or "").strip()
+        for word in words
+    ):
+        return [{"start": float(segment["start"]), "end": float(segment["end"]), "text": text}]
+    text_spans = _word_text_spans(text, words)
+    if text_spans is None:
+        return [{"start": float(segment["start"]), "end": float(segment["end"]), "text": text}]
+
+    pause_boundaries = {
+        index
+        for index in range(len(words) - 1)
+        if float(words[index + 1]["start"]) - float(words[index]["end"])
+        >= WHISPER_PRIORITY_GAP_SECONDS
+    }
+    group_ends = [*sorted(pause_boundaries), len(words) - 1]
+    word_ranges: list[dict[str, int]] = []
+    group_start = 0
+    for group_end in group_ends:
+        group_words = words[group_start:group_end + 1]
+        group_text_start = 0 if group_start == 0 else text_spans[group_start][0]
+        group_text_end = len(text) if group_end == len(words) - 1 else text_spans[group_end + 1][0]
+        group_text = text[group_text_start:group_text_end].strip()
+        if _nonspace_length(group_text) > WHISPER_LONG_SEGMENT_CHARACTERS and len(group_words) >= 2:
+            target_count = min(
+                len(group_words),
+                max(
+                    2,
+                    (_nonspace_length(group_text) + WHISPER_SPLIT_TARGET_CHARACTERS // 2)
+                    // WHISPER_SPLIT_TARGET_CHARACTERS,
+                ),
+            )
+            parts = analysis_service.split_subtitle_words(
+                group_words,
+                target_count,
+                cancel_callback=cancel_callback,
+            )
+            word_ranges.extend(
+                {
+                    "start_word": group_start + part["start_word"],
+                    "end_word": group_start + part["end_word"],
+                }
+                for part in parts
+            )
+        else:
+            word_ranges.append({"start_word": group_start, "end_word": group_end})
+        group_start = group_end + 1
+
+    result: list[dict[str, Any]] = []
+    segment_start, segment_end = float(segment["start"]), float(segment["end"])
+    for index, part in enumerate(word_ranges):
+        start_word, end_word = part["start_word"], part["end_word"]
+        if index == 0:
+            start = segment_start
+        elif word_ranges[index - 1]["end_word"] in pause_boundaries:
+            start = float(words[start_word]["start"])
+        else:
+            previous_end = word_ranges[index - 1]["end_word"]
+            start = (
+                float(words[previous_end]["end"])
+                + float(words[start_word]["start"])
+            ) / 2
+        if index == len(word_ranges) - 1:
+            end = segment_end
+        elif end_word in pause_boundaries:
+            end = float(words[end_word]["end"])
+        else:
+            next_start = word_ranges[index + 1]["start_word"]
+            end = (
+                float(words[end_word]["end"])
+                + float(words[next_start]["start"])
+            ) / 2
+        start, end = round(start, 3), round(end, 3)
+        if end <= start or start < segment_start or end > segment_end:
+            raise LLMAnalysisError("Whisper 단어 타임스탬프로 유효한 자막 경계를 만들 수 없습니다.")
+        text_start = 0 if index == 0 else text_spans[start_word][0]
+        text_end = len(text) if index == len(word_ranges) - 1 else text_spans[end_word + 1][0]
+        part_text = text[text_start:text_end].strip()
+        if not part_text:
+            raise LLMAnalysisError("Whisper 단어 범위에서 자막 문장을 만들 수 없습니다.")
+        result.append({"start": start, "end": end, "text": part_text})
+    return result
 
 
 def _ensure_candidate_ids(candidates: list[dict[str, Any]]) -> None:
@@ -119,7 +277,7 @@ def write_selected_subtitles(
             start = max(clip_start, float(segment["start"]))
             end = min(clip_end, float(segment["end"]))
             text = re.sub(r"\s+", " ", str(segment.get("text", ""))).strip()
-            if end - start < 0.08 or not text:
+            if end - start < SUBTITLE_MIN_DURATION_SECONDS or not text:
                 continue
             output_start = timeline_offset + start - clip_start
             output_end = timeline_offset + end - clip_start
@@ -131,7 +289,7 @@ def write_selected_subtitles(
 
     lines: list[str] = []
     for index, (start, end, value) in enumerate(entries, start=1):
-        wrapped = "\n".join(textwrap.wrap(value, width=38, break_long_words=False, break_on_hyphens=False))
+        wrapped = "\n".join(textwrap.wrap(value, width=SUBTITLE_LINE_WIDTH, break_long_words=False, break_on_hyphens=False))
         lines.extend([str(index), f"{_srt_timestamp(start)} --> {_srt_timestamp(end)}", wrapped, ""])
     output.write_text("\n".join(lines), encoding="utf-8")
     return len(entries)
@@ -153,6 +311,39 @@ def _run_ffmpeg(command: list[str]) -> None:
         raise LiveEditPipelineError(completed.stderr[-3000:] or "ffmpeg 편집에 실패했습니다.")
 
 
+def _write_json_atomic(path: Path, value: Any) -> None:
+    """Write JSON beside its destination and atomically publish it."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    with _ATOMIC_WRITE_LOCKS_GUARD:
+        lock = _ATOMIC_WRITE_LOCKS.setdefault(path.resolve(), threading.Lock())
+    try:
+        with lock:
+            with pending.open("w", encoding="utf-8") as output:
+                json.dump(value, output, ensure_ascii=False, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            for attempt in range(5):
+                try:
+                    os.replace(pending, path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def _copy_file_atomic(source: Path, destination: Path) -> None:
+    """Copy a completed render beside its destination, then publish it atomically."""
+
+    pending = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+    shutil.copyfile(source, pending)
+    os.replace(pending, destination)
+
+
 def _ffmpeg_binary() -> str:
     try:
         return str(get_ffmpeg())
@@ -165,33 +356,34 @@ _HARDWARE_VIDEO_ENCODERS = ("h264_nvenc", "h264_amf", "h264_qsv")
 
 
 @lru_cache(maxsize=1)
-def _preferred_video_encoder() -> str | None:
-    """지원되는 GPU H.264 인코더를 찾고, 없으면 CPU 인코더를 사용한다."""
+def _render_encoder_candidates() -> tuple[str | None, ...]:
+    """실제 렌더링에 시도할 GPU 후보와 최종 CPU 폴백을 반환한다."""
 
     configured = os.getenv("AVE_VIDEO_ENCODER", "auto").strip().lower()
     if configured == "cpu":
-        return None
+        return (None,)
     candidates = _HARDWARE_VIDEO_ENCODERS if configured in {"", "auto"} else (configured,)
     try:
         completed = subprocess.run([_ffmpeg_binary(), "-hide_banner", "-encoders"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
     except OSError:
-        return None
+        return (None,)
     if completed.returncode != 0:
-        return None
+        return (None,)
     available = completed.stdout + completed.stderr
-    return next((encoder for encoder in candidates if encoder in _HARDWARE_VIDEO_ENCODERS and encoder in available), None)
+    gpu_candidates = tuple(encoder for encoder in candidates if encoder in _HARDWARE_VIDEO_ENCODERS and encoder in available)
+    return (*gpu_candidates, None)
 
 
-def _video_encoding_args(encoder: str | None, *, preview: bool) -> list[str]:
-    """인코더별 품질·속도 옵션. 지원하지 않으면 libx264로 폴백한다."""
+def _video_encoding_args(encoder: str | None) -> list[str]:
+    """개발 단계의 빠른 결과 확인용 인코더 옵션. 지원하지 않으면 libx264로 폴백한다."""
 
     if encoder == "h264_nvenc":
-        return ["-c:v", encoder, "-preset", "p1" if preview else "p4", "-tune", "hq", "-cq", "23" if preview else "20", "-b:v", "0"]
+        return ["-c:v", encoder, "-preset", "p1", "-tune", "hq", "-cq", "23", "-b:v", "0"]
     if encoder == "h264_qsv":
-        return ["-c:v", encoder, "-preset", "veryfast" if preview else "fast", "-global_quality", "23" if preview else "20"]
+        return ["-c:v", encoder, "-preset", "veryfast", "-global_quality", "23"]
     if encoder == "h264_amf":
-        return ["-c:v", encoder, "-quality", "speed" if preview else "balanced", "-qp_i", "23" if preview else "20", "-qp_p", "23" if preview else "20"]
-    return ["-c:v", "libx264", "-preset", "veryfast" if preview else "fast", "-crf", "23" if preview else "20"]
+        return ["-c:v", encoder, "-quality", "speed", "-qp_i", "23", "-qp_p", "23"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
 
 
 def _hardware_decoding_args(encoder: str | None) -> list[str]:
@@ -205,12 +397,21 @@ def _hardware_decoding_args(encoder: str | None) -> list[str]:
     return ["-hwaccel", "auto"] if encoder else []
 
 
+def _render_acceleration_label(encoder: str | None) -> str:
+    """사용자 진행 메시지와 완료 이력에 남길 실제 렌더링 방식을 반환한다."""
+
+    labels = {
+        "h264_nvenc": "NVIDIA GPU (NVENC)",
+        "h264_amf": "AMD GPU (AMF)",
+        "h264_qsv": "Intel GPU (Quick Sync)",
+    }
+    return labels.get(encoder or "", "CPU (libx264)")
+
+
 def _burn_subtitles(
     source: Path,
     subtitles: Path,
     output: Path,
-    font_name: str = "Malgun Gothic",
-    font_size: int = 18,
     encoder: str | None = None,
 ) -> None:
     ffmpeg = _ffmpeg_binary()
@@ -220,18 +421,16 @@ def _burn_subtitles(
     # 이스케이프가 필요하다. libass가 실제 Windows 경로를 받도록 backslash를
     # 두 번 이스케이프한다.
     filter_path = str(subtitles.resolve()).replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
-    safe_font_name = re.sub(r"[\\:'&,]", "", str(font_name)).strip() or "Malgun Gothic"
-    safe_font_size = max(8, min(64, int(font_size)))
     subtitle_filter = (
         f"subtitles=filename='{filter_path}':"
-        f"force_style='FontName={safe_font_name},FontSize={safe_font_size},"
-        "Outline=2,Shadow=1,MarginV=36'"
+        f"force_style='FontName={SUBTITLE_FONT_NAME},FontSize={SUBTITLE_FONT_SIZE},"
+        f"Outline=1,Shadow=0,MarginV={SUBTITLE_MARGIN_BOTTOM}'"
     )
     try:
         _run_ffmpeg([
             ffmpeg, "-y", *_hardware_decoding_args(encoder), "-i", str(source), "-vf", subtitle_filter,
-            *_video_encoding_args(encoder, preview=False),
-            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output),
+            *_video_encoding_args(encoder),
+            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(output),
         ])
     except LiveEditPipelineError as exc:
         raise LiveEditPipelineError(
@@ -239,130 +438,155 @@ def _burn_subtitles(
         ) from exc
 
 
-def render_preview(
+def render_final(
     source: Path,
     clips: list[dict[str, Any]],
     output: Path,
     subtitles: Path | None = None,
-    font_name: str = "Malgun Gothic",
-    font_size: int = 18,
     progress_callback: Callable[[float], None] | None = None,
-) -> None:
-    encoder = _preferred_video_encoder()
-    try:
-        _render_preview(source, clips, output, subtitles, font_name, font_size, progress_callback, encoder)
-    except LiveEditPipelineError:
-        if encoder is None:
-            raise
-        # 컴파일된 인코더가 드라이버·장치 제약으로 실행되지 않으면 같은 작업을
-        # CPU로 다시 실행해 결과 생성 자체가 실패하지 않게 한다.
-        _render_preview(source, clips, output, subtitles, font_name, font_size, progress_callback, None)
+    status_callback: Callable[[str], None] | None = None,
+) -> str:
+    candidates = _render_encoder_candidates()
+    for index, encoder in enumerate(candidates):
+        attempt_name = re.sub(r"[^A-Za-z0-9_-]+", "-", encoder or "libx264")
+        attempt_output = output.with_name(
+            f"{output.stem}.{attempt_name}.{uuid4().hex}.attempt{output.suffix}"
+        )
+        if status_callback:
+            if encoder:
+                status_callback(f"하드웨어 가속 렌더링을 시도합니다: {_render_acceleration_label(encoder)} 인코딩, 입력 하드웨어 디코딩 자동 시도")
+            else:
+                status_callback("사용 가능한 GPU 렌더링에 실패하여 CPU 렌더링을 시도합니다.")
+        try:
+            _render_final(source, clips, attempt_output, subtitles, progress_callback, encoder)
+            _copy_file_atomic(attempt_output, output)
+            return _render_acceleration_label(encoder)
+        except LiveEditPipelineError:
+            if encoder is None:
+                raise
+            next_encoder = candidates[index + 1]
+            if status_callback:
+                status_callback(f"{_render_acceleration_label(encoder)} 렌더링에 실패하여 {_render_acceleration_label(next_encoder)} 렌더링으로 다시 시도합니다.")
+    raise LiveEditPipelineError("렌더링 인코더를 선택하지 못했습니다.")
 
 
-def _render_preview(
+def _render_final(
     source: Path,
     clips: list[dict[str, Any]],
     output: Path,
     subtitles: Path | None = None,
-    font_name: str = "Malgun Gothic",
-    font_size: int = 18,
-    progress_callback: Callable[[float], None] | None = None,
-    encoder: str | None = None,
-) -> None:
-    ffmpeg = _ffmpeg_binary()
-    with tempfile.TemporaryDirectory(prefix="live-edit-") as temp_name:
-        temp = Path(temp_name)
-        files = []
-        total_duration = sum(max(0.0, float(clip["end"]) - float(clip["start"])) for clip in clips)
-        completed_duration = 0.0
-        for index, clip in enumerate(clips):
-            segment = temp / f"segment-{index:04d}.mp4"
-            _run_ffmpeg([
-                # Stream-copy seeking starts on a nearby keyframe. Each clip can
-                # then be slightly longer/shorter than its requested duration,
-                # causing subtitle timestamps to drift further on every join.
-                # Re-encode the preview clips from an accurate post-input seek
-                # so their concatenated timeline matches write_selected_subtitles.
-                ffmpeg, "-y", *_hardware_decoding_args(encoder), "-i", str(source), "-ss", str(clip["start"]),
-                "-t", str(clip["end"] - clip["start"]), "-map", "0:v:0", "-map", "0:a:0?",
-                *_video_encoding_args(encoder, preview=True),
-                "-c:a", "aac", "-b:a", "160k", "-avoid_negative_ts", "make_zero", str(segment),
-            ])
-            files.append(segment)
-            completed_duration += max(0.0, float(clip["end"]) - float(clip["start"]))
-            if progress_callback:
-                progress_callback(0.75 * completed_duration / max(0.001, total_duration))
-        concat = temp / "concat.txt"
-        concat.write_text("\n".join(f"file '{path.as_posix()}'" for path in files), encoding="utf-8")
-        joined = temp / "joined.mp4"
-        _run_ffmpeg([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat), "-c", "copy", str(joined)])
-        if progress_callback:
-            progress_callback(0.82)
-        if subtitles and subtitles.exists() and subtitles.stat().st_size > 0:
-            _burn_subtitles(joined, subtitles, output, font_name, font_size, encoder)
-        else:
-            shutil.copyfile(joined, output)
-        if progress_callback:
-            progress_callback(1.0)
-
-
-def render_exact(
-    source: Path,
-    clips: list[dict[str, Any]],
-    output: Path,
-    subtitles: Path | None = None,
-    font_name: str = "Malgun Gothic",
-    font_size: int = 18,
-    progress_callback: Callable[[float], None] | None = None,
-) -> None:
-    encoder = _preferred_video_encoder()
-    try:
-        _render_exact(source, clips, output, subtitles, font_name, font_size, progress_callback, encoder)
-    except LiveEditPipelineError:
-        if encoder is None:
-            raise
-        _render_exact(source, clips, output, subtitles, font_name, font_size, progress_callback, None)
-
-
-def _render_exact(
-    source: Path,
-    clips: list[dict[str, Any]],
-    output: Path,
-    subtitles: Path | None = None,
-    font_name: str = "Malgun Gothic",
-    font_size: int = 18,
     progress_callback: Callable[[float], None] | None = None,
     encoder: str | None = None,
 ) -> None:
     ffmpeg = _ffmpeg_binary()
-    with tempfile.TemporaryDirectory(prefix="live-edit-exact-") as temp_name:
-        joined = Path(temp_name) / "joined.mp4"
-        video_parts = []
-        audio_parts = []
-        for index, clip in enumerate(clips):
-            start, end = clip["start"], clip["end"]
-            video_parts.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{index}]")
-            audio_parts.append(f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{index}]")
-        concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(clips)))
-        filter_graph = ";".join(video_parts + audio_parts) + f";{concat_inputs}concat=n={len(clips)}:v=1:a=1[v][a]"
-        _run_ffmpeg([
-            ffmpeg, "-y", *_hardware_decoding_args(encoder), "-i", str(source), "-filter_complex", filter_graph,
-            "-map", "[v]", "-map", "[a]", *_video_encoding_args(encoder, preview=False),
-            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(joined),
-        ])
-        if progress_callback:
-            progress_callback(0.82)
-        if subtitles and subtitles.exists() and subtitles.stat().st_size > 0:
-            _burn_subtitles(joined, subtitles, output, font_name, font_size, encoder)
-        else:
-            shutil.copyfile(joined, output)
-        if progress_callback:
-            progress_callback(1.0)
+    joined = output.with_name(f"{output.stem}.{uuid4().hex}.joined.mp4")
+    video_parts = []
+    audio_parts = []
+    for index, clip in enumerate(clips):
+        start, end = clip["start"], clip["end"]
+        video_parts.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{index}]")
+        audio_parts.append(f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{index}]")
+    concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(clips)))
+    filter_graph = ";".join(video_parts + audio_parts) + f";{concat_inputs}concat=n={len(clips)}:v=1:a=1[v][a]"
+    _run_ffmpeg([
+        ffmpeg, "-y", *_hardware_decoding_args(encoder), "-i", str(source), "-filter_complex", filter_graph,
+        "-map", "[v]", "-map", "[a]", *_video_encoding_args(encoder),
+        "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(joined),
+    ])
+    if progress_callback:
+        progress_callback(0.82)
+    if subtitles and subtitles.exists() and subtitles.stat().st_size > 0:
+        _burn_subtitles(joined, subtitles, output, encoder)
+    else:
+        shutil.copyfile(joined, output)
+    if progress_callback:
+        progress_callback(1.0)
 
 
 class LiveEditPipeline:
     def __init__(self, media_root: Path | None = None):
         self.media_root = (media_root or get_media_root()).resolve()
+
+    def prepare_whisper_transcript(self, *, job_id: str, vod_url: str, llm_provider: str, stt_language: str | None, stt_initial_prompt: str | None, stt_hotwords: str | None, stt_speed: float, server_access_token: AccessTokenSource, progress_callback: Callable[[int, str], None] | None = None, cancel_callback: Callable[[], None] | None = None, whisper_job_started_callback: Callable[[str], None] | None = None) -> dict[str, Any]:
+        def check_cancelled() -> None:
+            if cancel_callback:
+                cancel_callback()
+
+        check_cancelled()
+        video_id = extract_video_id(vod_url)
+        transcript_path = _whisper_transcript_path(self.media_root, job_id)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path = transcript_path.parent / f"{job_id}.whisper-source.json"
+        stt_initial_prompt = fixed_whisper_initial_prompt(stt_language) if stt_initial_prompt else ""
+        request_fingerprint = {"video_id": video_id, "language": stt_language, "initial_prompt": stt_initial_prompt, "hotwords": stt_hotwords, "speed": stt_speed, "timestamp_mode": "whisperx-aligned-word-v1"}
+        whisper_segments: list[dict[str, Any]] = []
+        try:
+            saved_source = json.loads(source_path.read_text(encoding="utf-8"))
+            if saved_source.get("request") == request_fingerprint and isinstance(saved_source.get("segments"), list):
+                whisper_segments = saved_source["segments"]
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+        if not whisper_segments:
+            source_audio_path = YouTubeImporter(self.media_root).prepare_best_audio(vod_url, video_id)
+            whisper_audio_path = prepare_whisper_audio(source_audio_path, prepared_metadata_paths(video_id)["whisper_audio"])
+            check_cancelled()
+            if progress_callback: progress_callback(20, "Whisper 전사용 오디오를 준비했습니다.")
+            uploaded = upload_audio_for_transcription(whisper_audio_path, server_access_token)
+            check_cancelled()
+            if progress_callback: progress_callback(25, "Whisper API로 음성을 전사하는 중입니다.")
+            remote_job_id: str | None = None
+            def started(value: str) -> None:
+                nonlocal remote_job_id
+                remote_job_id = value
+                if whisper_job_started_callback: whisper_job_started_callback(value)
+            result = transcribe_uploaded_audio(uploaded.file_id, server_access_token, client_job_id=job_id, server_job_id=None, language=stt_language, initial_prompt=stt_initial_prompt, hotwords=stt_hotwords, speed=stt_speed, progress_callback=lambda progress, message: (check_cancelled(), progress_callback and progress_callback(min(80, progress), message)), job_started_callback=started)
+            check_cancelled()
+            if result.get("engine") != "whisperx-aligned-word-v1" or result.get("alignment") != "ctc-forced-alignment-with-words":
+                raise LiveEditPipelineError("WhisperX 단어 강제 정렬 API가 아닌 전사 결과를 받았습니다.")
+            whisper_segments = result.get("segments", [])
+            if not whisper_segments: raise LiveEditPipelineError("Whisper 전사 결과에 세그먼트가 없습니다.")
+            _write_json_atomic(source_path, {"request": request_fingerprint, "language": result.get("language"), "engine": result.get("engine"), "alignment": result.get("alignment"), "segments": whisper_segments})
+            if remote_job_id:
+                try: acknowledge_transcription_result(remote_job_id, _access_token(server_access_token))
+                except ServerMediaError: pass
+        checkpoint_path = transcript_path.parent / f"{job_id}.llm-checkpoint.json"
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8")) if checkpoint_path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            checkpoint = {}
+        if not isinstance(checkpoint, dict):
+            checkpoint = {}
+
+        def save_checkpoint() -> None:
+            _write_json_atomic(checkpoint_path, checkpoint)
+
+        needs_split = any(
+            _nonspace_length(str(segment.get("text") or "")) > WHISPER_LONG_SEGMENT_CHARACTERS
+            and isinstance(segment.get("words"), list)
+            and len(segment["words"]) >= 2
+            for segment in whisper_segments
+        )
+        analysis_service = LLMAnalysisService(
+            provider=llm_provider,
+            server_access_token=_access_token(server_access_token),
+            checkpoint=checkpoint,
+            checkpoint_callback=save_checkpoint,
+        ) if needs_split else None
+        segments: list[dict[str, Any]] = []
+        try:
+            for index, segment in enumerate(whisper_segments):
+                check_cancelled()
+                if analysis_service is None:
+                    segments.append({"start": float(segment["start"]), "end": float(segment["end"]), "text": str(segment["text"]).strip()})
+                else:
+                    segments.extend(_split_whisper_segment(segment, analysis_service, cancel_callback=cancel_callback))
+                if progress_callback:
+                    progress_callback(80 + int(19 * (index + 1) / max(1, len(whisper_segments))), "긴 Whisper 문장을 자막 단위로 분할하는 중입니다.")
+        except LLMAnalysisError as exc:
+            raise LiveEditPaused(f"LLM 자막 분할이 재시도 한도에 도달했습니다: {exc}") from exc
+        _write_json_atomic(transcript_path, {"segments": segments})
+        if progress_callback: progress_callback(100, "Whisper 전사를 완료했습니다.")
+        return {"job_id": job_id, "video_id": video_id, "segment_count": len(segments)}
 
     def run(
         self,
@@ -374,13 +598,10 @@ class LiveEditPipeline:
         target_seconds: int = 600,
         transcription_source: str = "youtube_caption",
         transcript_language: str | None = None,
-        stt_language: str = "ko",
+        stt_language: str | None = "ko",
         stt_initial_prompt: str | None = None,
         stt_hotwords: str | None = None,
         stt_speed: float = 1.0,
-        subtitle_font_name: str = "Malgun Gothic",
-        subtitle_font_size: int = 18,
-        render_mode: str = "preview",
         defer_render: bool = True,
         progress_callback: Callable[[int, str], None] | None = None,
         cancel_callback: Callable[[], None] | None = None,
@@ -394,12 +615,10 @@ class LiveEditPipeline:
             if progress_callback:
                 progress_callback(progress, message)
 
-        if target_seconds < 60 or target_seconds > 3600:
-            raise LiveEditPipelineError("target_seconds는 60초에서 3600초 사이여야 합니다.")
+        if target_seconds < 60 or target_seconds > 7200:
+            raise LiveEditPipelineError("target_seconds는 60초에서 7200초 사이여야 합니다.")
         if genre not in EDIT_GENRES:
             raise LiveEditPipelineError("genre는 ai_news, stock 또는 game이어야 합니다.")
-        if render_mode not in {"preview", "exact"}:
-            raise LiveEditPipelineError("render_mode는 preview 또는 exact여야 합니다.")
 
         job_id = job_id or uuid4().hex
         if Path(job_id).name != job_id:
@@ -410,8 +629,8 @@ class LiveEditPipeline:
         importer = YouTubeImporter(self.media_root)
         imported = importer.find_complete_cached_import(vod_url, job_id=f"edit-{job_id}")
         if imported is None:
-            raise LiveEditPipelineError("1·2단계에서 준비한 원본 영상과 자막/캡션을 찾지 못했습니다.")
-        report(18, "1·2단계에서 준비한 원본 영상과 자막을 재사용합니다.")
+            raise LiveEditPipelineError("1·2단계에서 준비한 원본 영상을 찾지 못했습니다.")
+        report(18, "1·2단계에서 준비한 원본 영상과 스크립트를 재사용합니다.")
         source = Path(imported.get("video_path", ""))
         if not source.is_absolute():
             source = (Path.cwd() / source).resolve()
@@ -436,11 +655,22 @@ class LiveEditPipeline:
             except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 raise LiveEditPipelineError("2단계 스크립트 파일 형식이 올바르지 않습니다.") from exc
         if transcription_source == "whisper_api":
+            transcript_path = _whisper_transcript_path(self.media_root, job_id)
+            try:
+                payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+                raw_segments = [{"start": float(item["start"]), "end": float(item["end"]), "text": str(item["text"])} for item in payload["segments"] if isinstance(item, dict) and item.get("text")]
+            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise LiveEditPipelineError("2단계에서 준비한 Whisper 전사 파일을 찾지 못했습니다.") from exc
+        if False:  # Whisper 원격 전사는 2단계 준비 작업에서만 수행한다.
             if whisper_preparing_callback:
                 whisper_preparing_callback()
             report(22, "음원을 AVE 서버에 올리는 중입니다.")
             try:
-                uploaded_audio = upload_audio_for_transcription(source, server_access_token or "")
+                source_audio_path = YouTubeImporter(self.media_root).prepare_best_audio(vod_url, video_id)
+                whisper_audio_path = prepare_whisper_audio(
+                    source_audio_path, prepared_metadata_paths(video_id)["whisper_audio"]
+                )
+                uploaded_audio = upload_audio_for_transcription(whisper_audio_path, server_access_token or "")
                 report(25, "Whisper API로 음성을 전사하는 중입니다. 처음 요청은 모델 준비로 오래 걸릴 수 있습니다.")
                 whisper_remote_job_id: str | None = None
 
@@ -467,8 +697,9 @@ class LiveEditPipeline:
                     for segment in transcription_result["segments"]
                     if isinstance(segment, dict)
                 ]
-                (output_dir / f"{job_id}.whisper-transcript.json").write_text(
-                    json.dumps({"segments": raw_segments}, ensure_ascii=False, indent=2), encoding="utf-8"
+                _write_json_atomic(
+                    output_dir / f"{job_id}.whisper-transcript.json",
+                    {"segments": raw_segments},
                 )
                 if whisper_remote_job_id:
                     try:
@@ -483,8 +714,25 @@ class LiveEditPipeline:
             raise LiveEditPipelineError("자막 파일은 있지만 시간표시 문장을 읽지 못했습니다.")
 
         raw_segments = [{**segment, "id": index} for index, segment in enumerate(raw_segments)]
+        _write_json_atomic(
+            output_dir / f"{job_id}.analysis-transcript.json",
+            {"segments": raw_segments},
+        )
         report(22, f"자막 {len(raw_segments):,}개 구간을 확인했습니다.")
-        analysis_service = LLMAnalysisService(provider=llm_provider, server_access_token=server_access_token)
+        checkpoint_path = output_dir / f"{job_id}.llm-checkpoint.json"
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8")) if checkpoint_path.is_file() else {}
+        except (OSError, json.JSONDecodeError):
+            checkpoint = {}
+        if not isinstance(checkpoint, dict):
+            checkpoint = {}
+        checkpoint["transcript_ids"] = [item["id"] for item in raw_segments]
+        checkpoint["transcription_source"] = transcription_source
+
+        def save_checkpoint() -> None:
+            _write_json_atomic(checkpoint_path, checkpoint)
+
+        analysis_service = LLMAnalysisService(provider=llm_provider, server_access_token=server_access_token, checkpoint=checkpoint, checkpoint_callback=save_checkpoint)
         try:
             structure = analysis_service.structure_transcript(
                 raw_segments,
@@ -492,7 +740,7 @@ class LiveEditPipeline:
                 cancel_callback=cancel_callback,
             )
         except LLMAnalysisError as exc:
-            raise LiveEditPipelineError(f"LLM 챕터·섹션 분할에 실패했습니다: {exc}") from exc
+            raise LiveEditPaused(f"LLM 챕터·섹션 분할이 재시도 한도에 도달했습니다: {exc}") from exc
         subtitle_by_id = {int(item["id"]): item for item in raw_segments}
         candidates: list[dict[str, Any]] = []
         chapters: list[dict[str, Any]] = []
@@ -522,12 +770,18 @@ class LiveEditPipeline:
                 })
             chapters.append({"chapter_id": chapter_id, "summary": chapter["summary"], "llm_score": float(chapter["score"]), "start": float(first["start"]), "end": float(last["end"]), "sections": chapter_sections})
         report(55, "LLM이 전체 스크립트를 챕터와 섹션으로 분할했습니다.")
-        scored = analysis_service.score_sections(
-            candidates,
-            genre=genre,
-            progress_callback=lambda done, total, label: report(55 + int(25 * done / max(1, total)), f"LLM {label} ({done}/{total})"),
-            cancel_callback=cancel_callback,
-        )
+        try:
+            scored = analysis_service.score_sections(
+                candidates,
+                genre=genre,
+                progress_callback=lambda done, total, label: report(55 + int(25 * done / max(1, total)), f"LLM {label} ({done}/{total})"),
+                cancel_callback=cancel_callback,
+            )
+        except LLMAnalysisError as exc:
+            raise LiveEditPaused(f"LLM 섹션 중요도 평가가 재시도 한도에 도달했습니다: {exc}") from exc
+        # Keep the completed request checkpoint with the job. Cancelled and
+        # failed job files are preserved locally even though they are not
+        # restored automatically.
         report(80, f"LLM이 섹션 {len(scored):,}개의 중요도를 평가했습니다.")
         # Stable IDs let the browser send a compact, auditable selection back
         # without trusting client-provided timestamps or text.
@@ -547,10 +801,7 @@ class LiveEditPipeline:
             "transcription_source": transcription_source,
             "target_seconds": target_seconds,
             "source_video_path": str(source.resolve()),
-            "render_mode": render_mode,
-            "subtitle_font_name": subtitle_font_name,
-            "subtitle_font_size": subtitle_font_size,
-            "rendered_filename": f"edited-{render_mode}.mp4",
+            "rendered_filename": "edited.mp4",
             "source_duration_seconds": duration,
             "candidates": scored,
             "chapters": chapters,
@@ -558,6 +809,10 @@ class LiveEditPipeline:
             "selected_segment_ids": recommended_segment_ids,
             "clips": clips,
         }
+        _write_json_atomic(
+            output_dir / f"{job_id}.analysis-plan.json",
+            {**plan, "script_segments": raw_segments},
+        )
 
         base_result = {
             "job_id": job_id,
@@ -569,13 +824,10 @@ class LiveEditPipeline:
             "transcription_source": transcription_source,
             "subtitles_burned_in": False,
             "rendered_video_path": None,
-            "render_mode": render_mode,
-            "subtitle_font_name": subtitle_font_name,
-            "subtitle_font_size": subtitle_font_size,
             "target_seconds": target_seconds,
             "selected_duration_seconds": round(sum(item["end"] - item["start"] for item in clips), 3),
-            # 분석 전사문은 활성 작업 메모리에만 보관하며, 선택 렌더링 뒤
-            # SQLite와 서버 이력에는 LocalJobStore가 최소 계획만 남긴다.
+            # 분석 자료는 작업 폴더와 활성 작업 응답에 보관한다. 선택 렌더링 뒤
+            # SQLite에는 LocalJobStore가 최소 완료 계획만 남긴다.
             "analysis_plan": {**plan, "script_segments": raw_segments},
             "recommended_segment_ids": recommended_segment_ids,
             "clips": clips,
@@ -585,15 +837,20 @@ class LiveEditPipeline:
             report(90, "AI 분석이 완료되었습니다. 웹에서 원하는 구간을 선택하세요.")
             return base_result
 
-        rendered = output_dir / f"{job_id}.edited-{render_mode}.mp4"
-        with tempfile.TemporaryDirectory(prefix="ave-srt-") as temporary:
-            subtitles = Path(temporary) / "render.srt"
-            subtitle_count = write_selected_subtitles(raw_segments, clips, subtitles)
-            if render_mode == "preview":
-                render_preview(source, clips, rendered, subtitles, subtitle_font_name, subtitle_font_size)
-            else:
-                render_exact(source, clips, rendered, subtitles, subtitle_font_name, subtitle_font_size)
-        report(100, "AI 영상 편집이 완료되었습니다.")
+        rendered = output_dir / f"{job_id}.edited.mp4"
+        render_id = uuid4().hex
+        pending_output = output_dir / f"{job_id}.edited.{render_id}.pending.mp4"
+        subtitles = output_dir / f"{job_id}.render-input.{render_id}.srt"
+        subtitle_count = write_selected_subtitles(raw_segments, clips, subtitles)
+        rendering_backend = render_final(
+            source,
+            clips,
+            pending_output,
+            subtitles,
+            status_callback=lambda message: report(90, message),
+        )
+        _copy_file_atomic(pending_output, rendered)
+        report(100, f"AI 영상 편집이 완료되었습니다. 최종 렌더링: {rendering_backend}")
         return {
             **base_result,
             "subtitles_burned_in": subtitle_count > 0,
@@ -632,7 +889,6 @@ class LiveEditPipeline:
                 })
             chapters.append({**chapter, "sections": sections})
         clips = plan.get("clips") or []
-        render_mode = str(plan.get("render_mode", "preview"))
         return {
             "job_id": job_id,
             "genre": plan.get("genre", "ai_news"),
@@ -647,7 +903,6 @@ class LiveEditPipeline:
             "revision": int(plan.get("revision") or 0),
             "source_video_url": f"/api/youtube/edit/{job_id}/media/source",
             "rendered_video_url": f"/api/youtube/edit/{job_id}/media/rendered",
-            "render_mode": render_mode,
         }
 
     def rerender_from_selection(
@@ -704,33 +959,23 @@ class LiveEditPipeline:
             raise LiveEditPipelineError("메모리의 원본 스크립트를 찾을 수 없습니다.")
 
         report(0, "선택한 구간에 맞춰 자막 시간축을 다시 만드는 중입니다.")
-        render_mode = str(plan.get("render_mode", "preview"))
-        font_name = str(plan.get("subtitle_font_name", "Malgun Gothic"))
-        font_size = int(plan.get("subtitle_font_size", 18))
         revision = int(plan.get("revision") or 0) + 1
-        output = output_dir / f"{job_id}.edited-{render_mode}.mp4"
-        pending_output = output_dir / f"{job_id}.edited-{render_mode}.pending.mp4"
+        output = output_dir / f"{job_id}.edited.mp4"
+        render_id = uuid4().hex
+        pending_output = output_dir / f"{job_id}.edited.{render_id}.pending.mp4"
         report(0, f"사용자가 선택한 {len(canonical_ids):,}개 구간을 렌더링하는 중입니다.")
         def report_render_progress(fraction: float) -> None:
             percent = max(0, min(98, int(round(float(fraction) * 98))))
             report(percent, f"영상 렌더링 진행률 {percent}%")
 
-        pending_subtitles = output_dir / f"{job_id}.render-input.srt"
-        try:
-            subtitle_count = write_selected_subtitles(raw_segments, clips, pending_subtitles)
-            if render_mode == "preview":
-                render_preview(source, clips, pending_output, pending_subtitles, font_name, font_size, progress_callback=report_render_progress)
-            elif render_mode == "exact":
-                render_exact(source, clips, pending_output, pending_subtitles, font_name, font_size, progress_callback=report_render_progress)
-            else:
-                raise LiveEditPipelineError("저장된 렌더링 방식이 올바르지 않습니다.")
-        except Exception:
-            pending_output.unlink(missing_ok=True)
-            raise
-        finally:
-            pending_subtitles.unlink(missing_ok=True)
+        def report_render_status(message: str) -> None:
+            report(0, message)
 
-        os.replace(pending_output, output)
+        pending_subtitles = output_dir / f"{job_id}.render-input.{render_id}.srt"
+        subtitle_count = write_selected_subtitles(raw_segments, clips, pending_subtitles)
+        rendering_backend = render_final(source, clips, pending_output, pending_subtitles, progress_callback=report_render_progress, status_callback=report_render_status)
+
+        _copy_file_atomic(pending_output, output)
         plan.update(
             {
                 "clips": clips,
@@ -741,7 +986,8 @@ class LiveEditPipeline:
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
         )
-        report(100, "선택한 구간으로 영상을 다시 만들었습니다.")
+        _write_json_atomic(output_dir / f"{job_id}.analysis-plan.json", plan)
+        report(100, f"선택한 구간으로 영상을 다시 만들었습니다. 최종 렌더링: {rendering_backend}")
         return {
             **self.get_segment_review(job_id, plan),
             "rendered_video_path": str(output.resolve()),

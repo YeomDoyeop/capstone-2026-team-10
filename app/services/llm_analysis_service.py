@@ -1,6 +1,8 @@
 """공급자와 무관한 JSON 기반 영상 구조화·하이라이트 분석 서비스."""
 from __future__ import annotations
 import json
+import hashlib
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,15 +37,67 @@ SECTION_SYSTEM = '''역할: 영상 편집용 챕터 내부 최소 의미 단위 
 CHAPTER_RESPONSE_SCHEMA={"type":"object","additionalProperties":False,"required":["chapters"],"properties":{"chapters":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["start_id","end_id","summary","score"],"properties":{"start_id":{"type":"integer"},"end_id":{"type":"integer"},"summary":{"type":"string"},"score":{"type":"integer","minimum":0,"maximum":1000}}}}}}
 SECTION_RESPONSE_SCHEMA={"type":"object","additionalProperties":False,"required":["sections"],"properties":{"sections":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["start_id","end_id"],"properties":{"start_id":{"type":"integer"},"end_id":{"type":"integer"}}}}}}
 SCORE_RESPONSE_SCHEMA={"type":"object","additionalProperties":False,"required":["items"],"properties":{"items":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["id","score"],"properties":{"id":{"type":"string"},"score":{"type":"integer","minimum":0,"maximum":1000}}}}}}
+WHISPER_SETTINGS_SYSTEM = '''역할: 영상 메타데이터에서 Whisper STT용 고유명사 핫워드만 보수적으로 추출하는 개체명 판별기.
 
+고유명사 판정:
+1. 항목은 현실 또는 작품 안의 단 하나의 특정 대상을 식별하는 이름이어야 한다.
+2. 허용 유형은 person, organization, channel, brand, product, model, service, work, game, place, event 중 하나다.
+3. 입력 메타데이터에 동일한 문자열이 원문 그대로 존재해야 한다. 번역·교정·확장·축약·추측으로 표기를 만들지 않는다.
+4. 일반 명사, 보편적 전문 용어, 직업명, 직함만 있는 표현, 학문·산업 분야, 주제, 장르, 범주, 성질, 상태, 행동, 설명구는 제외한다.
+5. 문맥에 따라 고유명사일 수도 있는 애매한 말은 제외한다. 포함 근거가 명백한 항목만 선택한다.
+6. 동일 대상을 가리키는 전체명·약칭·부분명·표기 변형이 겹치면 가장 명확한 원문 표기 하나만 남긴다.
+7. 항목 수를 채우지 않는다. 확실한 고유명사가 없으면 빈 배열을 반환한다.
+
+작업 순서:
+1. 입력에서 후보를 찾는다.
+2. 각 후보가 특정 대상의 이름인지 판정한다.
+3. 허용 유형 하나를 지정한다.
+4. 원문 일치와 중복 여부를 다시 확인한다.
+5. 확실한 항목만 중요도순으로 최대 10개 반환한다. 각 text는 40자 이내다.
+
+출력 전 검사: 각 항목에 대해 “이 표현은 종류나 개념이 아니라 특정 대상의 이름인가?”에 확실히 예라고 답할 수 없으면 삭제한다.
+출력 규칙: JSON 외 텍스트, Markdown, 코드펜스, 설명, 주석을 절대 쓰지 않는다.
+출력 형식: {"hotwords":[{"text":string,"entity_type":string}]}'''
+WHISPER_ENTITY_TYPES = frozenset({"person", "organization", "channel", "brand", "product", "model", "service", "work", "game", "place", "event"})
+WHISPER_SETTINGS_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["hotwords"],
+    "properties": {
+        "hotwords": {"type": "array", "maxItems": 10, "items": {
+            "type": "object", "additionalProperties": False, "required": ["text", "entity_type"],
+            "properties": {"text": {"type": "string", "minLength": 1, "maxLength": 40}, "entity_type": {"type": "string", "enum": sorted(WHISPER_ENTITY_TYPES)}},
+        }},
+    },
+}
+SUBTITLE_SPLIT_SYSTEM = '''역할: 영상 자막용 문장 경계 결정기.
+목표: 하나의 긴 Whisper 문장을 제공된 단어 경계에서만 의미가 자연스럽고 길이가 가능한 한 균등한 연속 자막으로 분할한다.
+입력 형식: {"target_count":정수,"words":[{"id":0부터 시작하는 연속 정수,"text":원문 단어}]}이다.
+분할 기준: target_count개를 정확히 만들되 각 부분의 공백 제외 글자 수가 20자에 가깝고 서로 가능한 한 균등해야 한다. 구·절·문장부호와 문법적 의미 단위를 우선하며, 지나치게 짧은 조각을 만들지 않는다.
+경계 규칙: indexes에는 각 자막 조각의 마지막 단어 id를 마지막 조각을 제외하고 순서대로 넣는다. 예를 들어 indexes가 [0,2]이면 단어 범위는 0 / 1~2 / 3~마지막이다. 값은 0 이상 마지막 단어 id 미만의 서로 다른 오름차순 정수이며, 개수는 target_count-1이어야 한다.
+보존 규칙: 단어를 수정·추가·삭제·재배열하지 않는다.
+출력 규칙: JSON 외 텍스트, Markdown, 코드펜스, 설명, 주석을 절대 쓰지 않는다.
+출력 형식: {"indexes":[number]}'''
+SUBTITLE_SPLIT_RESPONSE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["indexes"],
+    "properties": {
+        "indexes": {"type": "array", "items": {"type": "integer"}},
+    },
+}
 class LLMAnalysisService:
-    def __init__(self, *, provider: str="deepseek", server_access_token: str|None=None, **_: Any):
+    def __init__(self, *, provider: str="deepseek", server_access_token: str|None=None, checkpoint: dict[str, Any] | None = None, checkpoint_callback: Callable[[], None] | None = None, **_: Any):
         try: self.gateway=LLMGateway(provider, server_access_token=server_access_token)
         except LLMGatewayError as exc: raise LLMAnalysisError(str(exc)) from exc
         self._max_parallel_requests = self.gateway.max_parallel_requests
         self._minimum_request_interval_seconds = self.gateway.minimum_request_interval_seconds
         self._request_limit_lock = threading.Lock()
         self._last_request_started_at = 0.0
+        self._checkpoint = checkpoint if checkpoint is not None else {}
+        self._checkpoint_responses = self._checkpoint.setdefault("llm_responses", {})
+        self._checkpoint_callback = checkpoint_callback
+        self._checkpoint_lock = threading.Lock()
     def _wait_for_request_slot(self, cancel_callback: Callable[[],None]|None) -> None:
         interval = getattr(self, "_minimum_request_interval_seconds", 0.0)
         if interval <= 0:
@@ -57,19 +111,108 @@ class LLMAnalysisService:
             if cancel_callback: cancel_callback()
             self._last_request_started_at = time.monotonic()
     def _request_json(self, system: str, prompt: str, *, response_schema: dict[str,Any]|None=None, validator: Callable[[Any],Any]|None=None, cancel_callback: Callable[[],None]|None=None) -> Any:
+        cache_key = hashlib.sha256(json.dumps([system, prompt, response_schema], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        checkpoint_lock = getattr(self, "_checkpoint_lock", None)
+        responses = getattr(self, "_checkpoint_responses", {})
+        if checkpoint_lock is None:
+            cached = None
+        else:
+            with checkpoint_lock:
+                cached = responses.get(cache_key)
+        if cached is not None:
+            value = validator(cached) if validator else cached
+            if cancel_callback: cancel_callback()
+            return value
         last_error: Exception|None=None
-        for attempt in range(10):
+        for attempt in range(20):
             if cancel_callback: cancel_callback()
             self._wait_for_request_slot(cancel_callback)
             rule="" if attempt==0 else "\n직전 응답은 JSON 문법 또는 배열 길이·ID 범위 계약을 지키지 못했습니다. 설명하지 말고 완결된 JSON 객체 하나만 반환하세요. 입력 순서와 길이, 문자열·쉼표·대괄호·중괄호를 확인하세요."
             try:
-                value=json.loads(self.gateway.request_json(system+rule,prompt,response_schema=response_schema))
-                value = validator(value) if validator else value
+                raw=json.loads(self.gateway.request_json(system+rule,prompt,response_schema=response_schema))
+                value = validator(raw) if validator else raw
+                if checkpoint_lock is not None:
+                    with checkpoint_lock:
+                        responses[cache_key] = raw
+                        callback = getattr(self, "_checkpoint_callback", None)
+                        if callback:
+                            callback()
                 if cancel_callback: cancel_callback()
                 return value
             except LLMGatewayError as exc: raise LLMAnalysisError(f"구조화 JSON 요청에 실패했습니다: {exc}") from exc
             except (json.JSONDecodeError,LLMAnalysisError) as exc: last_error=exc
-        raise LLMAnalysisError("LLM이 열 번 연속 JSON 문법 또는 응답 계약을 지키지 않았습니다.") from last_error
+        raise LLMAnalysisError("LLM이 스무 번 연속 JSON 문법 또는 응답 계약을 지키지 않았습니다.") from last_error
+    @staticmethod
+    def _validated_whisper_settings(raw: Any, *, metadata_text: str = "") -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != {"hotwords"}:
+            raise LLMAnalysisError("Whisper 설정 응답 객체 형식이 올바르지 않습니다.")
+        hotwords = raw.get("hotwords")
+        if not isinstance(hotwords, list) or len(hotwords) > 10:
+            raise LLMAnalysisError("Whisper 설정 응답 필드 형식이 올바르지 않습니다.")
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in hotwords:
+            if not isinstance(item, dict) or set(item) != {"text", "entity_type"}:
+                raise LLMAnalysisError("Whisper 핫워드는 고유명사와 개체 유형을 포함해야 합니다.")
+            value, entity_type = item.get("text"), item.get("entity_type")
+            if not isinstance(value, str) or entity_type not in WHISPER_ENTITY_TYPES:
+                raise LLMAnalysisError("Whisper 핫워드의 고유명사 유형이 올바르지 않습니다.")
+            word = value.strip()
+            if not word or len(word) > 40:
+                raise LLMAnalysisError("Whisper 핫워드 길이가 올바르지 않습니다.")
+            if metadata_text and word.casefold() not in metadata_text.casefold():
+                raise LLMAnalysisError("Whisper 핫워드는 입력 메타데이터의 원문 표기여야 합니다.")
+            key = word.casefold()
+            if key not in seen:
+                seen.add(key)
+                cleaned.append(word)
+        return {"hotwords": ", ".join(cleaned)}
+    def recommend_whisper_settings(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        prompt = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+        return self._request_json(
+            WHISPER_SETTINGS_SYSTEM,
+            prompt,
+            response_schema=WHISPER_SETTINGS_RESPONSE_SCHEMA,
+            validator=lambda raw: self._validated_whisper_settings(raw, metadata_text=prompt),
+        )
+    def split_subtitle_words(
+        self,
+        words: list[dict[str, Any]],
+        target_count: int,
+        *,
+        cancel_callback: Callable[[], None] | None = None,
+    ) -> list[dict[str, int]]:
+        rows = [{"id": index, "text": str(word["word"])} for index, word in enumerate(words)]
+        if target_count < 2 or target_count > len(rows):
+            raise LLMAnalysisError("자막 목표 분할 수가 단어 수와 맞지 않습니다.")
+
+        def validate(raw: Any) -> list[dict[str, int]]:
+            if not isinstance(raw, dict) or set(raw) != {"indexes"}:
+                raise LLMAnalysisError("자막 분할 응답 객체 형식이 올바르지 않습니다.")
+            indexes = raw.get("indexes")
+            if (
+                not isinstance(indexes, list)
+                or len(indexes) != target_count - 1
+                or any(type(index) is not int for index in indexes)
+                or indexes != sorted(set(indexes))
+                or any(index < 0 or index >= len(rows) - 1 for index in indexes)
+            ):
+                raise LLMAnalysisError("자막 분할 경계 인덱스가 올바르지 않습니다.")
+            starts = [0, *(index + 1 for index in indexes)]
+            ends = [*indexes, len(rows) - 1]
+            return [
+                {"start_word": start, "end_word": end}
+                for start, end in zip(starts, ends)
+            ]
+
+        prompt = json.dumps({"target_count": target_count, "words": rows}, ensure_ascii=False, separators=(",", ":"))
+        return self._request_json(
+            SUBTITLE_SPLIT_SYSTEM,
+            prompt,
+            response_schema=SUBTITLE_SPLIT_RESPONSE_SCHEMA,
+            validator=validate,
+            cancel_callback=cancel_callback,
+        )
     @staticmethod
     def _validated_ranges(raw: Any, ids: list[int], *, key: str, require_chapter_fields: bool) -> list[dict[str,Any]]:
         if not isinstance(raw,dict) or set(raw) != {key}:

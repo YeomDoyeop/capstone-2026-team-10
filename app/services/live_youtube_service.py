@@ -7,19 +7,88 @@ import json
 import re
 from typing import Callable
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from app.config import get_media_root
 from app.services.ytdlp_binary import YoutubeDL
-from app.services.youtube_importer import YouTubeImporter, YouTubeImportError
+from app.services.youtube_importer import YouTubeImporter, YouTubeImportError, format_info_json
 
 
 VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 THUMBNAIL_FILENAMES = {"sddefault.jpg", "sd1.jpg", "sd2.jpg", "sd3.jpg"}
+METADATA_PREFERRED_LANGUAGE = "ko"
+METADATA_POLICY_VERSION = 4
 
 
 class LiveYouTubeError(RuntimeError):
     pass
+
+
+def _find_description_chapter_renderers(value: object) -> list[dict]:
+    """YouTube 초기 데이터에서 플레이어의 실제 챕터 렌더러를 찾는다."""
+
+    if isinstance(value, dict):
+        player_bar = value.get("multiMarkersPlayerBarRenderer")
+        if isinstance(player_bar, dict):
+            for marker_map in player_bar.get("markersMap") or []:
+                if not isinstance(marker_map, dict) or marker_map.get("key") != "DESCRIPTION_CHAPTERS":
+                    continue
+                chapters = (marker_map.get("value") or {}).get("chapters") or []
+                return [
+                    chapter["chapterRenderer"]
+                    for chapter in chapters
+                    if isinstance(chapter, dict) and isinstance(chapter.get("chapterRenderer"), dict)
+                ]
+        for child in value.values():
+            result = _find_description_chapter_renderers(child)
+            if result:
+                return result
+    elif isinstance(value, list):
+        for child in value:
+            result = _find_description_chapter_renderers(child)
+            if result:
+                return result
+    return []
+
+
+def _localized_youtube_chapters(downloader, url: str, duration: object) -> list[dict]:
+    """한국어 YouTube 페이지가 제공하는 챕터 제목과 시각을 직접 읽는다."""
+
+    if not isinstance(duration, (int, float)) or isinstance(duration, bool):
+        return []
+    parsed_url = urlparse(url)
+    query = parse_qs(parsed_url.query)
+    query["hl"] = [METADATA_PREFERRED_LANGUAGE]
+    query["gl"] = ["KR"]
+    localized_url = urlunparse(parsed_url._replace(query=urlencode(query, doseq=True)))
+    response = downloader.urlopen(localized_url)
+    try:
+        page = response.read().decode("utf-8", errors="replace")
+    finally:
+        response.close()
+    marker = "var ytInitialData = "
+    start = page.find(marker)
+    if start < 0:
+        return []
+    initial_data, _ = json.JSONDecoder().raw_decode(page, start + len(marker))
+    renderers = _find_description_chapter_renderers(initial_data)
+    parsed: list[tuple[float, str]] = []
+    for renderer in renderers:
+        title = (renderer.get("title") or {}).get("simpleText")
+        start_millis = renderer.get("timeRangeStartMillis")
+        if not isinstance(title, str) or not title.strip() or not isinstance(start_millis, (int, float)):
+            continue
+        parsed.append((float(start_millis) / 1000, title.strip()))
+    if not parsed:
+        return []
+    return [
+        {
+            "start_time": start,
+            "end_time": parsed[index + 1][0] if index + 1 < len(parsed) else float(duration),
+            "title": title,
+        }
+        for index, (start, title) in enumerate(parsed)
+    ]
 
 
 def _download_thumbnail_list(
@@ -164,8 +233,11 @@ def _parse_vtt_rows(content: str, filename: str) -> list[dict]:
         start, end = (part.strip().split(" ", 1)[0] for part in lines[index].split("-->", 1))
         index += 1
         text_lines = []
-        while index < len(lines) and lines[index].strip():
-            text_lines.append(lines[index])
+        while index < len(lines) and "-->" not in lines[index]:
+            if lines[index].strip():
+                text_lines.append(lines[index])
+            elif text_lines:
+                break
             index += 1
         rows.append({
             "filename": filename,
@@ -185,8 +257,34 @@ def _rolling_caption_rows(rows: list[dict]) -> list[dict]:
     avoids showing the same growing sentence over and over in the inspector.
     """
 
-    completed = [row for row in rows if 0 <= row.get("duration_seconds", 1) <= 0.05 and row.get("text")]
-    source = completed or rows
+    completed = [
+        (index, row)
+        for index, row in enumerate(rows)
+        if 0 <= row.get("duration_seconds", 1) <= 0.05 and row.get("text")
+    ]
+    if completed:
+        restored = []
+        for source_index, row in completed:
+            spoken_cue = next(
+                (
+                    candidate
+                    for candidate in reversed(rows[:source_index])
+                    if candidate.get("duration_seconds", 0) > 0.05
+                    and candidate.get("text")
+                ),
+                None,
+            )
+            start = spoken_cue["start"] if spoken_cue else row["start"]
+            end = row["start"]
+            restored.append({
+                **row,
+                "start": start,
+                "end": end,
+                "duration_seconds": _vtt_timestamp_seconds(end) - _vtt_timestamp_seconds(start),
+            })
+        source = restored
+    else:
+        source = rows
     cleaned: list[dict] = []
     previous_text = ""
     for row in source:
@@ -227,7 +325,7 @@ def _live_chat_jsonl_files(output_dir: Path) -> list[Path]:
 
 def _metadata_edit_dir(video_id: str) -> Path:
     """원본 yt-dlp 산출물에서 파생한 2단계 작업 파일의 고정 위치."""
-    path = get_media_root() / "yt-edit" / f"{video_id}.metadata"
+    path = get_media_root() / "yt-edit" / video_id
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -239,10 +337,11 @@ def prepared_metadata_paths(video_id: str) -> dict[str, Path]:
     경로만 읽어야 하며, 자료가 없으면 먼저 2단계를 실행해야 한다.
     """
 
-    directory = get_media_root() / "yt-edit" / f"{video_id}.metadata"
+    directory = get_media_root() / "yt-edit" / video_id
     return {
         "directory": directory,
         "chat_times": directory / f"{video_id}.chat-times.json",
+        "whisper_audio": directory / f"{video_id}.whisper.mp3",
     }
 
 
@@ -296,8 +395,19 @@ def get_video_metadata(url: str, *, refresh: bool = True) -> dict:
     output_dir = get_media_root() / "yt-data" / video_id
     output_dir.mkdir(parents=True, exist_ok=True)
     info_path = output_dir / f"{video_id}.info.json"
+    policy_path = output_dir / f"{video_id}.metadata-policy.json"
     info: dict | None = None
-    if not refresh and info_path.exists():
+    cache_uses_current_language = False
+    try:
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        cache_uses_current_language = (
+            isinstance(policy, dict)
+            and policy.get("preferred_language") == METADATA_PREFERRED_LANGUAGE
+            and policy.get("version") == METADATA_POLICY_VERSION
+        )
+    except (OSError, json.JSONDecodeError):
+        pass
+    if not refresh and info_path.exists() and cache_uses_current_language:
         try:
             cached_info = json.loads(info_path.read_text(encoding="utf-8"))
             if isinstance(cached_info, dict):
@@ -326,13 +436,33 @@ def get_video_metadata(url: str, *, refresh: bool = True) -> dict:
             with YoutubeDL({
                 "skip_download": True,
                 "writeinfojson": True,
+                # 1단계 info.json에는 선택 자료의 본문을 수집하지 않는다.
+                # 자막·캡션·채팅의 트랙 목록은 일반 메타데이터로 유지된다.
+                "writecomments": False,
+                "writesubtitles": False,
+                "writeautomaticsub": False,
+                "extractor_args": {
+                    "youtube": {
+                        "lang": [METADATA_PREFERRED_LANGUAGE],
+                        "max_comments": ["0"],
+                    },
+                },
                 "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
+                "http_headers": {"Accept-Language": "ko-KR,ko;q=0.9"},
                 "quiet": True,
                 "no_warnings": True,
             }) as downloader:
                 # download=True persists the unmodified yt-dlp info JSON.
                 info = downloader.extract_info(url, download=True)
                 if isinstance(info, dict):
+                    try:
+                        localized_chapters = _localized_youtube_chapters(
+                            downloader, url, info.get("duration")
+                        )
+                    except Exception:
+                        localized_chapters = []
+                    if localized_chapters:
+                        info["chapters"] = localized_chapters
                     thumbnail_files = _download_thumbnail_list(
                         downloader,
                         info.get("thumbnails") or [],
@@ -345,6 +475,26 @@ def get_video_metadata(url: str, *, refresh: bool = True) -> dict:
 
     if not isinstance(info, dict):
         raise LiveYouTubeError("YouTube 메타데이터 형식이 올바르지 않습니다.")
+    # writecomments=False는 별도 댓글 파일 생성을 막지만 yt-dlp 버전에
+    # 따라 추출 결과 객체와 info.json에 comments 본문이 남을 수 있다.
+    # 1단계 메타데이터에는 개수만 유지하고 본문은 선택 수집 단계로 격리한다.
+    info.pop("comments", None)
+    try:
+        info = format_info_json(
+            info_path,
+            info,
+            prefer_fallback=True,
+        )
+        format_info_json(
+            policy_path,
+            {
+                "preferred_language": METADATA_PREFERRED_LANGUAGE,
+                "version": METADATA_POLICY_VERSION,
+            },
+            prefer_fallback=True,
+        )
+    except YouTubeImportError as exc:
+        raise LiveYouTubeError(str(exc)) from exc
     duration = info.get("duration")
     if not isinstance(duration, (int, float)) or isinstance(duration, bool) or not 600 <= duration < 21_600:
         raise LiveYouTubeError("10분 이상 6시간 미만 영상만 지원합니다.")
@@ -481,7 +631,8 @@ def download_metadata_materials(
         if comments is None:
             info = run_ytdlp({
                 "skip_download": True,
-                "writeinfojson": True,
+                # 댓글은 comments.json에만 보관하고 기존 info.json은 건드리지 않는다.
+                "writeinfojson": False,
                 "writecomments": True,
                 "extractor_args": {"youtube": {"comment_sort": ["top"]}},
                 "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
@@ -515,9 +666,11 @@ def download_metadata_materials(
         if not paths:
             run_ytdlp({
                 "skip_download": True,
+                "writecomments": False,
                 "writesubtitles": True,
                 "subtitleslangs": ["live_chat"],
                 "subtitlesformat": "json",
+                "extractor_args": {"youtube": {"max_comments": ["0"]}},
                 "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
                 "quiet": True,
                 "no_warnings": True,
@@ -559,9 +712,11 @@ def download_metadata_materials(
         else:
             options = {
                 "skip_download": True,
+                "writecomments": False,
                 option: True,
                 "subtitleslangs": [language],
                 "subtitlesformat": "vtt",
+                "extractor_args": {"youtube": {"max_comments": ["0"]}},
                 "outtmpl": str(output_dir / kind / "%(id)s.%(ext)s"),
                 "quiet": True,
                 "no_warnings": True,
@@ -600,13 +755,16 @@ def download_metadata_materials(
         artifacts.append({"kind": kind, "label": label, "path": str(display_path.resolve()), "parsed_path": str(parsed_path.resolve()), "format": "WebVTT", "count": len(previews), "preview": previews})
         complete_material(label)
 
-    # 분석 단계는 원격 수집을 하지 않는다. 2단계가 선택된 스크립트와 함께
-    # 원본 영상을 확보해 이후 단계가 yt-data만 읽도록 만든다.
-    if selections.get("subtitles") or selections.get("captions"):
-        try:
-            YouTubeImporter(get_media_root()).prepare_source_video(url, job_id=video_id)
-        except (YouTubeImportError, OSError) as exc:
-            raise LiveYouTubeError(f"분석용 원본 영상을 준비하지 못했습니다: {exc}") from exc
+    # 분석 단계는 원격 수집을 하지 않는다. 선택한 추가 자료가 없거나
+    # Whisper만 사용하는 경우에도 2단계에서 원본 영상을 확보한다.
+    try:
+        YouTubeImporter(get_media_root()).prepare_source_video(
+            url,
+            job_id=video_id,
+            include_subtitles=False,
+        )
+    except (YouTubeImportError, OSError) as exc:
+        raise LiveYouTubeError(f"분석용 원본 영상을 준비하지 못했습니다: {exc}") from exc
 
     report(100, "추가 메타데이터 준비를 완료했습니다.")
     return {"video_id": video_id, "artifacts": artifacts}

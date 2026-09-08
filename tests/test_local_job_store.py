@@ -6,7 +6,7 @@ def test_local_job_store_keeps_only_completed_result(tmp_path):
     store.save_completed(
         "abcdefghijk.19d",
         {
-            "rendered_filename": "abcdefghijk.19d.edited-preview.mp4",
+            "rendered_filename": "abcdefghijk.19d.edited.mp4",
             "rendered_video_path": "/media/result.mp4",
             "candidates": [{"text": "저장하면 안 되는 분석 원문"}],
             "summary": {"summary": "저장하면 안 되는 요약"},

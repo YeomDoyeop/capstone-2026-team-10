@@ -2,7 +2,52 @@ import json
 from pathlib import Path
 
 from app.services import youtube_importer
-from app.services.youtube_importer import YouTubeImporter
+from app.services.youtube_importer import YouTubeImporter, format_info_json
+
+
+def test_info_json_is_formatted_atomically_without_changing_values(tmp_path):
+    info_path = tmp_path / "video.info.json"
+    source = {"id": "video", "title": "한국어 제목", "nested": {"values": [1, 2]}}
+    info_path.write_text(json.dumps(source, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+    assert format_info_json(info_path) == source
+    text = info_path.read_text(encoding="utf-8")
+    assert text.endswith("\n")
+    assert '\n  "title": "한국어 제목"' in text
+    assert json.loads(text) == source
+    assert not list(tmp_path.glob(".*.pending"))
+
+
+def test_best_audio_uses_highest_quality_and_is_stored_in_yt_data(tmp_path, monkeypatch):
+    calls = []
+
+    class AudioYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def extract_info(self, _url, download=True):
+            calls.append(self.options)
+            Path(self.options["outtmpl"].replace("%(ext)s", "mp3")).write_bytes(b"best audio")
+            return {"id": "abc123"}
+
+    monkeypatch.setattr(youtube_importer, "YoutubeDL", AudioYoutubeDL)
+    monkeypatch.setattr(youtube_importer, "ffmpeg", lambda: tmp_path / "ffmpeg.exe")
+
+    path = YouTubeImporter(tmp_path).prepare_best_audio(
+        "https://www.youtube.com/watch?v=abc123", "abc123"
+    )
+
+    assert path == tmp_path / "yt-data" / "abc123" / "abc123.mp3"
+    assert path.read_bytes() == b"best audio"
+    assert calls[0]["format"] == "bestaudio/best"
+    assert calls[0]["audioformat"] == "mp3"
+    assert calls[0]["audioquality"] == "0"
 
 
 def test_import_reuses_existing_video_and_vtt_without_invoking_ytdlp(tmp_path, monkeypatch):
@@ -33,6 +78,26 @@ def test_import_reuses_existing_video_and_vtt_without_invoking_ytdlp(tmp_path, m
     assert result["cache_hit"] is True
     assert Path(result["video_path"]).resolve() == video.resolve()
     assert [Path(path).resolve() for path in result["subtitle_files"]] == [subtitle.resolve()]
+
+
+def test_cached_source_video_is_reusable_without_vtt_for_whisper(tmp_path):
+    cache_dir = tmp_path / "yt-data" / "abc123"
+    cache_dir.mkdir(parents=True)
+    video = cache_dir / "sample-abc123.mp4"
+    video.write_bytes(b"existing video")
+    (cache_dir / "abc123.info.json").write_text(
+        json.dumps({"source_url": "https://www.youtube.com/watch?v=abc123", "title": "Whisper source"}),
+        encoding="utf-8",
+    )
+
+    result = YouTubeImporter(tmp_path).find_complete_cached_import(
+        "https://www.youtube.com/watch?v=abc123", "edit-job"
+    )
+
+    assert result is not None
+    assert result["cache_hit"] is True
+    assert result["subtitle_files"] == []
+    assert Path(result["video_path"]).resolve() == video.resolve()
 
 
 def test_import_reuses_phase_two_caption_when_downloading_the_source_video(tmp_path, monkeypatch):
@@ -167,7 +232,10 @@ def test_import_uses_single_file_format_when_ffmpeg_is_missing(tmp_path, monkeyp
     result = importer.prepare_source_video("https://www.youtube.com/watch?v=abc123")
 
     assert SingleFileYoutubeDL.calls[0]["format"] == "best[ext=mp4]/best"
+    assert "lang" not in SingleFileYoutubeDL.calls[0].get("extractor_args", {}).get("youtube", {})
     assert "merge_output_format" not in SingleFileYoutubeDL.calls[0]
+    assert SingleFileYoutubeDL.calls[0]["writecomments"] is False
+    assert SingleFileYoutubeDL.calls[0]["extractor_args"]["youtube"]["max_comments"] == ["0"]
     assert result["title"] == "Single file video"
     assert result["warnings"] == [
         "ffmpeg is not installed. Downloaded a single-file video stream; "
@@ -177,7 +245,40 @@ def test_import_uses_single_file_format_when_ffmpeg_is_missing(tmp_path, monkeyp
     assert not (tmp_path / "yt-edit" / result["job_id"] / "import.json").exists()
 
 
-def test_import_record_does_not_modify_ytdlp_info_json(tmp_path):
+class SeparateStreamsFallbackYoutubeDL(SingleFileYoutubeDL):
+    calls = []
+
+    def extract_info(self, url, download=True):
+        self.__class__.calls.append(self.options)
+        if self.options["format"] == "best[ext=mp4]/best":
+            raise RuntimeError("ERROR: Requested format is not available")
+        video_path = self.job_dir / "merged-video.mp4"
+        video_path.write_bytes(b"fake video")
+        return {
+            "title": "Merged video",
+            "duration": 45,
+            "webpage_url": url,
+            "requested_downloads": [{"filepath": str(video_path)}],
+        }
+
+
+def test_import_retries_with_separate_streams_when_combined_format_is_unavailable(tmp_path, monkeypatch):
+    SeparateStreamsFallbackYoutubeDL.calls = []
+    monkeypatch.setattr(youtube_importer, "YoutubeDL", SeparateStreamsFallbackYoutubeDL)
+    monkeypatch.setattr(YouTubeImporter, "_has_ffmpeg", lambda self: True, raising=False)
+    importer = YouTubeImporter(tmp_path)
+
+    result = importer.prepare_source_video("https://www.youtube.com/watch?v=abc123")
+
+    assert [call["format"] for call in SeparateStreamsFallbackYoutubeDL.calls] == [
+        "best[ext=mp4]/best",
+        "bestvideo*+bestaudio/best",
+    ]
+    assert result["title"] == "Merged video"
+    assert any("separate video and audio" in warning for warning in result["warnings"])
+
+
+def test_import_record_only_formats_ytdlp_info_json(tmp_path):
     importer = YouTubeImporter(tmp_path)
     source_dir = tmp_path / "yt-data" / "abc123"
     source_dir.mkdir(parents=True)
@@ -196,6 +297,8 @@ def test_import_record_does_not_modify_ytdlp_info_json(tmp_path):
     )
 
     assert returned_path == info_path
+    assert json.loads(info_path.read_text(encoding="utf-8")) == source_info
+    assert "\n  \"title\"" in info_path.read_text(encoding="utf-8")
     assert json.loads(info_path.read_text(encoding="utf-8")) == source_info
     assert not (tmp_path / "yt-edit" / "edit-job" / "import.json").exists()
 

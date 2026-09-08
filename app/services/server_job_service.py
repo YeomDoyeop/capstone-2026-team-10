@@ -85,4 +85,9 @@ def _integer(value: object) -> int | None:
 
 def _score(value: object) -> float | None:
     number = _number(value)
-    return min(1.0, max(0.0, number)) if number is not None else None
+    if number is None:
+        return None
+    # The client analysis contract deliberately uses a detailed 0..1000
+    # integer scale. The server history contract stores normalized values.
+    # Clamp before division so malformed values cannot escape that contract.
+    return min(1000.0, max(0.0, number)) / 1000.0

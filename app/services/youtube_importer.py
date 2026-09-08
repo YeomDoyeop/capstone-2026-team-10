@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
@@ -40,11 +41,60 @@ YTDLP_DRM_WARNING = (
     "YouTube marked this VOD as DRM protected. "
     "yt-dlp cannot download the protected stream; use an authorized local source video."
 )
+YTDLP_SEPARATE_STREAMS_WARNING = (
+    "A combined video format was unavailable. Downloaded separate video and audio "
+    "streams and merged them with ffmpeg."
+)
 YTDLP_STREAM_403_WARNING = (
     "YouTube metadata was readable, but the video stream returned HTTP 403. "
     "This is usually a player-client or PO Token restriction; use the web_embedded "
     "client and keep the bundled yt-dlp binary with Node/EJS installed."
 )
+
+
+def format_info_json(
+    path: Path,
+    fallback: dict | None = None,
+    *,
+    prefer_fallback: bool = False,
+) -> dict:
+    """yt-dlp info JSON을 내용 변경 없이 읽기 쉬운 형식으로 원자적 저장한다."""
+
+    try:
+        value = (
+            fallback
+            if prefer_fallback and fallback is not None
+            else json.loads(path.read_text(encoding="utf-8"))
+            if path.is_file()
+            else fallback
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        if fallback is None:
+            raise YouTubeImportError("YouTube info JSON을 읽지 못했습니다.") from exc
+        value = fallback
+    if not isinstance(value, dict):
+        raise YouTubeImportError("YouTube info JSON이 객체 형식이 아닙니다.")
+    formatted = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+    try:
+        if path.is_file() and path.read_text(encoding="utf-8") == formatted:
+            return value
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name(f".{path.name}.{uuid4().hex}.pending")
+    try:
+        pending.write_text(formatted, encoding="utf-8")
+        for attempt in range(5):
+            try:
+                os.replace(pending, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        pending.unlink(missing_ok=True)
+    return value
 
 
 class InvalidYouTubeURLError(ValueError):
@@ -75,7 +125,13 @@ class YouTubeImporter:
     async def import_video(self, url: str, job_id: str | None = None) -> dict:
         return await asyncio.to_thread(self.prepare_source_video, url, job_id)
 
-    def prepare_source_video(self, url: str, job_id: str | None = None) -> dict:
+    def prepare_source_video(
+        self,
+        url: str,
+        job_id: str | None = None,
+        *,
+        include_subtitles: bool = True,
+    ) -> dict:
         """원본 영상을 준비하거나 이미 확보한 ``yt-data`` 자료를 재사용한다."""
         if not is_youtube_url(url):
             raise InvalidYouTubeURLError("Only YouTube URLs are supported.")
@@ -102,7 +158,7 @@ class YouTubeImporter:
         info = self._download_with_fallbacks(
             url,
             job_dir,
-            include_subtitles=not bool(existing_subtitles),
+            include_subtitles=include_subtitles and not bool(existing_subtitles),
             write_info_json=not self._has_cached_info(job_dir),
             prefer_merged_formats=prefer_merged_formats,
             warnings=warnings,
@@ -131,6 +187,52 @@ class YouTubeImporter:
             "warnings": warnings,
         }
 
+    def prepare_best_audio(self, url: str, video_id: str) -> Path:
+        """Download the best available audio and publish one reusable MP3."""
+
+        if not is_youtube_url(url):
+            raise InvalidYouTubeURLError("Only YouTube URLs are supported.")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", video_id):
+            raise YouTubeImportError("유효한 YouTube 영상 ID가 아닙니다.")
+        data_dir = self.media_root / "yt-data" / video_id
+        data_dir.mkdir(parents=True, exist_ok=True)
+        destination = data_dir / f"{video_id}.mp3"
+        if destination.is_file() and destination.stat().st_size > 0:
+            return destination
+
+        pending_stem = f".{video_id}.{uuid4().hex}.audio"
+        last_error: Exception | None = None
+        for player_client in self._player_clients():
+            options = self._build_ydl_options(
+                data_dir,
+                include_subtitles=False,
+                write_info_json=False,
+                prefer_merged_formats=False,
+                player_client=player_client,
+            )
+            options.update(
+                {
+                    "format": "bestaudio/best",
+                    "outtmpl": str(data_dir / f"{pending_stem}.%(ext)s"),
+                    "extractaudio": True,
+                    "audioformat": "mp3",
+                    "audioquality": "0",
+                    "ffmpeg_location": str(ffmpeg()),
+                }
+            )
+            try:
+                self._download(url, options)
+                pending = data_dir / f"{pending_stem}.mp3"
+                if not pending.is_file() or pending.stat().st_size <= 0:
+                    raise YouTubeImportError("최고 품질 MP3를 생성하지 못했습니다.")
+                pending.replace(destination)
+                return destination
+            except Exception as exc:
+                last_error = exc
+        raise YouTubeImportError(
+            self._clean_error(str(last_error or "최고 품질 오디오 다운로드에 실패했습니다."))
+        ) from last_error
+
     @staticmethod
     def _video_id_from_url(url: str) -> str | None:
         """Return a conservative YouTube ID without contacting YouTube."""
@@ -148,7 +250,7 @@ class YouTubeImporter:
         return candidate if re.fullmatch(r"[A-Za-z0-9_-]{6,32}", candidate or "") else None
 
     def find_complete_cached_import(self, url: str, job_id: str) -> dict | None:
-        """Reuse an existing source only when both video and captions exist."""
+        """Reuse an existing source video; transcript availability is checked separately."""
 
         video_id = self._video_id_from_url(url)
         if not video_id:
@@ -165,7 +267,7 @@ class YouTubeImporter:
             metadata: dict = {}
             if info_paths:
                 try:
-                    stored_info = json.loads(info_paths[0].read_text(encoding="utf-8"))
+                    stored_info = format_info_json(info_paths[0])
                     # ``yt-data`` contains the unmodified info JSON produced by
                     # yt-dlp.  Service state is deliberately kept in ``yt-edit``.
                     metadata = stored_info
@@ -183,7 +285,7 @@ class YouTubeImporter:
                 if path.suffix.lower() == ".vtt" and path.stat().st_size > 0
             ]
             video = self._find_video_file(directory, metadata)
-            if video is None or not video.exists() or video.stat().st_size <= 0 or not subtitles:
+            if video is None or not video.exists() or video.stat().st_size <= 0:
                 continue
             newest = max([video.stat().st_mtime, *(path.stat().st_mtime for path in subtitles)])
             matches.append((newest, directory, video, subtitles, metadata))
@@ -201,7 +303,7 @@ class YouTubeImporter:
             "video_path": relative_to_cwd(video),
             "subtitle_files": [relative_to_cwd(path) for path in subtitles],
             "metadata_path": relative_to_cwd(metadata_path) if metadata_path.exists() else "",
-            "warnings": ["Reused existing source video and subtitles for this YouTube video."],
+            "warnings": ["Reused the existing source video for this YouTube video."],
             "cache_hit": True,
         }
 
@@ -228,6 +330,10 @@ class YouTubeImporter:
             "subtitleslangs": ["ko"] if include_subtitles else [],
             "subtitlesformat": "vtt",
             "writeinfojson": write_info_json,
+            # yt-dlp may fetch comments it considers quick even when comment
+            # writing is disabled. Every non-comment extraction must set the
+            # YouTube extractor limit to zero as well.
+            "writecomments": False,
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
@@ -244,10 +350,10 @@ class YouTubeImporter:
         }
         if prefer_merged_formats:
             options["merge_output_format"] = "mp4"
+        youtube_args = {"max_comments": ["0"]}
         if player_client:
-            options["extractor_args"] = {
-                "youtube": {"player_client": [player_client]}
-            }
+            youtube_args["player_client"] = [player_client]
+        options["extractor_args"] = {"youtube": youtube_args}
 
         cookie_file = os.getenv("YTDLP_COOKIEFILE", "").strip()
         if use_cookies and cookie_file:
@@ -294,6 +400,22 @@ class YouTubeImporter:
                 return self._download(url, options)
             except Exception as exc:  # yt-dlp exposes several custom errors.
                 last_error = exc
+                if self._is_format_unavailable_error(exc) and prefer_merged_formats:
+                    fallback_options = self._build_ydl_options(
+                        job_dir,
+                        include_subtitles=include_subtitles,
+                        write_info_json=write_info_json,
+                        prefer_merged_formats=True,
+                        player_client=client,
+                        use_cookies=not cookies_disabled,
+                    )
+                    fallback_options["format"] = "bestvideo*+bestaudio/best"
+                    try:
+                        result = self._download(url, fallback_options)
+                        warnings.append(YTDLP_SEPARATE_STREAMS_WARNING)
+                        return result
+                    except Exception as fallback_exc:
+                        last_error = fallback_exc
                 if self._is_drm_error(exc) and index < len(clients) - 1:
                     continue
                 if self._is_cookie_database_error(exc) and not cookies_disabled:
@@ -352,6 +474,10 @@ class YouTubeImporter:
             and ("429" in message or "Too Many Requests" in message)
         )
 
+    @staticmethod
+    def _is_format_unavailable_error(exc: Exception) -> bool:
+        return "Requested format is not available" in str(exc)
+
     def _is_forbidden_error(self, exc: Exception | None) -> bool:
         return "403" in str(exc or "") or "Forbidden" in str(exc or "")
 
@@ -379,6 +505,7 @@ class YouTubeImporter:
         warnings: list[str],
     ) -> Path:
         info_path = job_dir / f"{info.get('id') or job_dir.name}.info.json"
+        format_info_json(info_path, info)
         return info_path
 
     def _find_video_file(self, job_dir: Path, info: dict) -> Path | None:
@@ -400,9 +527,9 @@ class YouTubeImporter:
 
         for path in job_dir.glob("*.info.json"):
             try:
-                if isinstance(json.loads(path.read_text(encoding="utf-8")), dict):
+                if isinstance(format_info_json(path), dict):
                     return True
-            except (OSError, json.JSONDecodeError):
+            except (OSError, YouTubeImportError):
                 continue
         return False
 
