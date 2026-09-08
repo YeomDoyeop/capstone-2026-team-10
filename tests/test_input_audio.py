@@ -31,8 +31,16 @@ class DownloadAudioTest(unittest.TestCase):
                 pass
 
         reports: list[tuple[int, str]] = []
-        with tempfile.TemporaryDirectory() as directory, patch("src.input_audio._validate_public_https_url"), patch("src.input_audio.requests.get", return_value=Response()) as get:
-            path = download_audio("https://example.com/audio.mp3", Path(directory), progress_callback=lambda progress, message: reports.append((progress, message)))
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "src.input_audio._validate_public_https_url"
+        ), patch("src.input_audio.requests.get", return_value=Response()) as get:
+            path = download_audio(
+                "https://example.com/audio.mp3",
+                Path(directory),
+                progress_callback=lambda progress, message: reports.append(
+                    (progress, message)
+                ),
+            )
             self.assertEqual(path.read_bytes(), b"a" * 1024 * 1024 + b"b" * 1024 * 1024)
             self.assertEqual(get.call_args.kwargs["timeout"], (15, 60))
             self.assertEqual(reports[-1][0], 14)

@@ -30,10 +30,20 @@ def parse_request(value: Any) -> TranscriptionRequest:
     initial_prompt = _optional_text(value, "initial_prompt")
     hotwords = _optional_text(value, "hotwords")
     speed = value.get("speed", 1.0)
-    if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not 1.0 <= speed <= 2.0:
+    if (
+        isinstance(speed, bool)
+        or not isinstance(speed, (int, float))
+        or not 1.0 <= speed <= 2.0
+    ):
         raise RequestValidationError("speed는 1.0 이상 2.0 이하의 숫자여야 합니다.")
 
-    return TranscriptionRequest(audio_url.strip(), language.strip() if language is not None else None, initial_prompt, hotwords, float(speed))
+    return TranscriptionRequest(
+        audio_url.strip(),
+        language.strip() if language is not None else None,
+        initial_prompt,
+        hotwords,
+        float(speed),
+    )
 
 
 def _optional_text(value: dict[str, Any], key: str) -> str | None:

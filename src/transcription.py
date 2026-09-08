@@ -13,7 +13,6 @@ from .input_audio import AudioDownloadError, apply_speed, download_audio
 from .request import RequestValidationError, parse_request
 from .timestamps import restore_original_segment_timestamps
 
-
 MODEL_NAME = "large-v3"
 DEVICE = "cuda"
 COMPUTE_TYPE = "float16"
@@ -47,7 +46,9 @@ def _alignment_model(language: str) -> tuple[Any, dict]:
     return cached
 
 
-def _transcribe_and_align(audio_path: Path, request, report: Callable[[int, str], None]) -> tuple[dict, float]:
+def _transcribe_and_align(
+    audio_path: Path, request, report: Callable[[int, str], None]
+) -> tuple[dict, float]:
     audio = whisperx.load_audio(str(audio_path))
     duration = len(audio) / SAMPLE_RATE
     original_options = MODEL.options
@@ -90,7 +91,9 @@ def _transcribe_and_align(audio_path: Path, request, report: Callable[[int, str]
     return {"language": language, **aligned}, duration
 
 
-def transcribe(value: Any, progress_callback: Callable[[int, str], None] | None = None) -> dict[str, Any]:
+def transcribe(
+    value: Any, progress_callback: Callable[[int, str], None] | None = None
+) -> dict[str, Any]:
     def report(progress: int, message: str) -> None:
         if progress_callback:
             progress_callback(progress, message)
@@ -99,7 +102,9 @@ def transcribe(value: Any, progress_callback: Callable[[int, str], None] | None 
         request = parse_request(value)
         with tempfile.TemporaryDirectory(prefix="ave-whisperx-") as directory:
             report(5, "전사용 오디오를 다운로드하는 중입니다.")
-            audio_path = download_audio(request.audio_url, Path(directory), progress_callback=report)
+            audio_path = download_audio(
+                request.audio_url, Path(directory), progress_callback=report
+            )
             if request.speed != 1.0:
                 report(10, "전사 배속을 적용하는 중입니다.")
                 audio_path = apply_speed(audio_path, request.speed)
@@ -133,7 +138,9 @@ def transcribe(value: Any, progress_callback: Callable[[int, str], None] | None 
             result_segments, original_duration = restore_original_segment_timestamps(
                 timestamped_segments, duration, request.speed
             )
-            for result_segment, source_segment in zip(result_segments, timestamped_segments, strict=True):
+            for result_segment, source_segment in zip(
+                result_segments, timestamped_segments, strict=True
+            ):
                 result_segment["words"] = [
                     {
                         "start": round(float(word["start"]) * request.speed, 3),
@@ -154,4 +161,9 @@ def transcribe(value: Any, progress_callback: Callable[[int, str], None] | None 
     except (RequestValidationError, AudioDownloadError) as error:
         return {"error": {"code": error.code, "message": str(error)}}
     except Exception:
-        return {"error": {"code": "TRANSCRIPTION_FAILED", "message": "음성 전사 또는 강제 정렬에 실패했습니다."}}
+        return {
+            "error": {
+                "code": "TRANSCRIPTION_FAILED",
+                "message": "음성 전사 또는 강제 정렬에 실패했습니다.",
+            }
+        }

@@ -10,7 +10,9 @@ class ParseRequestTest(unittest.TestCase):
         self.assertEqual(result.speed, 1.0)
 
     def test_none_language_enables_model_detection(self) -> None:
-        result = parse_request({"audio_url": "https://example.com/audio.mp3", "language": None})
+        result = parse_request(
+            {"audio_url": "https://example.com/audio.mp3", "language": None}
+        )
         self.assertIsNone(result.language)
 
     def test_rejects_invalid_speed(self) -> None:
@@ -22,7 +24,9 @@ class ParseRequestTest(unittest.TestCase):
             parse_request({"audio_url": "https://example.com/audio.mp3", "speed": 0.9})
 
     def test_accepts_two_times_speed(self) -> None:
-        result = parse_request({"audio_url": "https://example.com/audio.mp3", "speed": 2.0})
+        result = parse_request(
+            {"audio_url": "https://example.com/audio.mp3", "speed": 2.0}
+        )
         self.assertEqual(result.speed, 2.0)
 
     def test_requires_audio_url(self) -> None:

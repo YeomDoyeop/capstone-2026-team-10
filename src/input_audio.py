@@ -35,9 +35,14 @@ def download_audio(
             )
         except requests.RequestException as error:
             if attempt + 1 == attempts:
-                raise AudioDownloadError("오디오 URL을 다운로드하지 못했습니다.") from error
+                raise AudioDownloadError(
+                    "오디오 URL을 다운로드하지 못했습니다."
+                ) from error
             if progress_callback:
-                progress_callback(5, f"전사용 오디오 다운로드를 다시 시도합니다. ({attempt + 2}/{attempts})")
+                progress_callback(
+                    5,
+                    f"전사용 오디오 다운로드를 다시 시도합니다. ({attempt + 2}/{attempts})",
+                )
 
 
 def _download_once(
@@ -71,7 +76,9 @@ def _download_once(
             try:
                 declared_size = int(content_length) if content_length else None
             except ValueError as error:
-                raise AudioDownloadError("오디오 파일 크기 정보가 올바르지 않습니다.") from error
+                raise AudioDownloadError(
+                    "오디오 파일 크기 정보가 올바르지 않습니다."
+                ) from error
             if declared_size and declared_size > maximum_bytes:
                 raise AudioDownloadError("오디오 파일이 최대 크기를 초과했습니다.")
 
@@ -84,12 +91,17 @@ def _download_once(
                         continue
                     downloaded += len(chunk)
                     if downloaded > maximum_bytes:
-                        raise AudioDownloadError("오디오 파일이 최대 크기를 초과했습니다.")
+                        raise AudioDownloadError(
+                            "오디오 파일이 최대 크기를 초과했습니다."
+                        )
                     file.write(chunk)
                     if progress_callback and declared_size:
                         progress = min(14, 5 + int(9 * downloaded / declared_size))
                         if progress > last_reported_progress:
-                            progress_callback(progress, f"전사용 오디오를 다운로드하는 중입니다. ({downloaded / 1024 / 1024:.1f} MiB / {declared_size / 1024 / 1024:.1f} MiB)")
+                            progress_callback(
+                                progress,
+                                f"전사용 오디오를 다운로드하는 중입니다. ({downloaded / 1024 / 1024:.1f} MiB / {declared_size / 1024 / 1024:.1f} MiB)",
+                            )
                             last_reported_progress = progress
             return target
         finally:
@@ -104,7 +116,15 @@ def apply_speed(audio_path: Path, speed: float) -> Path:
     filters = _atempo_filters(speed)
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-i", str(audio_path), "-filter:a", filters, str(output_path)],
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(audio_path),
+                "-filter:a",
+                filters,
+                str(output_path),
+            ],
             check=True,
             capture_output=True,
             timeout=120,
