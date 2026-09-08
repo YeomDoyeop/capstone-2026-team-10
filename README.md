@@ -25,7 +25,7 @@ API 세부 계약과 DB 스키마는 `docs/`에서 관리한다.
 * `GET /api/auth/config`: 브라우저 Google 로그인에 필요한 Supabase URL·anon 공개 키 반환
 * `POST /api/analysis-jobs`: 렌더링 완료 뒤 완료 이력 생성
 * `PUT /api/analysis-jobs/{job_id}/result`: 완료된 작업의 구간별 분석값과 추천·선택 정보 저장
-* `POST /api/llm/generate`: Gemini 또는 DeepSeek API 호출
+* `POST /api/llm/generate`: Gemini 3.5 Flash-Lite 또는 DeepSeek-V4-Flash API 호출
 * `POST /api/stt-files`, `POST /api/stt/transcriptions`: 임시 MP3 업로드와 lease 기반 원격 Whisper 전사
 * `POST /api/stt/transcriptions/{job_id}/heartbeat`, `POST /api/stt/transcriptions/{job_id}/cancel`: heartbeat와 RunPod 작업 ID 기반 취소 전파
 * `POST /api/stt/transcriptions/{job_id}/ack`: 클라이언트의 Whisper 결과 파일 저장 확인

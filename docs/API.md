@@ -50,7 +50,7 @@
 
 ## 서버 LLM 호출
 
-`POST /api/llm/generate`는 클라이언트가 직접 공급자 API 키를 보관하지 않도록 Gemini와 DeepSeek 호출을 서버에서 수행한다. `provider`를 생략하면 기본값은 DeepSeek다.
+`POST /api/llm/generate`는 클라이언트가 직접 공급자 API 키를 보관하지 않도록 Gemini 3.5 Flash-Lite와 DeepSeek-V4-Flash 호출을 서버에서 수행한다. `provider`를 생략하면 기본값은 DeepSeek-V4-Flash다.
 
 ```json
 {
