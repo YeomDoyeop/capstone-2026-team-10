@@ -1,6 +1,6 @@
 # AVE 워크스페이스
 
-AVE(Automatic Video Edit)는 YouTube 영상의 스크립트, 채팅, 댓글 타임스탬프, 히트맵, 음량 등의 정보를 분석해 편집 구간 선정을 돕는 시스템입니다.
+AVE(Automatic Video Edit)는 YouTube 영상의 스크립트를 분석해 편집 구간 선정을 돕는 시스템입니다. 채팅, 댓글 타임스탬프, 히트맵, 음량을 결합한 점수와 기승전결 탐색은 지원 예정입니다.
 
 이 저장소는 여러 독립 Git 저장소를 한곳에서 개발하기 위한 루트 워크스페이스입니다. 실제 애플리케이션 코드와 실행·배포 설정은 `modules/` 아래 각 모듈에서 관리합니다.
 
@@ -11,9 +11,9 @@ AVE(Automatic Video Edit)는 YouTube 영상의 스크립트, 채팅, 댓글 타�
 | `ave-client` | Windows 로컬 서버·트레이·웹 UI, 영상 수집·분석·자막·렌더링 | `python -m app` |
 | `ave-server` | 인증, 작업·분석 데이터, LLM 및 원격 STT 중계 API | 모듈의 배포 문서 참고 |
 | `ave-whisper-api` | GPU 환경에서 실행하는 faster-whisper 기반 음성 전사 API | RunPod Queue worker 배포 |
-| `ave-dist` | 향후 Windows 설치 프로그램과 배포 산출물 관리 | 아직 구현하지 않음 |
+| `ave-dist` | 향후 PyInstaller 기반 Windows 포터블 앱과 배포 산출물 관리 | 아직 구현하지 않음 |
 
-원본 영상, 렌더링 결과, 로컬 작업 파일과 경로는 `ave-client`가 실행되는 사용자 PC에만 보관합니다. 서버에는 작업 식별자, 스크립트와 분석 결과, 추천·선택 이력 등 필요한 데이터만 저장합니다. 원격 STT용 오디오는 전사 중에만 임시로 사용한 뒤 삭제합니다.
+원본 영상, 렌더링 결과, 로컬 작업 파일과 경로는 `ave-client`가 실행되는 사용자 PC에만 보관합니다. 서버에는 렌더링 완료 뒤 작업 식별자, 스크립트와 분석 결과, 추천·선택 이력 등 현재 API 계약의 데이터만 저장하며 로컬 경로와 진행 상태는 저장하지 않습니다. 원격 STT용 오디오는 전사 중에만 임시로 사용한 뒤 삭제합니다.
 
 ## 시작하기
 
@@ -68,6 +68,8 @@ npm run build
 `ave-server`는 클라이언트의 로그인·분석 요청을 처리하고 LLM 및 원격 STT를 중계합니다. Ubuntu VM 배포 절차는 [서버 배포 안내](modules/ave-server/deploy/README.md)를 참고합니다.
 
 `ave-whisper-api`는 `faster-whisper`와 GPU를 사용하는 전사 서비스이며, 현재 RunPod Serverless Queue worker 방식으로 배포합니다. 요청 형식과 배포 방법은 [전사 API 안내](modules/ave-whisper-api/README.md)를 참고합니다.
+
+클라이언트의 향후 사용자 배포 형식은 pynsist 설치 프로그램이 아니라 PyInstaller 기반 Windows 포터블 앱입니다. 현재는 패키징을 구현하지 않았으며 `python -m app` 개발 실행을 유지합니다. 추후 관련 설정과 배포 산출물은 `ave-dist`에서 관리합니다.
 
 ## 개발 시 참고 문서
 
