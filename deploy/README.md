@@ -103,6 +103,7 @@ AVE_SERVER_URL=https://ave-server.duckdns.org
 ## 5. 만료 파일 자동 삭제
 
 VM에서 다음 명령으로 한 시간마다 24시간 지난 오디오를 삭제한다.
+이 crontab은 `deploy.ps1`이나 Docker Compose가 자동으로 설치하지 않으므로 VM을 처음 구성할 때 root crontab에 별도로 등록해야 한다. 애플리케이션의 완료·취소·lease 정리가 정상적으로 동작하더라도, 업로드 후 전사 요청 전에 연결이 끊긴 고아 파일을 제거하는 최종 안전망으로 유지한다.
 
 ```bash
 sudo install -m 755 /home/ubuntu/ave-server/deploy/scripts/cleanup-expired.sh /usr/local/bin/ave-stt-cleanup

@@ -62,10 +62,10 @@ class TemporaryAudioResponse(BaseModel):
 
 class RemoteTranscriptionRequest(BaseModel):
     file_id: str = Field(min_length=32, max_length=32, pattern="^[a-f0-9]+$")
-    language: str = Field(default="ko", min_length=1, max_length=20)
+    language: str | None = Field(default="ko", min_length=1, max_length=20)
     initial_prompt: str | None = Field(default=None, max_length=1_000)
     hotwords: str | None = Field(default=None, max_length=1_000)
-    speed: float = Field(default=1.0, ge=1.0, le=4.0)
+    speed: float = Field(default=1.0, ge=1.0, le=2.0)
     track_progress: bool = False
     client_job_id: str | None = Field(default=None, min_length=1, max_length=100)
     server_job_id: str | None = Field(default=None, max_length=100)

@@ -27,7 +27,7 @@ def _endpoint_and_headers() -> tuple[str, dict[str, str]]:
 
 
 def start_transcription_with_whisper_api(
-    audio_url: str, *, language: str, initial_prompt: str | None, hotwords: str | None, speed: float
+    audio_url: str, *, language: str | None, initial_prompt: str | None, hotwords: str | None, speed: float
 ) -> str:
     endpoint, headers = _endpoint_and_headers()
     payload = {"input": {"audio_url": audio_url, "language": language, "initial_prompt": initial_prompt, "hotwords": hotwords, "speed": speed}}
@@ -64,7 +64,7 @@ def cancel_transcription(runpod_job_id: str) -> None:
         raise WhisperAPIError("Whisper API 작업 취소에 실패했습니다.") from exc
 
 
-def transcribe_with_whisper_api(audio_url: str, *, language: str, initial_prompt: str | None, hotwords: str | None, speed: float) -> dict[str, Any]:
+def transcribe_with_whisper_api(audio_url: str, *, language: str | None, initial_prompt: str | None, hotwords: str | None, speed: float) -> dict[str, Any]:
     endpoint_id = get_whisper_runpod_endpoint_id()
     api_key = get_runpod_api_key()
     if not endpoint_id or not api_key:

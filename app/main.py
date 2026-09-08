@@ -36,6 +36,7 @@ from app.services.supabase_service import (
     get_expired_transcription_results,
     get_auth_client,
     get_job,
+    get_job_by_client_id,
     get_result,
     get_transcription_job,
     get_active_transcription_job_by_client_id,
@@ -75,15 +76,45 @@ def _normalized_transcript(output: dict) -> dict:
     segments = output.get("segments")
     if not isinstance(segments, list):
         raise ValueError("segments가 없습니다.")
-    normalized = []
+    normalized_segments = []
     for segment in segments:
         if not isinstance(segment, dict):
             raise ValueError("segment 형식이 올바르지 않습니다.")
         start, end, text = segment.get("start"), segment.get("end"), segment.get("text")
-        if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, (int, float)) or not isinstance(end, (int, float)) or not isinstance(text, str) or end < start:
+        if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, (int, float)) or not isinstance(end, (int, float)) or not isinstance(text, str) or not text.strip() or end < start:
             raise ValueError("segment 값이 올바르지 않습니다.")
-        normalized.append({"start": round(float(start), 3), "end": round(float(end), 3), "text": text})
-    return {**output, "segments": normalized}
+        normalized_segment = {
+            "start": round(float(start), 3),
+            "end": round(float(end), 3),
+            "text": text,
+        }
+        words = segment.get("words")
+        if words is not None:
+            if not isinstance(words, list):
+                raise ValueError("segment words 형식이 올바르지 않습니다.")
+            normalized_words = []
+            for word in words:
+                if not isinstance(word, dict):
+                    raise ValueError("word 형식이 올바르지 않습니다.")
+                word_start, word_end, value = word.get("start"), word.get("end"), word.get("word")
+                if (
+                    isinstance(word_start, bool)
+                    or isinstance(word_end, bool)
+                    or not isinstance(word_start, (int, float))
+                    or not isinstance(word_end, (int, float))
+                    or not isinstance(value, str)
+                    or not value.strip()
+                    or word_end < word_start
+                ):
+                    raise ValueError("word 값이 올바르지 않습니다.")
+                normalized_words.append({
+                    "start": round(float(word_start), 3),
+                    "end": round(float(word_end), 3),
+                    "word": value,
+                })
+            normalized_segment["words"] = normalized_words
+        normalized_segments.append(normalized_segment)
+    return {**output, "segments": normalized_segments}
 
 
 def _user_value(user: object, key: str):
@@ -114,6 +145,25 @@ def _require_storage() -> None:
 
 def _job_response(job: dict) -> dict:
     return {key: job[key] for key in ("id", "client_job_id", "status", "progress")}
+
+
+def _is_unique_violation(exc: Exception) -> bool:
+    """PostgREST/psycopg 오류에서 PostgreSQL unique violation을 판별한다."""
+    code = getattr(exc, "code", None)
+    if str(code) == "23505":
+        return True
+    message = str(exc).lower()
+    return "duplicate key" in message or "unique constraint" in message
+
+
+def _storage_error_detail(exc: Exception, *, operation: str) -> str:
+    """저장소 내부 오류를 노출하지 않으면서 운영자가 구분할 수 있게 응답한다."""
+    message = str(exc).lower()
+    if any(token in message for token in ("invalid api key", "invalid jwt", "service role", "permission denied", "not authorized", "401", "403")):
+        return "AVE 서버 저장소 인증 설정을 확인하세요."
+    if any(token in message for token in ("does not exist", "schema cache", "column", "relation", "enum")):
+        return "분석 이력 DB 스키마가 최신 상태가 아닙니다. Supabase 스키마 적용 상태를 확인하세요."
+    return f"분석 이력 {operation} 중 저장소 오류가 발생했습니다. 잠시 후 다시 시도하세요."
 
 
 @app.get("/health")
@@ -512,9 +562,15 @@ async def cancel_transcription_by_client_job_id(client_job_id: str, user=Depends
 @app.post("/api/analysis-jobs", response_model=AnalysisJobResponse, status_code=201)
 async def create_analysis_job(request: AnalysisJobCreateRequest, user=Depends(get_current_user)):
     _require_storage()
+    user_id = str(_user_value(user, "id"))
+    # client_job_id는 분석 이력의 멱등 키다. 재렌더링·재연결 시 먼저 기존
+    # 행을 돌려주며, 새 작업에만 INSERT한다.
     try:
+        existing = await asyncio.to_thread(get_job_by_client_id, user_id, request.client_job_id)
+        if existing is not None:
+            return _job_response(existing)
         job = create_job(
-            str(_user_value(user, "id")),
+            user_id,
             {
                 "id": str(uuid4()),
                 **request.model_dump(),
@@ -524,10 +580,22 @@ async def create_analysis_job(request: AnalysisJobCreateRequest, user=Depends(ge
             },
         )
     except Exception as exc:
+        if _is_unique_violation(exc):
+            # 선행 조회와 INSERT 사이에 다른 요청이 행을 만들 수 있다.
+            # 고유 제약을 최종 동시성 제어로 쓰고, 그 행을 다시 읽어 반환한다.
+            try:
+                existing = await asyncio.to_thread(get_job_by_client_id, user_id, request.client_job_id)
+            except Exception as lookup_exc:
+                logger.exception("분석 작업 이력 충돌 후 기존 작업 조회에 실패했습니다.")
+                raise HTTPException(status_code=503, detail=_storage_error_detail(lookup_exc, operation="조회")) from lookup_exc
+            if existing is not None:
+                return _job_response(existing)
+            logger.exception("분석 작업 이력 충돌 뒤 기존 작업을 찾지 못했습니다.")
+            raise HTTPException(status_code=409, detail="동일한 분석 이력 생성 요청이 경합했습니다. 다시 시도하세요.") from exc
         logger.exception("분석 작업 이력 생성에 실패했습니다.")
         raise HTTPException(
             status_code=503,
-            detail="분석 이력 DB가 준비되지 않았습니다. ave-server/docs/supabase_schema.sql을 Supabase SQL Editor에서 실행하세요.",
+            detail=_storage_error_detail(exc, operation="생성"),
         ) from exc
     return _job_response(job)
 
@@ -547,7 +615,13 @@ async def save_analysis_result(job_id: str, request: AnalysisResultRequest, user
     for segment in request.segments:
         if segment.end_ms <= segment.start_ms:
             raise HTTPException(status_code=422, detail="구간 종료 시각은 시작 시각보다 커야 합니다.")
-    result = upsert_result(str(_user_value(user, "id")), job_id, request.model_dump())
+    try:
+        # analysis_results.job_id를 conflict 키로 사용하는 upsert라서 같은
+        # 작업의 완료 처리 재진입도 최신 결과로 안전하게 덮어쓴다.
+        result = upsert_result(str(_user_value(user, "id")), job_id, request.model_dump())
+    except Exception as exc:
+        logger.exception("분석 작업 결과 저장에 실패했습니다: job_id=%s", job_id)
+        raise HTTPException(status_code=503, detail=_storage_error_detail(exc, operation="결과 저장")) from exc
     if result is None:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
     return result

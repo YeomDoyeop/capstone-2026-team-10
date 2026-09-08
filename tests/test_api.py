@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 from pathlib import Path
+import pytest
 
 from app.main import _cancel_persisted_transcription, _lease_has_expired, app, get_current_user
 from app.services.whisper_api_service import WhisperAPIError
@@ -64,6 +65,7 @@ def test_api_requires_bearer_token():
 def test_create_analysis_job_records_client_reference(monkeypatch):
     app.dependency_overrides[get_current_user] = lambda: {"id": "user-001", "email": "user@example.com"}
     monkeypatch.setattr("app.main.is_storage_configured", lambda: True)
+    monkeypatch.setattr("app.main.get_job_by_client_id", lambda *_: None)
 
     def fake_create_job(user_id, values):
         assert user_id == "user-001"
@@ -86,6 +88,74 @@ def test_create_analysis_job_records_client_reference(monkeypatch):
     assert response.json()["client_job_id"] == "local-job-001"
     assert response.json()["status"] == "completed"
     assert response.json()["progress"] == 100
+
+
+def test_create_analysis_job_returns_existing_client_job(monkeypatch):
+    app.dependency_overrides[get_current_user] = lambda: {"id": "user-001"}
+    monkeypatch.setattr("app.main.is_storage_configured", lambda: True)
+    existing = {"id": "server-job-001", "client_job_id": "local-job-001", "status": "completed", "progress": 100}
+    monkeypatch.setattr("app.main.get_job_by_client_id", lambda user_id, client_job_id: existing)
+    monkeypatch.setattr("app.main.create_job", lambda *_: pytest.fail("기존 작업에는 INSERT하면 안 됩니다."))
+    with TestClient(app) as client:
+        first = client.post("/api/analysis-jobs", json={"client_job_id": "local-job-001", "source_id": "video-001"})
+        retry = client.post("/api/analysis-jobs", json={"client_job_id": "local-job-001", "source_id": "video-001"})
+    app.dependency_overrides.clear()
+
+    assert first.status_code == 201
+    assert retry.status_code == 201
+    assert first.json() == retry.json() == existing
+
+
+def test_create_analysis_job_recovers_unique_conflict_from_concurrent_request(monkeypatch):
+    app.dependency_overrides[get_current_user] = lambda: {"id": "user-001"}
+    monkeypatch.setattr("app.main.is_storage_configured", lambda: True)
+    existing = {"id": "server-job-race", "client_job_id": "local-job-race", "status": "completed", "progress": 100}
+    lookups = iter([None, existing])
+    monkeypatch.setattr("app.main.get_job_by_client_id", lambda *_: next(lookups))
+
+    class UniqueViolation(Exception):
+        code = "23505"
+
+    monkeypatch.setattr("app.main.create_job", lambda *_: (_ for _ in ()).throw(UniqueViolation("duplicate key value violates unique constraint")))
+    with TestClient(app) as client:
+        response = client.post("/api/analysis-jobs", json={"client_job_id": "local-job-race", "source_id": "video-001"})
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 201
+    assert response.json() == existing
+
+
+def test_save_analysis_result_retries_are_upserts(monkeypatch):
+    app.dependency_overrides[get_current_user] = lambda: {"id": "user-001"}
+    monkeypatch.setattr("app.main.is_storage_configured", lambda: True)
+    saved = []
+
+    def fake_upsert(user_id, job_id, values):
+        saved.append((user_id, job_id, values))
+        return {"job_id": job_id, **values}
+
+    monkeypatch.setattr("app.main.upsert_result", fake_upsert)
+    payload = {"segments": [{"segment_index": 0, "start_ms": 0, "end_ms": 1000}]}
+    with TestClient(app) as client:
+        first = client.put("/api/analysis-jobs/server-job-001/result", json=payload)
+        retry = client.put("/api/analysis-jobs/server-job-001/result", json=payload)
+    app.dependency_overrides.clear()
+
+    assert first.status_code == 200
+    assert retry.status_code == 200
+    assert [item[1] for item in saved] == ["server-job-001", "server-job-001"]
+
+
+def test_analysis_job_reports_service_key_error_without_schema_message(monkeypatch):
+    app.dependency_overrides[get_current_user] = lambda: {"id": "user-001"}
+    monkeypatch.setattr("app.main.is_storage_configured", lambda: True)
+    monkeypatch.setattr("app.main.get_job_by_client_id", lambda *_: (_ for _ in ()).throw(RuntimeError("Invalid API key")))
+    with TestClient(app) as client:
+        response = client.post("/api/analysis-jobs", json={"client_job_id": "local-job-001", "source_id": "video-001"})
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "AVE 서버 저장소 인증 설정을 확인하세요."
 
 
 def test_result_rejects_invalid_segment_time(monkeypatch):
@@ -140,7 +210,13 @@ def test_completed_transcription_result_survives_reconnect_until_ack(monkeypatch
     monkeypatch.setattr("app.main.start_transcription_with_whisper_api", lambda *args, **kwargs: "runpod-ack")
     monkeypatch.setattr(
         "app.main.get_transcription_status",
-        lambda _: {"status": "COMPLETED", "output": {"segments": [{"end": 2, "start": 1, "text": "테스트"}]}},
+        lambda _: {"status": "COMPLETED", "output": {
+            "segments": [{"start": 1, "end": 2, "text": " 테스트", "words": [
+                {"start": 1, "end": 2, "word": " 테스트"},
+            ]}],
+            "engine": "whisperx-aligned-word-v1",
+            "alignment": "ctc-forced-alignment-with-words",
+        }},
     )
     with TestClient(app) as client:
         client.post("/api/stt/transcriptions", json={"file_id": "a" * 32, "client_job_id": "local-ack", "track_progress": True})
@@ -149,7 +225,13 @@ def test_completed_transcription_result_survives_reconnect_until_ack(monkeypatch
         acknowledged = client.post("/api/stt/transcriptions/runpod-ack/ack")
     app.dependency_overrides.clear()
 
-    expected = {"segments": [{"start": 1.0, "end": 2.0, "text": "테스트"}]}
+    expected = {
+        "segments": [{"start": 1.0, "end": 2.0, "text": " 테스트", "words": [
+            {"start": 1.0, "end": 2.0, "word": " 테스트"},
+        ]}],
+        "engine": "whisperx-aligned-word-v1",
+        "alignment": "ctc-forced-alignment-with-words",
+    }
     assert completed.json()["result"] == expected
     assert reconnected.json()["result"] == expected
     assert acknowledged.status_code == 200

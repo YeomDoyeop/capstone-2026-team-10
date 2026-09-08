@@ -77,3 +77,5 @@
 전사 작업 상태는 `queued → in_progress → completed|failed|cancelled`로 전이한다. 취소 요청 중 RunPod 응답을 기다리는 상태는 `cancel_requested`이며, 서버 재시작 뒤에도 `transcription_jobs`에서 이어서 정리한다. terminal 상태는 응답 직후 삭제되고, heartbeat가 사라진 작업은 lease sweep이 취소·삭제한다. 시작되지 않은 취소 의도도 TTL 만료 뒤 삭제된다.
 
 전사 요청 성공·실패와 무관하게 서버는 해당 임시 MP3를 삭제한다. `/files/` URL은 RunPod worker의 일시적 다운로드 용도이며, 클라이언트가 직접 SFTP로 접근하지 않는다.
+
+완료 결과에는 WhisperX 전사와 CTC 강제 정렬에서 얻은 `segments`, `engine=whisperx-aligned-word-v1`, `alignment=ctc-forced-alignment-with-words`가 포함된다. 각 `segments[]`는 세그먼트의 `start`, `end`, `text`와 정렬된 `words[]`의 `start`, `end`, `word`를 가진다. 서버는 두 단계의 시간값과 텍스트를 검증한 뒤 클라이언트에 중계한다. 문자 정렬 상세값은 외부 계약에 노출하지 않는다.

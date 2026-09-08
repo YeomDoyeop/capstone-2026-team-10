@@ -42,6 +42,25 @@ def create_job(user_id: str, values: dict[str, Any]) -> dict[str, Any]:
     return response.data[0]
 
 
+def get_job_by_client_id(user_id: str, client_job_id: str) -> dict[str, Any] | None:
+    """클라이언트 작업 식별자에 연결된 분석 이력을 반환한다.
+
+    ``analysis_jobs.user_id, client_job_id``의 고유 제약과 같은 조건을 사용한다.
+    결과 동기화 재시도와 동시 생성 요청에서 동일한 서버 작업을 재사용하기 위한
+    조회이므로 반드시 사용자 범위를 함께 제한한다.
+    """
+    response = (
+        get_service_client()
+        .table("analysis_jobs")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("client_job_id", client_job_id)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
 def get_job(user_id: str, job_id: str) -> dict[str, Any] | None:
     response = get_service_client().table("analysis_jobs").select("*").eq("id", job_id).eq("user_id", user_id).execute()
     return response.data[0] if response.data else None
