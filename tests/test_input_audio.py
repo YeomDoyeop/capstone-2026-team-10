@@ -3,12 +3,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.input_audio import _atempo_filters, download_audio
+from src.input_audio import AudioDownloadError, _atempo_filters, download_audio
 
 
 class AtempoFiltersTest(unittest.TestCase):
-    def test_creates_filter_chain_for_four_times_speed(self) -> None:
-        self.assertEqual(_atempo_filters(4.0), "atempo=2.0,atempo=2.0")
+    def test_accepts_two_times_speed(self) -> None:
+        self.assertEqual(_atempo_filters(2.0), "atempo=2.0")
+
+    def test_rejects_more_than_two_times_speed(self) -> None:
+        with self.assertRaises(AudioDownloadError):
+            _atempo_filters(2.1)
 
 
 class DownloadAudioTest(unittest.TestCase):

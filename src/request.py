@@ -9,7 +9,7 @@ class RequestValidationError(ValueError):
 @dataclass(frozen=True)
 class TranscriptionRequest:
     audio_url: str
-    language: str
+    language: str | None
     initial_prompt: str | None
     hotwords: str | None
     speed: float
@@ -24,16 +24,16 @@ def parse_request(value: Any) -> TranscriptionRequest:
         raise RequestValidationError("audio_url은 비어 있지 않은 문자열이어야 합니다.")
 
     language = value.get("language", "ko")
-    if not isinstance(language, str) or not language.strip():
+    if language is not None and (not isinstance(language, str) or not language.strip()):
         raise RequestValidationError("language는 비어 있지 않은 문자열이어야 합니다.")
 
     initial_prompt = _optional_text(value, "initial_prompt")
     hotwords = _optional_text(value, "hotwords")
     speed = value.get("speed", 1.0)
-    if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not 1.0 <= speed <= 4.0:
-        raise RequestValidationError("speed는 1.0 이상 4.0 이하의 숫자여야 합니다.")
+    if isinstance(speed, bool) or not isinstance(speed, (int, float)) or not 1.0 <= speed <= 2.0:
+        raise RequestValidationError("speed는 1.0 이상 2.0 이하의 숫자여야 합니다.")
 
-    return TranscriptionRequest(audio_url.strip(), language.strip(), initial_prompt, hotwords, float(speed))
+    return TranscriptionRequest(audio_url.strip(), language.strip() if language is not None else None, initial_prompt, hotwords, float(speed))
 
 
 def _optional_text(value: dict[str, Any], key: str) -> str | None:

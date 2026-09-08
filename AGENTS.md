@@ -4,7 +4,7 @@
 
 `ave-whisper-api`는 AVE 프로젝트의 STT API 모듈이다.
 
-`faster-whisper`를 사용해 음성을 텍스트로 변환하며, 다양한 GPU 백엔드 환경에서 실행할 수 있도록 구성한다.
+WhisperX를 사용해 음성을 텍스트로 변환하고 언어별 CTC 모델로 강제 정렬하며, 다양한 GPU 백엔드 환경에서 실행할 수 있도록 구성한다.
 
 ## 기본 원칙
 
@@ -20,8 +20,9 @@
 * 작업: `transcribe`
 * beam size: `5`
 * VAD: 항상 활성화
+* 정렬: WhisperX 언어별 CTC 강제 정렬
 * 출력 형식: JSON
-  * segment timestamp
+  * 정렬된 segment 및 word timestamp
 * 입력 대상: URL
 
 ## 지원 옵션

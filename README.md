@@ -1,6 +1,6 @@
 # ave-whisper-api
 
-`faster-whisper` 기반의 AVE 음성 전사 API입니다.
+WhisperX 기반의 AVE 음성 전사·강제 정렬 API입니다. 이전 faster-whisper 전용 구현은 `legacy/faster-whisper-v1/`에 보존하며 신규 배포에는 사용하지 않습니다.
 
 ```text
 src/                 입력 검증, 오디오 다운로드, 모델 전사 로직
@@ -17,12 +17,12 @@ tests/               입력 및 오디오 처리 단위 테스트
   "audio_url": "https://example.com/audio.mp3",
   "language": "ko",
   "initial_prompt": "AVE 프로젝트 회의",
-  "hotwords": "AVE, faster-whisper",
+  "hotwords": "AVE, 서울대학교",
   "speed": 1.0
 }
 ```
 
-`audio_url`만 필수이며, `language`의 기본값은 `ko`입니다. `speed`는 비용 절감을 위한 실험적 옵션으로 `1.0~4.0`만 허용합니다. 감속은 지원하지 않습니다. 배속 전사 시에도 `duration`과 세그먼트 타임스탬프는 원본 오디오 시간축 기준으로 반환됩니다. 세그먼트 객체는 항상 사람이 읽기 쉬운 `start`, `end`, `text` 순서로 구성합니다. RunPod Console이 객체 키를 정렬해 표시하는 경우에도 실제 키 이름과 값에는 영향이 없습니다.
+`audio_url`만 필수이며, `language`의 기본값은 `ko`입니다. `speed`는 `1.0~2.0`만 허용합니다. 배속 전사 시에도 `duration`과 세그먼트 타임스탬프는 원본 오디오 시간축 기준으로 반환됩니다.
 
 성공 시 다음 JSON을 반환합니다.
 
@@ -31,13 +31,23 @@ tests/               입력 및 오디오 처리 단위 테스트
   "text": "전체 전사문",
   "language": "ko",
   "duration": 12.345,
+  "engine": "whisperx-aligned-word-v1",
+  "alignment": "ctc-forced-alignment-with-words",
   "segments": [
-    { "start": 0.0, "end": 2.4, "text": "첫 문장" }
+    {
+      "start": 0.0,
+      "end": 1.0,
+      "text": " 첫 문장",
+      "words": [
+        {"start": 0.0, "end": 0.4, "word": " 첫"},
+        {"start": 0.4, "end": 1.0, "word": " 문장"}
+      ]
+    }
   ]
 }
 ```
 
-모델과 전사 설정은 `large-v3`, `float16`, `beam_size=5`, VAD 활성화로 고정됩니다.
+WhisperX의 `large-v3`, `float16`, Silero VAD로 한 번 전사한 뒤 감지 또는 지정된 언어의 CTC 음향 모델로 원본 전사문을 강제 정렬합니다. 한국어는 WhisperX 기본 매핑인 `kresnik/wav2vec2-large-xlsr-korean`을 사용합니다. 응답에는 정렬된 문장 세그먼트와 그 안의 단어 타임스탬프가 함께 포함되며 `engine`과 `alignment` 필드로 실제 worker 버전을 식별합니다.
 
 ## 입력 제약
 
@@ -47,7 +57,9 @@ tests/               입력 및 오디오 처리 단위 테스트
 
 | 이름 | 기본값 | 설명 |
 | --- | --- | --- |
-| `MODEL_CACHE_DIR` | `/models` | faster-whisper 모델 캐시 경로 |
+| `MODEL_CACHE_DIR` | `/models` | WhisperX `large-v3` 모델 캐시 경로 |
+| `ALIGN_MODEL_CACHE_DIR` | `/models/alignment` | 언어별 CTC 정렬 모델 캐시 경로 |
+| `WHISPERX_BATCH_SIZE` | `16` | WhisperX 전사 배치 크기 |
 | `MAX_DOWNLOAD_BYTES` | `1073741824` | 입력 오디오 최대 다운로드 크기 (1 GiB) |
 | `DOWNLOAD_CONNECT_TIMEOUT_SECONDS` | `15` | URL 연결과 TLS 협상 제한 시간(초) |
 | `DOWNLOAD_READ_TIMEOUT_SECONDS` | `60` | 다운로드 중 새 데이터 수신 제한 시간(초) |
@@ -83,7 +95,7 @@ python -m unittest discover -s tests -v
 
 ### 2. Docker Hub 로그인 및 이미지 빌드
 
-아래의 `<dockerhub-user>`를 본인의 Docker Hub 사용자명으로 바꿉니다. `<version>`에는 변경하지 않을 버전 태그를 사용합니다. 처음이면 `v0.1.0`을 사용할 수 있습니다.
+아래의 `<dockerhub-user>`를 본인의 Docker Hub 사용자명으로 바꿉니다. `<version>`에는 변경하지 않을 버전 태그를 사용합니다. WhisperX 계열의 첫 버전은 `v0.2.0`을 사용합니다.
 
 ```powershell
 docker login
@@ -99,7 +111,7 @@ docker build --platform linux/amd64 `
 docker push <dockerhub-user>/ave-whisper-api:<version>
 ```
 
-이미지가 공개 저장소가 아니라면 RunPod에서 해당 Docker Hub 저장소에 접근할 수 있도록 레지스트리 자격 증명을 함께 설정해야 합니다. 처음 검증할 때는 공개 저장소가 간단합니다. 이미지 태그는 `latest` 대신 `v0.1.0`처럼 고정된 값을 사용합니다.
+이미지가 공개 저장소가 아니라면 RunPod에서 해당 Docker Hub 저장소에 접근할 수 있도록 레지스트리 자격 증명을 함께 설정해야 합니다. 처음 검증할 때는 공개 저장소가 간단합니다. 이미지 태그는 `latest` 대신 `v0.2.0`처럼 고정된 값을 사용합니다.
 
 ### 3. RunPod Queue Endpoint 생성
 
@@ -112,12 +124,12 @@ docker push <dockerhub-user>/ave-whisper-api:<version>
    ```
 
 4. Endpoint 유형으로 **Queue**를 선택합니다.
-5. `float16`을 지원하는 NVIDIA GPU를 선택합니다. `large-v3` 모델을 올려야 하므로 처음 검증에는 GPU 메모리 16 GB 이상인 인스턴스를 권장합니다.
+5. `float16`을 지원하는 NVIDIA GPU를 선택합니다. `large-v3`와 정렬 모델을 함께 올리므로 GPU 메모리 24 GB 이상인 인스턴스를 권장합니다.
 6. 비용을 제한하려면 **Min Workers**를 `0`, **Max Workers**를 `1`로 설정합니다. 요청이 없을 때 worker가 내려가며, 첫 요청은 worker 시작과 모델 다운로드 때문에 오래 걸릴 수 있습니다.
 7. 긴 오디오도 검사할 수 있도록 실행 제한 시간은 우선 `900`초로 설정합니다. 실제 서비스에서는 최대 오디오 길이에 맞춰 조정합니다.
 8. Endpoint를 생성하고 worker 로그에서 이미지 시작 및 모델 다운로드가 완료되는지 확인합니다.
 
-첫 worker 시작 시 `large-v3` 모델 다운로드와 GPU 메모리 적재가 발생합니다. 이 시간에는 요청이 대기 상태일 수 있으며 오류가 아닙니다.
+첫 worker 시작 시 `large-v3` 모델을 내려받고, 첫 언어 요청 시 해당 CTC 정렬 모델을 추가로 내려받아 적재합니다. 이 시간에는 요청이 대기 상태일 수 있으며 오류가 아닙니다.
 
 ### 4. RunPod 콘솔에서 첫 요청 보내기
 
@@ -189,11 +201,11 @@ AVE Server는 사용자의 명시 취소 또는 heartbeat lease 만료 시 RunPo
 ```powershell
 docker build --platform linux/amd64 `
   -f deploy/runpod/Dockerfile `
-  -t <dockerhub-user>/ave-whisper-api:v0.1.1 .
+  -t <dockerhub-user>/ave-whisper-api:v0.2.1 .
 
-docker push <dockerhub-user>/ave-whisper-api:v0.1.1
+docker push <dockerhub-user>/ave-whisper-api:v0.2.1
 ```
 
-RunPod Endpoint 설정에서 이미지 태그를 `v0.1.1`로 바꾸어 worker를 재배포한 뒤, 위와 같은 요청으로 다시 확인합니다. 문제가 생기면 이전에 검증된 이미지 태그로 되돌릴 수 있습니다.
+RunPod Endpoint 설정에서 이미지 태그를 `v0.2.1`로 바꾸어 worker를 재배포한 뒤, 위와 같은 요청으로 다시 확인합니다. 문제가 생기면 이전에 검증된 이미지 태그로 되돌릴 수 있습니다.
 
 RunPod 콘솔 절차와 API 형식은 [RunPod worker 배포 문서](https://docs.runpod.io/serverless/workers/deploy), [Endpoint 개요](https://docs.runpod.io/serverless/endpoints/overview), [요청 전송 문서](https://docs.runpod.io/serverless/endpoints/send-requests)를 기준으로 합니다.

@@ -98,6 +98,8 @@ def _download_once(
 
 
 def apply_speed(audio_path: Path, speed: float) -> Path:
+    if not 1.0 <= speed <= 2.0:
+        raise AudioDownloadError("배속은 1.0 이상 2.0 이하만 지원합니다.")
     output_path = audio_path.with_name("speed-adjusted.wav")
     filters = _atempo_filters(speed)
     try:
@@ -113,12 +115,9 @@ def apply_speed(audio_path: Path, speed: float) -> Path:
 
 
 def _atempo_filters(speed: float) -> str:
-    filters: list[str] = []
-    while speed > 2.0:
-        filters.append("atempo=2.0")
-        speed /= 2.0
-    filters.append(f"atempo={speed}")
-    return ",".join(filters)
+    if not 1.0 <= speed <= 2.0:
+        raise AudioDownloadError("배속은 1.0 이상 2.0 이하만 지원합니다.")
+    return f"atempo={speed}"
 
 
 def _validate_public_https_url(value: str) -> None:

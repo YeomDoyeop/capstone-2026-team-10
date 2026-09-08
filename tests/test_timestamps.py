@@ -1,26 +1,25 @@
 import unittest
 
-from src.timestamps import restore_original_timestamps
+from src.timestamps import restore_original_segment_timestamps
 
 
-class RestoreOriginalTimestampsTest(unittest.TestCase):
-    def test_restores_speed_adjusted_timestamps_to_original_timeline(self) -> None:
-        segments, duration = restore_original_timestamps(
-            [{"start": 1.234, "end": 2.345, "text": "테스트"}],
-            3.456,
+class TimestampTests(unittest.TestCase):
+    def test_restores_segments_to_original_timeline(self):
+        segments, duration = restore_original_segment_timestamps(
+            [{
+                "start": 0.25,
+                "end": 1.0,
+                "text": " 안녕하세요.",
+            }],
+            1.0,
             2.0,
         )
 
-        self.assertEqual(segments, [{"start": 2.468, "end": 4.69, "text": "테스트"}])
-        self.assertEqual(duration, 6.912)
-
-    def test_normalizes_key_order_when_speed_is_one(self) -> None:
-        source_segments = [{"end": 2.0, "text": "테스트", "start": 1.0}]
-
-        segments, duration = restore_original_timestamps(source_segments, 2.0, 1.0)
-
-        self.assertEqual(segments, [{"start": 1.0, "end": 2.0, "text": "테스트"}])
-        self.assertEqual(list(segments[0]), ["start", "end", "text"])
+        self.assertEqual(segments, [{
+            "start": 0.5,
+            "end": 2.0,
+            "text": " 안녕하세요.",
+        }])
         self.assertEqual(duration, 2.0)
 
 
