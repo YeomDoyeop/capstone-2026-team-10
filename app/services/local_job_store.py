@@ -21,15 +21,13 @@ class LocalJobStore:
             connection.execute("DROP TABLE IF EXISTS edit_jobs")
             connection.execute("DROP TABLE IF EXISTS metadata_material_cache")
             connection.execute("DROP TABLE IF EXISTS llm_cache")
-            connection.execute(
-                """
+            connection.execute("""
                 CREATE TABLE IF NOT EXISTS completed_edits (
                     job_id TEXT PRIMARY KEY,
                     result_json TEXT NOT NULL,
                     completed_at TEXT NOT NULL
                 )
-                """
-            )
+                """)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -48,15 +46,35 @@ class LocalJobStore:
         self, job_id: str, result: dict[str, Any], *, owner_id: str | None = None
     ) -> None:
         completed_at = datetime.now(timezone.utc).isoformat()
-        plan = result.get("analysis_plan") if isinstance(result.get("analysis_plan"), dict) else {}
+        plan = (
+            result.get("analysis_plan")
+            if isinstance(result.get("analysis_plan"), dict)
+            else {}
+        )
         persisted_plan = {
-            key: value for key, value in plan.items()
-            if key in {"genre", "llm_provider", "transcription_source", "target_seconds", "chapters", "selected_segment_ids", "recommended_segment_ids", "clips"}
+            key: value
+            for key, value in plan.items()
+            if key
+            in {
+                "genre",
+                "llm_provider",
+                "transcription_source",
+                "target_seconds",
+                "chapters",
+                "selected_segment_ids",
+                "recommended_segment_ids",
+                "clips",
+            }
         }
         if isinstance(persisted_plan.get("clips"), list):
             persisted_plan["clips"] = [
-                {key: item[key] for key in ("segment_id", "start", "end", "llm_score") if key in item}
-                for item in persisted_plan["clips"] if isinstance(item, dict)
+                {
+                    key: item[key]
+                    for key in ("segment_id", "start", "end", "llm_score")
+                    if key in item
+                }
+                for item in persisted_plan["clips"]
+                if isinstance(item, dict)
             ]
         persisted = {
             "job_id": job_id,
@@ -66,8 +84,16 @@ class LocalJobStore:
             "progress": 100,
             "message": "AI 영상 편집이 완료되었습니다.",
             "result": {
-                key: value for key, value in result.items()
-                if key in {"rendered_filename", "rendered_video_path", "vod_video_id", "selected_segment_ids", "selected_duration_seconds"}
+                key: value
+                for key, value in result.items()
+                if key
+                in {
+                    "rendered_filename",
+                    "rendered_video_path",
+                    "vod_video_id",
+                    "selected_segment_ids",
+                    "selected_duration_seconds",
+                }
             },
             "analysis_plan": persisted_plan,
             "completed_at": completed_at,
@@ -81,7 +107,11 @@ class LocalJobStore:
                     result_json = excluded.result_json,
                     completed_at = excluded.completed_at
                 """,
-                (job_id, json.dumps(persisted, ensure_ascii=False, separators=(",", ":")), completed_at),
+                (
+                    job_id,
+                    json.dumps(persisted, ensure_ascii=False, separators=(",", ":")),
+                    completed_at,
+                ),
             )
 
     def get_completed(self, job_id: str) -> dict[str, Any] | None:

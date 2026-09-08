@@ -46,7 +46,9 @@ def test_job_result_sends_only_analysis_data_to_server(monkeypatch):
         requests.append({"method": method, "url": url, **kwargs})
         return FakeResponse({"id": "server-job"})
 
-    monkeypatch.setattr("app.services.server_job_service.requests.request", fake_request)
+    monkeypatch.setattr(
+        "app.services.server_job_service.requests.request", fake_request
+    )
 
     job_id = create_job(
         "Bearer session",
@@ -92,10 +94,17 @@ def test_repeated_result_sync_reuses_same_server_job(monkeypatch):
         requests.append({"method": method, "url": url, **kwargs})
         return FakeResponse({"id": "server-job-existing"})
 
-    monkeypatch.setattr("app.services.server_job_service.requests.request", fake_request)
+    monkeypatch.setattr(
+        "app.services.server_job_service.requests.request", fake_request
+    )
     result = {"candidates": []}
     for _ in range(2):
-        job_id = create_job("Bearer session", client_job_id="local-job", source_id="youtube-id", source_url="https://www.youtube.com/watch?v=youtube-id")
+        job_id = create_job(
+            "Bearer session",
+            client_job_id="local-job",
+            source_id="youtube-id",
+            source_url="https://www.youtube.com/watch?v=youtube-id",
+        )
         save_result("Bearer session", job_id, result)
 
     assert [request["method"] for request in requests] == ["POST", "PUT", "POST", "PUT"]

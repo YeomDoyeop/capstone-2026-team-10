@@ -13,7 +13,10 @@ SUPPORTED_LLM_PROVIDERS = ("gemini", "deepseek")
 # AVE Server도 적용해야 하지만, 클라이언트는 한 작업 안에서 이를 넘지 않는다.
 LLM_PROVIDER_EXECUTION_LIMITS = {
     "deepseek": {"max_parallel_requests": 100, "minimum_request_interval_seconds": 0.0},
-    "gemini": {"max_parallel_requests": 1, "minimum_request_interval_seconds": 4.0},  # 15 RPM
+    "gemini": {
+        "max_parallel_requests": 1,
+        "minimum_request_interval_seconds": 4.0,
+    },  # 15 RPM
 }
 
 
@@ -26,7 +29,15 @@ class LLMGatewayError(RuntimeError):
 class LLMGateway:
     """Archive gateway contract, extended for this app's JSON-only agents."""
 
-    def __init__(self, provider: str = "deepseek", *, api_key: str | None = None, model: str | None = None, timeout: float = 120.0, server_access_token: str | None = None):
+    def __init__(
+        self,
+        provider: str = "deepseek",
+        *,
+        api_key: str | None = None,
+        model: str | None = None,
+        timeout: float = 120.0,
+        server_access_token: str | None = None,
+    ):
         self.provider = provider.lower().strip()
         if self.provider not in SUPPORTED_LLM_PROVIDERS:
             raise LLMGatewayError(f"지원하지 않는 LLM 공급자입니다: {provider}")
@@ -43,17 +54,38 @@ class LLMGateway:
         self.max_input_chars = provider_limits[self.provider]
         execution_limits = LLM_PROVIDER_EXECUTION_LIMITS[self.provider]
         self.max_parallel_requests = int(execution_limits["max_parallel_requests"])
-        self.minimum_request_interval_seconds = float(execution_limits["minimum_request_interval_seconds"])
+        self.minimum_request_interval_seconds = float(
+            execution_limits["minimum_request_interval_seconds"]
+        )
 
-    def request_json(self, system: str, prompt: str, *, response_schema: dict[str, Any] | None = None) -> str:
+    def request_json(
+        self, system: str, prompt: str, *, response_schema: dict[str, Any] | None = None
+    ) -> str:
         if self.server_url.startswith("https://"):
             if not self.server_access_token:
                 raise LLMGatewayError("서버 LLM 호출에는 로그인 토큰이 필요합니다.")
             try:
-                response = requests.post(f"{self.server_url}/api/llm/generate", headers={"Authorization": self.server_access_token, "Content-Type": "application/json"}, json={"provider": self.provider, "model": self.model, "system": system, "prompt": prompt, "response_schema": response_schema}, timeout=self.timeout)
+                response = requests.post(
+                    f"{self.server_url}/api/llm/generate",
+                    headers={
+                        "Authorization": self.server_access_token,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "provider": self.provider,
+                        "model": self.model,
+                        "system": system,
+                        "prompt": prompt,
+                        "response_schema": response_schema,
+                    },
+                    timeout=self.timeout,
+                )
                 if getattr(response, "status_code", None) in {429, 503}:
                     try:
-                        detail = str(response.json().get("detail") or "LLM API 사용량 제한 또는 일시 장애")
+                        detail = str(
+                            response.json().get("detail")
+                            or "LLM API 사용량 제한 또는 일시 장애"
+                        )
                     except ValueError:
                         detail = "LLM API 사용량 제한 또는 일시 장애"
                     raise LLMGatewayError(detail, unavailable=True)

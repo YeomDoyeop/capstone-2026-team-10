@@ -13,7 +13,6 @@ from app.config import get_media_root
 from app.services.toolchain import ToolchainError, ffmpeg
 from app.services.ytdlp_binary import YoutubeDL
 
-
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
 SUBTITLE_EXTENSIONS = {".vtt", ".srt", ".json3"}
@@ -64,9 +63,11 @@ def format_info_json(
         value = (
             fallback
             if prefer_fallback and fallback is not None
-            else json.loads(path.read_text(encoding="utf-8"))
-            if path.is_file()
-            else fallback
+            else (
+                json.loads(path.read_text(encoding="utf-8"))
+                if path.is_file()
+                else fallback
+            )
         )
     except (OSError, json.JSONDecodeError) as exc:
         if fallback is None:
@@ -230,7 +231,9 @@ class YouTubeImporter:
             except Exception as exc:
                 last_error = exc
         raise YouTubeImportError(
-            self._clean_error(str(last_error or "최고 품질 오디오 다운로드에 실패했습니다."))
+            self._clean_error(
+                str(last_error or "최고 품질 오디오 다운로드에 실패했습니다.")
+            )
         ) from last_error
 
     @staticmethod
@@ -244,10 +247,16 @@ class YouTubeImporter:
         elif parsed.path.startswith("/watch"):
             candidate = parse_qs(parsed.query).get("v", [""])[0]
         elif parsed.path.startswith(("/shorts/", "/embed/", "/live/")):
-            candidate = parsed.path.strip("/").split("/", 1)[1] if "/" in parsed.path.strip("/") else ""
+            candidate = (
+                parsed.path.strip("/").split("/", 1)[1]
+                if "/" in parsed.path.strip("/")
+                else ""
+            )
         else:
             candidate = ""
-        return candidate if re.fullmatch(r"[A-Za-z0-9_-]{6,32}", candidate or "") else None
+        return (
+            candidate if re.fullmatch(r"[A-Za-z0-9_-]{6,32}", candidate or "") else None
+        )
 
     def find_complete_cached_import(self, url: str, job_id: str) -> dict | None:
         """Reuse an existing source video; transcript availability is checked separately."""
@@ -260,7 +269,9 @@ class YouTubeImporter:
             return None
 
         candidates = [root / video_id]
-        candidates.extend(path for path in root.iterdir() if path.is_dir() and path not in candidates)
+        candidates.extend(
+            path for path in root.iterdir() if path.is_dir() and path not in candidates
+        )
         matches: list[tuple[float, Path, Path, list[Path], dict]] = []
         for directory in candidates:
             info_paths = sorted(directory.glob("*.info.json"))
@@ -273,10 +284,20 @@ class YouTubeImporter:
                     metadata = stored_info
                 except (OSError, json.JSONDecodeError):
                     metadata = {}
-            known_id = self._video_id_from_url(str(metadata.get("source_url") or metadata.get("webpage_url") or ""))
+            known_id = self._video_id_from_url(
+                str(metadata.get("source_url") or metadata.get("webpage_url") or "")
+            )
             # Legacy metadata may not contain a parseable URL, but yt-dlp file
             # names retain the video ID.
-            if known_id != video_id and video_id not in directory.name and not any(video_id in path.name for path in directory.iterdir() if path.is_file()):
+            if (
+                known_id != video_id
+                and video_id not in directory.name
+                and not any(
+                    video_id in path.name
+                    for path in directory.iterdir()
+                    if path.is_file()
+                )
+            ):
                 continue
             subtitles = self._find_files(directory, SUBTITLE_EXTENSIONS, recursive=True)
             subtitles = [
@@ -287,14 +308,20 @@ class YouTubeImporter:
             video = self._find_video_file(directory, metadata)
             if video is None or not video.exists() or video.stat().st_size <= 0:
                 continue
-            newest = max([video.stat().st_mtime, *(path.stat().st_mtime for path in subtitles)])
+            newest = max(
+                [video.stat().st_mtime, *(path.stat().st_mtime for path in subtitles)]
+            )
             matches.append((newest, directory, video, subtitles, metadata))
         if not matches:
             return None
 
-        _, directory, video, subtitles, metadata = max(matches, key=lambda item: item[0])
+        _, directory, video, subtitles, metadata = max(
+            matches, key=lambda item: item[0]
+        )
         info_paths = sorted(directory.glob("*.info.json"))
-        metadata_path = info_paths[0] if info_paths else directory / f"{video_id}.info.json"
+        metadata_path = (
+            info_paths[0] if info_paths else directory / f"{video_id}.info.json"
+        )
         return {
             "job_id": job_id,
             "source_url": url,
@@ -302,7 +329,9 @@ class YouTubeImporter:
             "duration": metadata.get("duration"),
             "video_path": relative_to_cwd(video),
             "subtitle_files": [relative_to_cwd(path) for path in subtitles],
-            "metadata_path": relative_to_cwd(metadata_path) if metadata_path.exists() else "",
+            "metadata_path": (
+                relative_to_cwd(metadata_path) if metadata_path.exists() else ""
+            ),
             "warnings": ["Reused the existing source video for this YouTube video."],
             "cache_hit": True,
         }
@@ -469,9 +498,8 @@ class YouTubeImporter:
 
     def _is_subtitle_rate_limit_error(self, exc: Exception) -> bool:
         message = str(exc)
-        return (
-            "Unable to download video subtitles" in message
-            and ("429" in message or "Too Many Requests" in message)
+        return "Unable to download video subtitles" in message and (
+            "429" in message or "Too Many Requests" in message
         )
 
     @staticmethod
@@ -485,7 +513,8 @@ class YouTubeImporter:
         message = str(exc or "").lower()
         return (
             "could not copy chrome cookie database" in message
-            or "could not copy" in message and "cookie database" in message
+            or "could not copy" in message
+            and "cookie database" in message
         )
 
     def _is_drm_error(self, exc: Exception | None) -> bool:

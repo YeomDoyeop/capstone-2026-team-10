@@ -31,7 +31,13 @@ class YoutubeDL:
         return urlopen(Request(url, headers=headers), timeout=30)
 
     def extract_info(self, url: str, download: bool = True) -> dict:
-        arguments = [str(ytdlp()), "--ignore-config", "--no-warnings", "--no-playlist", "--print-json"]
+        arguments = [
+            str(ytdlp()),
+            "--ignore-config",
+            "--no-warnings",
+            "--no-playlist",
+            "--print-json",
+        ]
         arguments.extend(self._option_arguments())
         if not download:
             arguments.append("--skip-download")
@@ -87,12 +93,20 @@ class YoutubeDL:
         if value.get("writeautomaticsub"):
             arguments.append("--write-auto-subs")
         if languages := value.get("subtitleslangs"):
-            arguments.extend(["--sub-langs", ",".join(str(language) for language in languages)])
+            arguments.extend(
+                ["--sub-langs", ",".join(str(language) for language in languages)]
+            )
         if subtitle_format := value.get("subtitlesformat"):
             arguments.extend(["--sub-format", str(subtitle_format)])
         if merged_format := value.get("merge_output_format"):
             arguments.extend(["--merge-output-format", str(merged_format)])
-        for source, flag in (("retries", "--retries"), ("fragment_retries", "--fragment-retries"), ("file_access_retries", "--file-access-retries"), ("sleep_interval_requests", "--sleep-requests"), ("http_chunk_size", "--http-chunk-size")):
+        for source, flag in (
+            ("retries", "--retries"),
+            ("fragment_retries", "--fragment-retries"),
+            ("file_access_retries", "--file-access-retries"),
+            ("sleep_interval_requests", "--sleep-requests"),
+            ("http_chunk_size", "--http-chunk-size"),
+        ):
             if source in value:
                 arguments.extend([flag, str(value[source])])
         if cookie_file := value.get("cookiefile"):
@@ -104,13 +118,21 @@ class YoutubeDL:
         extractor_args = value.get("extractor_args") or {}
         youtube_args = extractor_args.get("youtube") or {}
         if clients := youtube_args.get("player_client"):
-            arguments.extend(["--extractor-args", f"youtube:player_client={','.join(clients)}"])
+            arguments.extend(
+                ["--extractor-args", f"youtube:player_client={','.join(clients)}"]
+            )
         if languages := youtube_args.get("lang"):
-            arguments.extend(["--extractor-args", f"youtube:lang={','.join(languages)}"])
+            arguments.extend(
+                ["--extractor-args", f"youtube:lang={','.join(languages)}"]
+            )
         if comment_sort := youtube_args.get("comment_sort"):
-            arguments.extend(["--extractor-args", f"youtube:comment_sort={','.join(comment_sort)}"])
+            arguments.extend(
+                ["--extractor-args", f"youtube:comment_sort={','.join(comment_sort)}"]
+            )
         if max_comments := youtube_args.get("max_comments"):
-            arguments.extend(["--extractor-args", f"youtube:max_comments={','.join(max_comments)}"])
+            arguments.extend(
+                ["--extractor-args", f"youtube:max_comments={','.join(max_comments)}"]
+            )
         runtimes = value.get("js_runtimes") or {}
         if "node" in runtimes:
             arguments.extend(["--js-runtimes", "node"])

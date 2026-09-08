@@ -31,12 +31,25 @@ from app.services.live_youtube_service import (
     get_video_metadata,
     download_metadata_materials,
 )
-from app.services.live_edit_pipeline import LiveEditCancelled, LiveEditPaused, LiveEditPipeline, LiveEditPipelineError
+from app.services.live_edit_pipeline import (
+    LiveEditCancelled,
+    LiveEditPaused,
+    LiveEditPipeline,
+    LiveEditPipelineError,
+)
 from app.services.llm_analysis_service import LLMAnalysisError, LLMAnalysisService
 from app.services.local_job_store import LocalJobStore
-from app.services.server_job_service import ServerJobError, create_job as create_server_job, save_result as save_server_result
-from app.services.server_media_service import ServerMediaError, TranscriptionCancelledError, cancel_pending_uploaded_transcription, cancel_uploaded_transcription
-
+from app.services.server_job_service import (
+    ServerJobError,
+    create_job as create_server_job,
+    save_result as save_server_result,
+)
+from app.services.server_media_service import (
+    ServerMediaError,
+    TranscriptionCancelledError,
+    cancel_pending_uploaded_transcription,
+    cancel_uploaded_transcription,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 REACT_UI_DIR = STATIC_DIR / "ui"
@@ -58,7 +71,11 @@ METADATA_JOB_RETENTION = timedelta(minutes=10)
 LOCAL_CONTROL_TOKEN = secrets.token_urlsafe(32)
 
 if (REACT_UI_DIR / "assets").exists():
-    app.mount("/ui/assets", StaticFiles(directory=REACT_UI_DIR / "assets"), name="react-ui-assets")
+    app.mount(
+        "/ui/assets",
+        StaticFiles(directory=REACT_UI_DIR / "assets"),
+        name="react-ui-assets",
+    )
 
 
 def _user_value(user, key: str):
@@ -106,7 +123,10 @@ def _cleanup_expired_metadata_jobs() -> None:
             METADATA_MATERIAL_JOBS.pop(job_id, None)
     for job_id, job in list(WHISPER_TRANSCRIPT_JOBS.items()):
         completed_at = job.get("completed_at")
-        if isinstance(completed_at, datetime) and now - completed_at >= METADATA_JOB_RETENTION:
+        if (
+            isinstance(completed_at, datetime)
+            and now - completed_at >= METADATA_JOB_RETENTION
+        ):
             WHISPER_TRANSCRIPT_JOBS.pop(job_id, None)
             WHISPER_TRANSCRIPT_CANCEL_REQUESTS.discard(job_id)
 
@@ -120,7 +140,9 @@ async def _expire_metadata_material_job(job_id: str) -> None:
         METADATA_MATERIAL_JOBS.pop(job_id, None)
 
 
-async def _expire_whisper_transcript_job(job_id: str, expected_job: dict | None = None) -> None:
+async def _expire_whisper_transcript_job(
+    job_id: str, expected_job: dict | None = None
+) -> None:
     await asyncio.sleep(METADATA_JOB_RETENTION.total_seconds())
     job = WHISPER_TRANSCRIPT_JOBS.get(job_id)
     if (
@@ -147,7 +169,9 @@ async def get_current_user(
         user = response.json()
         user_id = user.get("id") if isinstance(user, dict) else None
     except (requests.RequestException, ValueError) as exc:
-        raise HTTPException(status_code=401, detail="Invalid or expired login session.") from exc
+        raise HTTPException(
+            status_code=401, detail="Invalid or expired login session."
+        ) from exc
 
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid login session.")
@@ -171,7 +195,9 @@ def _new_edit_job_id(vod_url: str) -> str:
 async def index():
     index_path = REACT_UI_DIR / "index.html"
     if not index_path.exists():
-        raise HTTPException(status_code=404, detail="React UI를 빌드하세요: ui에서 npm run build")
+        raise HTTPException(
+            status_code=404, detail="React UI를 빌드하세요: ui에서 npm run build"
+        )
     return FileResponse(index_path)
 
 
@@ -180,7 +206,9 @@ async def index():
 async def react_index():
     index_path = REACT_UI_DIR / "index.html"
     if not index_path.exists():
-        raise HTTPException(status_code=404, detail="React UI를 빌드하세요: ui에서 npm run build")
+        raise HTTPException(
+            status_code=404, detail="React UI를 빌드하세요: ui에서 npm run build"
+        )
     return FileResponse(index_path)
 
 
@@ -188,7 +216,9 @@ async def react_index():
 async def react_favicon():
     favicon_path = REACT_UI_DIR / "favicon.svg"
     if not favicon_path.exists():
-        raise HTTPException(status_code=404, detail="React UI 파비콘을 찾을 수 없습니다.")
+        raise HTTPException(
+            status_code=404, detail="React UI 파비콘을 찾을 수 없습니다."
+        )
     return FileResponse(
         favicon_path,
         media_type="image/svg+xml",
@@ -203,9 +233,13 @@ async def public_config():
         response.raise_for_status()
         value = response.json()
     except (requests.RequestException, ValueError) as exc:
-        raise HTTPException(status_code=503, detail="AVE 서버 인증 설정을 불러오지 못했습니다.") from exc
+        raise HTTPException(
+            status_code=503, detail="AVE 서버 인증 설정을 불러오지 못했습니다."
+        ) from exc
     if not isinstance(value, dict):
-        raise HTTPException(status_code=503, detail="AVE 서버 인증 설정 응답이 올바르지 않습니다.")
+        raise HTTPException(
+            status_code=503, detail="AVE 서버 인증 설정 응답이 올바르지 않습니다."
+        )
     return value
 
 
@@ -237,7 +271,10 @@ def _analysis_task_name(message: str) -> str:
 
 
 def _raise_if_cancel_requested(job_id: str) -> None:
-    if job_id in LIVE_EDIT_CANCEL_REQUESTS or LIVE_EDIT_JOBS.get(job_id, {}).get("status") == "cancel_requested":
+    if (
+        job_id in LIVE_EDIT_CANCEL_REQUESTS
+        or LIVE_EDIT_JOBS.get(job_id, {}).get("status") == "cancel_requested"
+    ):
         raise LiveEditCancelled("사용자가 작업을 취소했습니다.")
 
 
@@ -265,7 +302,13 @@ async def _discard_failed_edit_job(job_id: str, error: Exception) -> None:
 
 async def _pause_edit_job(job_id: str, error: Exception) -> None:
     detail = str(error).strip() or "LLM 요청이 중단되었습니다."
-    _update_live_edit_job(job_id, status="paused", phase="analysis", message=f"{detail} 재개하면 완료된 LLM 응답을 재사용합니다.", error=detail)
+    _update_live_edit_job(
+        job_id,
+        status="paused",
+        phase="analysis",
+        message=f"{detail} 재개하면 완료된 LLM 응답을 재사용합니다.",
+        error=detail,
+    )
     _cleanup_edit_transient_state(job_id)
 
 
@@ -298,10 +341,22 @@ async def _run_live_edit_job(
 
     def report_whisper_preparing() -> None:
         _raise_if_cancel_requested(job_id)
-        _update_live_edit_job(job_id, whisper_preparing=True, phase="transcription", message="Whisper 전사를 준비하는 중입니다.")
+        _update_live_edit_job(
+            job_id,
+            whisper_preparing=True,
+            phase="transcription",
+            message="Whisper 전사를 준비하는 중입니다.",
+        )
 
     try:
-        _update_live_edit_job(job_id, status="running", progress=3, phase="analysis", task_name="영상 분석 준비", message="2단계에서 준비한 영상 자료를 확인하는 중입니다.")
+        _update_live_edit_job(
+            job_id,
+            status="running",
+            progress=3,
+            phase="analysis",
+            task_name="영상 분석 준비",
+            message="2단계에서 준비한 영상 자료를 확인하는 중입니다.",
+        )
         vod_id = extract_video_id(request.vod_url)
 
         pipeline = LiveEditPipeline(get_media_root())
@@ -328,7 +383,10 @@ async def _run_live_edit_job(
             whisper_progress_callback=report_transcription,
             whisper_preparing_callback=report_whisper_preparing,
             whisper_job_started_callback=lambda runpod_job_id: _update_live_edit_job(
-                job_id, runpod_job_id=runpod_job_id, phase="transcription", message="Whisper 전사 작업을 시작했습니다."
+                job_id,
+                runpod_job_id=runpod_job_id,
+                phase="transcription",
+                message="Whisper 전사 작업을 시작했습니다.",
             ),
         )
         result["vod_video_id"] = vod_id
@@ -352,8 +410,16 @@ async def _run_live_edit_job(
             sync_warning = None
             if server_access_token:
                 try:
-                    server_job_id = await asyncio.to_thread(create_server_job, server_access_token, client_job_id=job_id, source_id=vod_id, source_url=request.vod_url)
-                    await asyncio.to_thread(save_server_result, server_access_token, server_job_id, result)
+                    server_job_id = await asyncio.to_thread(
+                        create_server_job,
+                        server_access_token,
+                        client_job_id=job_id,
+                        source_id=vod_id,
+                        source_url=request.vod_url,
+                    )
+                    await asyncio.to_thread(
+                        save_server_result, server_access_token, server_job_id, result
+                    )
                 except ServerJobError as exc:
                     sync_warning = str(exc)
             _update_live_edit_job(
@@ -361,7 +427,11 @@ async def _run_live_edit_job(
                 status="completed",
                 progress=100,
                 phase="render",
-                message="AI 영상 편집이 완료되었습니다." if not sync_warning else f"영상 생성은 완료됐지만 {sync_warning}",
+                message=(
+                    "AI 영상 편집이 완료되었습니다."
+                    if not sync_warning
+                    else f"영상 생성은 완료됐지만 {sync_warning}"
+                ),
                 result=result,
             )
             _cleanup_edit_transient_state(job_id)
@@ -382,7 +452,9 @@ async def start_live_edit(
     user=Depends(get_current_user),
 ):
     if not authorization:
-        raise HTTPException(status_code=401, detail="AVE 서버 연동에는 로그인 토큰이 필요합니다.")
+        raise HTTPException(
+            status_code=401, detail="AVE 서버 연동에는 로그인 토큰이 필요합니다."
+        )
     try:
         job_id = request.job_id
     except LiveYouTubeError as exc:
@@ -390,17 +462,33 @@ async def start_live_edit(
     if Path(job_id).name != job_id:
         raise HTTPException(status_code=400, detail="잘못된 편집 작업 ID입니다.")
     try:
-        metadata = await asyncio.to_thread(get_video_metadata, request.vod_url, refresh=False)
+        metadata = await asyncio.to_thread(
+            get_video_metadata, request.vod_url, refresh=False
+        )
     except LiveYouTubeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    if not metadata.get("subtitles_available") and not metadata.get("captions_available"):
-        request = request.model_copy(update={"transcription_source": "whisper_api", "transcript_language": None})
+    if not metadata.get("subtitles_available") and not metadata.get(
+        "captions_available"
+    ):
+        request = request.model_copy(
+            update={"transcription_source": "whisper_api", "transcript_language": None}
+        )
     existing = LIVE_EDIT_JOBS.get(job_id)
     if existing:
         if existing.get("owner_id") != _user_id(user):
-            raise HTTPException(status_code=409, detail="다른 작업에 사용 중인 편집 작업 ID입니다.")
-        if existing.get("status") not in {"awaiting_selection", "completed", "failed", "cancelled"}:
-            raise HTTPException(status_code=409, detail="이미 실행 중이거나 재개 대기 중인 편집 작업 ID입니다.")
+            raise HTTPException(
+                status_code=409, detail="다른 작업에 사용 중인 편집 작업 ID입니다."
+            )
+        if existing.get("status") not in {
+            "awaiting_selection",
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail="이미 실행 중이거나 재개 대기 중인 편집 작업 ID입니다.",
+            )
     if request.transcription_source == "whisper_api":
         prepared = WHISPER_TRANSCRIPT_JOBS.get(job_id)
         if (
@@ -409,7 +497,9 @@ async def start_live_edit(
             or prepared.get("status") != "completed"
             or prepared.get("source_url") != request.vod_url
         ):
-            raise HTTPException(status_code=409, detail="완료된 Whisper 준비 작업을 확인할 수 없습니다.")
+            raise HTTPException(
+                status_code=409, detail="완료된 Whisper 준비 작업을 확인할 수 없습니다."
+            )
     if existing:
         # 사용자가 결과 확인 후 이전 단계로 돌아가 STT·설정을 다시 준비한
         # 경우에는 같은 작업 ID로 분석 결과를 새로 만들 수 있어야 한다.
@@ -431,16 +521,30 @@ async def start_live_edit(
 
 
 @app.post("/api/youtube/edit/{job_id}/resume", status_code=202)
-async def resume_live_edit(job_id: str, authorization: str | None = Header(default=None), user=Depends(get_current_user)):
+async def resume_live_edit(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+    user=Depends(get_current_user),
+):
     job = _job_for_user(job_id, user)
     if job.get("status") != "paused":
-        raise HTTPException(status_code=409, detail="재개할 수 있는 일시중지 작업이 아닙니다.")
+        raise HTTPException(
+            status_code=409, detail="재개할 수 있는 일시중지 작업이 아닙니다."
+        )
     try:
         request = LiveEditRequest.model_validate(job.get("request"))
     except Exception as exc:
-        raise HTTPException(status_code=409, detail="재개할 작업 설정을 찾을 수 없습니다.") from exc
+        raise HTTPException(
+            status_code=409, detail="재개할 작업 설정을 찾을 수 없습니다."
+        ) from exc
     LIVE_EDIT_ACCESS_TOKENS[job_id] = authorization or ""
-    _update_live_edit_job(job_id, status="queued", task_name="LLM 영상 분석", error=None, message="중단된 LLM 분석을 재개하는 중입니다.")
+    _update_live_edit_job(
+        job_id,
+        status="queued",
+        task_name="LLM 영상 분석",
+        error=None,
+        message="중단된 LLM 분석을 재개하는 중입니다.",
+    )
     asyncio.create_task(_run_live_edit_job(job_id, request, authorization))
     return LIVE_EDIT_JOBS[job_id]
 
@@ -463,11 +567,18 @@ async def recommend_whisper_settings(
     user=Depends(get_current_user),
 ):
     if not authorization:
-        raise HTTPException(status_code=401, detail="LLM 호출에는 로그인 토큰이 필요합니다.")
+        raise HTTPException(
+            status_code=401, detail="LLM 호출에는 로그인 토큰이 필요합니다."
+        )
     del user
     try:
-        service = LLMAnalysisService(provider=request.llm_provider, server_access_token=authorization)
-        return await asyncio.to_thread(service.recommend_whisper_settings, request.model_dump(exclude={"llm_provider"}))
+        service = LLMAnalysisService(
+            provider=request.llm_provider, server_access_token=authorization
+        )
+        return await asyncio.to_thread(
+            service.recommend_whisper_settings,
+            request.model_dump(exclude={"llm_provider"}),
+        )
     except LLMAnalysisError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -479,7 +590,9 @@ async def prepare_whisper_transcript(
     user=Depends(get_current_user),
 ):
     if not authorization:
-        raise HTTPException(status_code=401, detail="Whisper 전사에는 로그인 토큰이 필요합니다.")
+        raise HTTPException(
+            status_code=401, detail="Whisper 전사에는 로그인 토큰이 필요합니다."
+        )
     try:
         job_id = request.job_id
         if Path(job_id).name != job_id:
@@ -510,7 +623,9 @@ async def prepare_whisper_transcript(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-async def _run_whisper_transcript_job(job_id: str, request: WhisperPreparationRequest) -> None:
+async def _run_whisper_transcript_job(
+    job_id: str, request: WhisperPreparationRequest
+) -> None:
     job = WHISPER_TRANSCRIPT_JOBS[job_id]
 
     def cancelled() -> None:
@@ -539,20 +654,50 @@ async def _run_whisper_transcript_job(job_id: str, request: WhisperPreparationRe
             cancel_callback=cancelled,
             whisper_job_started_callback=started,
         )
-        job.update({"status": "completed", "progress": 100, "message": "Whisper 전사를 완료했습니다.", "result": result, "completed_at": datetime.now(timezone.utc)})
+        job.update(
+            {
+                "status": "completed",
+                "progress": 100,
+                "message": "Whisper 전사를 완료했습니다.",
+                "result": result,
+                "completed_at": datetime.now(timezone.utc),
+            }
+        )
     except (LiveEditCancelled, TranscriptionCancelledError):
-        job.update({"status": "cancelled", "message": "Whisper 전사 작업을 취소했습니다.", "completed_at": datetime.now(timezone.utc)})
+        job.update(
+            {
+                "status": "cancelled",
+                "message": "Whisper 전사 작업을 취소했습니다.",
+                "completed_at": datetime.now(timezone.utc),
+            }
+        )
     except LiveEditPaused as exc:
         detail = str(exc)
-        job.update({
-            "status": "paused",
-            "message": f"{detail} 재시도하면 완료된 LLM 응답을 재사용합니다.",
-            "error": detail,
-        })
+        job.update(
+            {
+                "status": "paused",
+                "message": f"{detail} 재시도하면 완료된 LLM 응답을 재사용합니다.",
+                "error": detail,
+            }
+        )
     except (LiveYouTubeError, LiveEditPipelineError, ServerMediaError) as exc:
-        job.update({"status": "failed", "message": str(exc), "error": str(exc), "completed_at": datetime.now(timezone.utc)})
+        job.update(
+            {
+                "status": "failed",
+                "message": str(exc),
+                "error": str(exc),
+                "completed_at": datetime.now(timezone.utc),
+            }
+        )
     except Exception as exc:
-        job.update({"status": "failed", "message": "Whisper 전사에 실패했습니다.", "error": str(exc), "completed_at": datetime.now(timezone.utc)})
+        job.update(
+            {
+                "status": "failed",
+                "message": "Whisper 전사에 실패했습니다.",
+                "error": str(exc),
+                "completed_at": datetime.now(timezone.utc),
+            }
+        )
     finally:
         asyncio.create_task(_expire_whisper_transcript_job(job_id, job))
 
@@ -564,7 +709,9 @@ async def start_whisper_transcript(
     user=Depends(get_current_user),
 ):
     if not authorization:
-        raise HTTPException(status_code=401, detail="Whisper 전사에는 로그인 토큰이 필요합니다.")
+        raise HTTPException(
+            status_code=401, detail="Whisper 전사에는 로그인 토큰이 필요합니다."
+        )
     _cleanup_expired_metadata_jobs()
     try:
         job_id = request.job_id
@@ -577,42 +724,79 @@ async def start_whisper_transcript(
         existing.get("owner_id") != _user_id(user)
         or existing.get("source_url") != request.url
     ):
-        raise HTTPException(status_code=409, detail="다른 작업에 사용 중인 편집 작업 ID입니다.")
+        raise HTTPException(
+            status_code=409, detail="다른 작업에 사용 중인 편집 작업 ID입니다."
+        )
     if existing and existing.get("status") in {"running", "cancel_requested"}:
-        raise HTTPException(status_code=409, detail="이미 실행 중인 Whisper 전사 작업입니다.")
+        raise HTTPException(
+            status_code=409, detail="이미 실행 중인 Whisper 전사 작업입니다."
+        )
     WHISPER_TRANSCRIPT_CANCEL_REQUESTS.discard(job_id)
-    WHISPER_TRANSCRIPT_JOBS[job_id] = {"job_id": job_id, "owner_id": _user_id(user), "source_url": request.url, "status": "running", "progress": 0, "message": "Whisper 전사를 준비하는 중입니다.", "access_token": authorization, "client_job_id": job_id}
+    WHISPER_TRANSCRIPT_JOBS[job_id] = {
+        "job_id": job_id,
+        "owner_id": _user_id(user),
+        "source_url": request.url,
+        "status": "running",
+        "progress": 0,
+        "message": "Whisper 전사를 준비하는 중입니다.",
+        "access_token": authorization,
+        "client_job_id": job_id,
+    }
     asyncio.create_task(_run_whisper_transcript_job(job_id, request))
-    return {key: value for key, value in WHISPER_TRANSCRIPT_JOBS[job_id].items() if key != "access_token"}
+    return {
+        key: value
+        for key, value in WHISPER_TRANSCRIPT_JOBS[job_id].items()
+        if key != "access_token"
+    }
 
 
 @app.get("/api/youtube/metadata/whisper-transcript/{job_id}")
-async def get_whisper_transcript_job(job_id: str, authorization: str | None = Header(default=None), user=Depends(get_current_user)):
+async def get_whisper_transcript_job(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+    user=Depends(get_current_user),
+):
     job = WHISPER_TRANSCRIPT_JOBS.get(job_id)
     if not job or job.get("owner_id") != _user_id(user):
-        raise HTTPException(status_code=404, detail="Whisper 전사 작업을 찾을 수 없습니다.")
+        raise HTTPException(
+            status_code=404, detail="Whisper 전사 작업을 찾을 수 없습니다."
+        )
     if authorization:
         job["access_token"] = authorization
     return {key: value for key, value in job.items() if key != "access_token"}
 
 
 @app.post("/api/youtube/metadata/whisper-transcript/{job_id}/cancel")
-async def cancel_whisper_transcript_job(job_id: str, authorization: str | None = Header(default=None), user=Depends(get_current_user)):
+async def cancel_whisper_transcript_job(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+    user=Depends(get_current_user),
+):
     job = WHISPER_TRANSCRIPT_JOBS.get(job_id)
     if not job or job.get("owner_id") != _user_id(user):
-        raise HTTPException(status_code=404, detail="Whisper 전사 작업을 찾을 수 없습니다.")
+        raise HTTPException(
+            status_code=404, detail="Whisper 전사 작업을 찾을 수 없습니다."
+        )
     if authorization:
         job["access_token"] = authorization
     if job.get("status") in {"completed", "failed", "cancelled"}:
         return {key: value for key, value in job.items() if key != "access_token"}
     WHISPER_TRANSCRIPT_CANCEL_REQUESTS.add(job_id)
-    job.update({"status": "cancel_requested", "message": "Whisper 전사 취소를 요청했습니다."})
+    job.update(
+        {"status": "cancel_requested", "message": "Whisper 전사 취소를 요청했습니다."}
+    )
     try:
         remote_job_id = job.get("remote_job_id")
         if isinstance(remote_job_id, str) and remote_job_id:
-            await asyncio.to_thread(cancel_uploaded_transcription, remote_job_id, job["access_token"])
+            await asyncio.to_thread(
+                cancel_uploaded_transcription, remote_job_id, job["access_token"]
+            )
         else:
-            await asyncio.to_thread(cancel_pending_uploaded_transcription, job["client_job_id"], job["access_token"])
+            await asyncio.to_thread(
+                cancel_pending_uploaded_transcription,
+                job["client_job_id"],
+                job["access_token"],
+            )
     except ServerMediaError as exc:
         job["message"] = f"취소를 요청했습니다. 서버 확인을 다시 시도합니다: {exc}"
     return {key: value for key, value in job.items() if key != "access_token"}
@@ -622,26 +806,74 @@ async def cancel_whisper_transcript_job(job_id: str, authorization: str | None =
 async def youtube_metadata_materials(request: YouTubeMetadataMaterialsRequest):
     try:
         extract_video_id(request.url)
-        selections = {key: getattr(request, key) for key in ("comments", "chat", "subtitles", "captions", "subtitle_language", "caption_language")}
-        return await asyncio.to_thread(download_metadata_materials, request.url, selections)
+        selections = {
+            key: getattr(request, key)
+            for key in (
+                "comments",
+                "chat",
+                "subtitles",
+                "captions",
+                "subtitle_language",
+                "caption_language",
+            )
+        }
+        return await asyncio.to_thread(
+            download_metadata_materials, request.url, selections
+        )
     except LiveYouTubeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-async def _run_metadata_material_job(job_id: str, request: YouTubeMetadataMaterialsRequest) -> None:
+async def _run_metadata_material_job(
+    job_id: str, request: YouTubeMetadataMaterialsRequest
+) -> None:
     job = METADATA_MATERIAL_JOBS[job_id]
 
     def update(progress: int, message: str) -> None:
         job.update({"progress": max(0, min(100, progress)), "message": message})
 
     try:
-        selections = {key: getattr(request, key) for key in ("comments", "chat", "subtitles", "captions", "subtitle_language", "caption_language")}
-        result = await asyncio.to_thread(download_metadata_materials, request.url, selections, update)
-        job.update({"status": "completed", "progress": 100, "message": "추가 메타데이터 준비를 완료했습니다.", "result": result, "completed_at": datetime.now(timezone.utc)})
+        selections = {
+            key: getattr(request, key)
+            for key in (
+                "comments",
+                "chat",
+                "subtitles",
+                "captions",
+                "subtitle_language",
+                "caption_language",
+            )
+        }
+        result = await asyncio.to_thread(
+            download_metadata_materials, request.url, selections, update
+        )
+        job.update(
+            {
+                "status": "completed",
+                "progress": 100,
+                "message": "추가 메타데이터 준비를 완료했습니다.",
+                "result": result,
+                "completed_at": datetime.now(timezone.utc),
+            }
+        )
     except LiveYouTubeError as exc:
-        job.update({"status": "failed", "message": str(exc), "error": str(exc), "completed_at": datetime.now(timezone.utc)})
+        job.update(
+            {
+                "status": "failed",
+                "message": str(exc),
+                "error": str(exc),
+                "completed_at": datetime.now(timezone.utc),
+            }
+        )
     except Exception as exc:
-        job.update({"status": "failed", "message": "추가 메타데이터 다운로드에 실패했습니다.", "error": str(exc), "completed_at": datetime.now(timezone.utc)})
+        job.update(
+            {
+                "status": "failed",
+                "message": "추가 메타데이터 다운로드에 실패했습니다.",
+                "error": str(exc),
+                "completed_at": datetime.now(timezone.utc),
+            }
+        )
     finally:
         if job.get("status") in {"completed", "failed"}:
             asyncio.create_task(_expire_metadata_material_job(job_id))
@@ -664,22 +896,39 @@ async def start_youtube_metadata_materials(
         existing.get("owner_id") != _user_id(user)
         or existing.get("source_url") != request.url
     ):
-        raise HTTPException(status_code=409, detail="다른 작업에 사용 중인 편집 작업 ID입니다.")
+        raise HTTPException(
+            status_code=409, detail="다른 작업에 사용 중인 편집 작업 ID입니다."
+        )
     if existing and existing.get("status") == "running":
-        raise HTTPException(status_code=409, detail="이미 실행 중인 추가 메타데이터 작업입니다.")
-    METADATA_MATERIAL_JOBS[job_id] = {"job_id": job_id, "owner_id": _user_id(user), "source_url": request.url, "status": "running", "progress": 0, "message": "추가 메타데이터 다운로드를 준비하는 중입니다."}
+        raise HTTPException(
+            status_code=409, detail="이미 실행 중인 추가 메타데이터 작업입니다."
+        )
+    METADATA_MATERIAL_JOBS[job_id] = {
+        "job_id": job_id,
+        "owner_id": _user_id(user),
+        "source_url": request.url,
+        "status": "running",
+        "progress": 0,
+        "message": "추가 메타데이터 다운로드를 준비하는 중입니다.",
+    }
     asyncio.create_task(_run_metadata_material_job(job_id, request))
     return METADATA_MATERIAL_JOBS[job_id]
 
 
 @app.get("/api/youtube/metadata/materials/{job_id}")
-async def get_youtube_metadata_material_job(job_id: str, user=Depends(get_current_user)):
+async def get_youtube_metadata_material_job(
+    job_id: str, user=Depends(get_current_user)
+):
     _cleanup_expired_metadata_jobs()
     job = METADATA_MATERIAL_JOBS.get(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="추가 메타데이터 작업을 찾을 수 없습니다.")
+        raise HTTPException(
+            status_code=404, detail="추가 메타데이터 작업을 찾을 수 없습니다."
+        )
     if job.get("owner_id") != _user_id(user):
-        raise HTTPException(status_code=404, detail="추가 메타데이터 작업을 찾을 수 없습니다.")
+        raise HTTPException(
+            status_code=404, detail="추가 메타데이터 작업을 찾을 수 없습니다."
+        )
     response = dict(job)
     # 결과 파일은 보존하지만, UI가 끝 상태를 읽은 뒤 진행 상태는 남기지 않는다.
     if response.get("status") in {"completed", "failed"}:
@@ -689,7 +938,10 @@ async def get_youtube_metadata_material_job(job_id: str, user=Depends(get_curren
 
 @app.get("/api/youtube/thumbnail/{video_id}/{filename}")
 async def youtube_thumbnail(video_id: str, filename: str):
-    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) or Path(filename).name != filename:
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id)
+        or Path(filename).name != filename
+    ):
         raise HTTPException(status_code=404, detail="썸네일을 찾을 수 없습니다.")
     path = get_media_root() / "yt-data" / video_id / "thumbnails" / filename
     if not path.is_file():
@@ -706,6 +958,7 @@ async def live_edit_status(job_id: str, user=Depends(get_current_user)):
 async def live_edit_events(job_id: str, user=Depends(get_current_user)):
     """로컬 작업 상태를 브라우저에 SSE로 전달한다."""
     _job_for_user(job_id, user)
+
     async def events():
         previous = ""
         yield "retry: 1000\n\n"
@@ -726,19 +979,35 @@ async def live_edit_events(job_id: str, user=Depends(get_current_user)):
             yield ": keep-alive\n\n"
             await asyncio.sleep(1)
 
-    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/youtube/edit/active")
 async def active_live_edit_jobs(user=Depends(get_current_user)):
     terminal = {"completed", "failed", "cancelled"}
     owner_id = _user_id(user)
-    return {"jobs": [job for job in LIVE_EDIT_JOBS.values() if job.get("status") not in terminal and job.get("owner_id") == owner_id]}
+    return {
+        "jobs": [
+            job
+            for job in LIVE_EDIT_JOBS.values()
+            if job.get("status") not in terminal and job.get("owner_id") == owner_id
+        ]
+    }
 
 
 @app.post("/api/youtube/edit/{job_id}/cancel")
 async def cancel_live_edit(
-    job_id: str, authorization: str | None = Header(default=None), user=Depends(get_current_user)
+    job_id: str,
+    authorization: str | None = Header(default=None),
+    user=Depends(get_current_user),
 ):
     if not job_id or Path(job_id).name != job_id:
         raise HTTPException(status_code=400, detail="잘못된 편집 작업 ID입니다.")
@@ -751,34 +1020,53 @@ async def cancel_live_edit(
         if owned_job.get("status") == "completed":
             return owned_job
         _cleanup_edit_job_state(job_id)
-        return {"job_id": job_id, "status": "cancelled", "message": "작업은 이미 종료되었습니다. 로컬 작업 파일은 보존됩니다."}
+        return {
+            "job_id": job_id,
+            "status": "cancelled",
+            "message": "작업은 이미 종료되었습니다. 로컬 작업 파일은 보존됩니다.",
+        }
     if job.get("status") in {"completed", "awaiting_selection"}:
         return job
     LIVE_EDIT_CANCEL_REQUESTS.add(job_id)
     runpod_job_id = job.get("runpod_job_id")
     if isinstance(runpod_job_id, str) and runpod_job_id and not authorization:
-        raise HTTPException(status_code=401, detail="Whisper 작업 취소에는 로그인 토큰이 필요합니다.")
+        raise HTTPException(
+            status_code=401, detail="Whisper 작업 취소에는 로그인 토큰이 필요합니다."
+        )
     job = {
         **job,
         "status": "cancel_requested" if is_live else "cancelled",
         "progress": job.get("progress", 0) if is_live else 100,
         "phase": "cancelled",
-        "message": "작업 취소를 요청했습니다." if is_live else "실행 중이 아닌 이전 작업을 종료했습니다.",
+        "message": (
+            "작업 취소를 요청했습니다."
+            if is_live
+            else "실행 중이 아닌 이전 작업을 종료했습니다."
+        ),
         "error": None,
     }
     if is_live:
         LIVE_EDIT_JOBS[job_id] = job
     access_token = authorization or LIVE_EDIT_ACCESS_TOKENS.get(job_id)
-    if job.get("transcription_source") == "whisper_api" and job.get("whisper_preparing") and not runpod_job_id and access_token:
+    if (
+        job.get("transcription_source") == "whisper_api"
+        and job.get("whisper_preparing")
+        and not runpod_job_id
+        and access_token
+    ):
         try:
-            await asyncio.to_thread(cancel_pending_uploaded_transcription, job_id, access_token)
+            await asyncio.to_thread(
+                cancel_pending_uploaded_transcription, job_id, access_token
+            )
         except ServerMediaError as exc:
             job["message"] = f"취소를 요청했습니다. 서버 확인을 다시 시도합니다: {exc}"
             if is_live:
                 LIVE_EDIT_JOBS[job_id] = job
     if isinstance(runpod_job_id, str) and runpod_job_id:
         try:
-            await asyncio.to_thread(cancel_uploaded_transcription, runpod_job_id, access_token or "")
+            await asyncio.to_thread(
+                cancel_uploaded_transcription, runpod_job_id, access_token or ""
+            )
         except ServerMediaError as exc:
             # 서버가 이미 RunPod 취소를 시작했거나 일시적으로 응답하지 않을 수
             # 있으므로 로컬 상태는 유지한다. heartbeat 중단 뒤 server lease가 재시도한다.
@@ -786,7 +1074,11 @@ async def cancel_live_edit(
             if is_live:
                 LIVE_EDIT_JOBS[job_id] = job
     _cleanup_edit_job_state(job_id)
-    return {"job_id": job_id, "status": "cancelled", "message": "작업을 취소했습니다. 로컬 작업 파일은 보존됩니다."}
+    return {
+        "job_id": job_id,
+        "status": "cancelled",
+        "message": "작업을 취소했습니다. 로컬 작업 파일은 보존됩니다.",
+    }
 
 
 @app.post("/api/youtube/edit/cancel-active")
@@ -811,7 +1103,9 @@ async def cancel_all_live_edit_jobs_from_tray(
     if not x_ave_local_control or not secrets.compare_digest(
         x_ave_local_control, LOCAL_CONTROL_TOKEN
     ):
-        raise HTTPException(status_code=401, detail="로컬 트레이 제어 권한이 필요합니다.")
+        raise HTTPException(
+            status_code=401, detail="로컬 트레이 제어 권한이 필요합니다."
+        )
     cancelled = 0
     for job_id, job in list(LIVE_EDIT_JOBS.items()):
         if job.get("status") in {"completed", "failed", "cancelled", "paused"}:
@@ -830,81 +1124,113 @@ async def _run_segment_selection_job(
 ) -> None:
     lock = EDIT_JOB_LOCKS.setdefault(job_id, asyncio.Lock())
     try:
-      async with lock:
-        previous_result = dict(LIVE_EDIT_JOBS.get(job_id, {}).get("result") or {})
+        async with lock:
+            previous_result = dict(LIVE_EDIT_JOBS.get(job_id, {}).get("result") or {})
 
-        def report_render(progress: int, message: str) -> None:
-            _raise_if_cancel_requested(job_id)
-            _update_live_edit_job(job_id, progress=progress, phase="render", task_name="영상 렌더링", message=message)
+            def report_render(progress: int, message: str) -> None:
+                _raise_if_cancel_requested(job_id)
+                _update_live_edit_job(
+                    job_id,
+                    progress=progress,
+                    phase="render",
+                    task_name="영상 렌더링",
+                    message=message,
+                )
 
-        try:
-            _update_live_edit_job(
-                job_id,
-                status="running",
-                progress=0,
-                phase="render",
-                task_name="영상 렌더링",
-                message="사용자가 선택한 구간으로 편집을 준비하는 중입니다.",
-            )
-            pipeline = LiveEditPipeline(get_media_root())
-            result = await asyncio.to_thread(
-                pipeline.rerender_from_selection,
-                job_id,
-                request.segment_ids,
-                plan=dict(previous_result.get("analysis_plan") or {}),
-                progress_callback=report_render,
-            )
-            final_plan = dict(previous_result.get("analysis_plan") or {})
-            selected_ids = result.get("selected_segment_ids") or request.segment_ids
-            candidates_by_id = {
-                str(item.get("segment_id")): item
-                for item in final_plan.get("candidates") or [] if isinstance(item, dict)
-            }
-            final_plan.update({
-                "clips": [
-                    {key: candidate[key] for key in ("segment_id", "start", "end", "llm_score") if key in candidate}
-                    for segment_id in selected_ids
-                    if (candidate := candidates_by_id.get(str(segment_id))) is not None
-                ],
-                "selected_segment_ids": selected_ids,
-                "rendered_filename": result.get("rendered_filename"),
-            })
-            merged_result = {
-                **previous_result,
-                **result,
-                "analysis_plan": final_plan,
-                "awaiting_selection": False,
-            }
-            # 렌더링 성공은 로컬 완료의 기준이다. 서버 이력 동기화 실패가 이미
-            # 생성된 결과 영상까지 폐기하게 해서는 안 된다.
-            LocalJobStore(get_database_root()).save_completed(
-                job_id, merged_result, owner_id=LIVE_EDIT_JOBS.get(job_id, {}).get("owner_id")
-            )
-            vod_url = str(previous_result.get("vod_url") or "")
-            sync_warning = None
-            if server_access_token and vod_url:
-                try:
-                    vod_id = extract_video_id(vod_url)
-                    server_job_id = await asyncio.to_thread(create_server_job, server_access_token, client_job_id=job_id, source_id=vod_id, source_url=vod_url)
-                    await asyncio.to_thread(save_server_result, server_access_token, server_job_id, merged_result, selection={"selected_segment_ids": request.segment_ids})
-                except ServerJobError as exc:
-                    sync_warning = str(exc)
-            _update_live_edit_job(
-                job_id,
-                status="completed",
-                progress=100,
-                phase="render",
-                message="선택한 구간으로 영상을 다시 만들었습니다." if not sync_warning else f"영상 생성은 완료됐지만 {sync_warning}",
-                result=merged_result,
-                error=None,
-            )
-            _cleanup_edit_transient_state(job_id)
-        except LiveEditCancelled:
-            _cleanup_edit_job_state(job_id)
-        except LiveEditPipelineError as exc:
-            await _discard_failed_edit_job(job_id, exc)
-        except Exception as exc:
-            await _discard_failed_edit_job(job_id, exc)
+            try:
+                _update_live_edit_job(
+                    job_id,
+                    status="running",
+                    progress=0,
+                    phase="render",
+                    task_name="영상 렌더링",
+                    message="사용자가 선택한 구간으로 편집을 준비하는 중입니다.",
+                )
+                pipeline = LiveEditPipeline(get_media_root())
+                result = await asyncio.to_thread(
+                    pipeline.rerender_from_selection,
+                    job_id,
+                    request.segment_ids,
+                    plan=dict(previous_result.get("analysis_plan") or {}),
+                    progress_callback=report_render,
+                )
+                final_plan = dict(previous_result.get("analysis_plan") or {})
+                selected_ids = result.get("selected_segment_ids") or request.segment_ids
+                candidates_by_id = {
+                    str(item.get("segment_id")): item
+                    for item in final_plan.get("candidates") or []
+                    if isinstance(item, dict)
+                }
+                final_plan.update(
+                    {
+                        "clips": [
+                            {
+                                key: candidate[key]
+                                for key in ("segment_id", "start", "end", "llm_score")
+                                if key in candidate
+                            }
+                            for segment_id in selected_ids
+                            if (candidate := candidates_by_id.get(str(segment_id)))
+                            is not None
+                        ],
+                        "selected_segment_ids": selected_ids,
+                        "rendered_filename": result.get("rendered_filename"),
+                    }
+                )
+                merged_result = {
+                    **previous_result,
+                    **result,
+                    "analysis_plan": final_plan,
+                    "awaiting_selection": False,
+                }
+                # 렌더링 성공은 로컬 완료의 기준이다. 서버 이력 동기화 실패가 이미
+                # 생성된 결과 영상까지 폐기하게 해서는 안 된다.
+                LocalJobStore(get_database_root()).save_completed(
+                    job_id,
+                    merged_result,
+                    owner_id=LIVE_EDIT_JOBS.get(job_id, {}).get("owner_id"),
+                )
+                vod_url = str(previous_result.get("vod_url") or "")
+                sync_warning = None
+                if server_access_token and vod_url:
+                    try:
+                        vod_id = extract_video_id(vod_url)
+                        server_job_id = await asyncio.to_thread(
+                            create_server_job,
+                            server_access_token,
+                            client_job_id=job_id,
+                            source_id=vod_id,
+                            source_url=vod_url,
+                        )
+                        await asyncio.to_thread(
+                            save_server_result,
+                            server_access_token,
+                            server_job_id,
+                            merged_result,
+                            selection={"selected_segment_ids": request.segment_ids},
+                        )
+                    except ServerJobError as exc:
+                        sync_warning = str(exc)
+                _update_live_edit_job(
+                    job_id,
+                    status="completed",
+                    progress=100,
+                    phase="render",
+                    message=(
+                        "선택한 구간으로 영상을 다시 만들었습니다."
+                        if not sync_warning
+                        else f"영상 생성은 완료됐지만 {sync_warning}"
+                    ),
+                    result=merged_result,
+                    error=None,
+                )
+                _cleanup_edit_transient_state(job_id)
+            except LiveEditCancelled:
+                _cleanup_edit_job_state(job_id)
+            except LiveEditPipelineError as exc:
+                await _discard_failed_edit_job(job_id, exc)
+            except Exception as exc:
+                await _discard_failed_edit_job(job_id, exc)
     finally:
         EDIT_JOB_LOCKS.pop(job_id, None)
 
@@ -945,7 +1271,9 @@ async def get_edit_segments(job_id: str, user=Depends(get_current_user)):
     current = LIVE_EDIT_JOBS.get(job_id)
     plan = (current or {}).get("result", {}).get("analysis_plan")
     if not isinstance(plan, dict):
-        raise HTTPException(status_code=404, detail="선택 대기 중인 분석 작업을 찾을 수 없습니다.")
+        raise HTTPException(
+            status_code=404, detail="선택 대기 중인 분석 작업을 찾을 수 없습니다."
+        )
     pipeline = LiveEditPipeline(get_media_root())
     try:
         return pipeline.get_segment_review(job_id, plan)
@@ -955,17 +1283,31 @@ async def get_edit_segments(job_id: str, user=Depends(get_current_user)):
 
 @app.put("/api/youtube/edit/{job_id}/segments", status_code=202)
 async def update_edit_segments(
-    job_id: str, request: SegmentSelectionRequest, authorization: str | None = Header(default=None), user=Depends(get_current_user)
+    job_id: str,
+    request: SegmentSelectionRequest,
+    authorization: str | None = Header(default=None),
+    user=Depends(get_current_user),
 ):
     _job_for_user(job_id, user)
     current = LIVE_EDIT_JOBS.get(job_id)
-    if not current or not isinstance((current.get("result") or {}).get("analysis_plan"), dict):
-        raise HTTPException(status_code=404, detail="선택 대기 중인 분석 작업을 찾을 수 없습니다.")
-    if current and current.get("phase") == "render" and current.get("status") in {
-        "queued",
-        "running",
-    }:
-        raise HTTPException(status_code=409, detail="이미 선택 구간을 렌더링하고 있습니다.")
+    if not current or not isinstance(
+        (current.get("result") or {}).get("analysis_plan"), dict
+    ):
+        raise HTTPException(
+            status_code=404, detail="선택 대기 중인 분석 작업을 찾을 수 없습니다."
+        )
+    if (
+        current
+        and current.get("phase") == "render"
+        and current.get("status")
+        in {
+            "queued",
+            "running",
+        }
+    ):
+        raise HTTPException(
+            status_code=409, detail="이미 선택 구간을 렌더링하고 있습니다."
+        )
     if current is None:
         LIVE_EDIT_JOBS[job_id] = {
             "job_id": job_id,
@@ -999,15 +1341,29 @@ async def get_edit_media(job_id: str, kind: str, user=Depends(get_current_user))
     active = LIVE_EDIT_JOBS.get(job_id, {})
     result = active.get("result") or (_completed_job(job_id) or {}).get("result") or {}
     if kind == "source":
-        source = Path(str((active.get("result") or {}).get("analysis_plan", {}).get("source_video_path", "")))
+        source = Path(
+            str(
+                (active.get("result") or {})
+                .get("analysis_plan", {})
+                .get("source_video_path", "")
+            )
+        )
         if source.is_file():
-            return FileResponse(source, media_type="video/mp4", headers={"Cache-Control": "no-store"})
+            return FileResponse(
+                source, media_type="video/mp4", headers={"Cache-Control": "no-store"}
+            )
     if kind != "rendered":
-        raise HTTPException(status_code=404, detail="원본 미리보기 단계가 종료되었습니다.")
+        raise HTTPException(
+            status_code=404, detail="원본 미리보기 단계가 종료되었습니다."
+        )
     filename = Path(str(result.get("rendered_filename") or "")).name
     if not filename:
-        raise HTTPException(status_code=404, detail="완료된 결과 영상을 찾을 수 없습니다.")
+        raise HTTPException(
+            status_code=404, detail="완료된 결과 영상을 찾을 수 없습니다."
+        )
     media_path = output_dir / filename
     if not media_path.is_file():
         raise HTTPException(status_code=404, detail="영상 파일을 찾을 수 없습니다.")
-    return FileResponse(media_path, media_type="video/mp4", headers={"Cache-Control": "no-store"})
+    return FileResponse(
+        media_path, media_type="video/mp4", headers={"Cache-Control": "no-store"}
+    )

@@ -2,7 +2,9 @@ from pathlib import Path
 
 
 def test_tray_icon_uses_the_same_play_favicon_colors():
-    source = (Path(__file__).resolve().parents[1] / "app" / "desktop.py").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "app" / "desktop.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "rounded_rectangle" in source
     assert "draw.polygon" in source
@@ -11,7 +13,9 @@ def test_tray_icon_uses_the_same_play_favicon_colors():
 
 
 def test_client_logs_use_an_independent_gui_instead_of_cmd():
-    source = (Path(__file__).resolve().parents[1] / "app" / "desktop.py").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "app" / "desktop.py").read_text(
+        encoding="utf-8"
+    )
 
     assert 'root.title("AVE 클라이언트 로그")' in source
     assert 'pystray.MenuItem("로그 열기"' in source
@@ -47,6 +51,8 @@ def test_client_logs_use_an_independent_gui_instead_of_cmd():
     assert "parent=root" not in source
     assert 'default="no"' in source
     assert "_keep_taskbar_icon_only" not in source
-    assert source.index("root.withdraw()") < source.index('root.title("AVE 클라이언트 로그")')
+    assert source.index("root.withdraw()") < source.index(
+        'root.title("AVE 클라이언트 로그")'
+    )
     assert 'root.configure(background="SystemButtonFace")' in source
     assert "tk.Toplevel(root)" not in source

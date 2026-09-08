@@ -18,7 +18,6 @@ import uvicorn
 from PIL import Image, ImageDraw
 from app.main import LOCAL_CONTROL_TOKEN
 
-
 HOST = "127.0.0.1"
 PORT = 8000
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -138,7 +137,9 @@ class LogWindowManager:
                 else:
                     horizontal.grid()
 
-            text.configure(yscrollcommand=update_vertical, xscrollcommand=update_horizontal)
+            text.configure(
+                yscrollcommand=update_vertical, xscrollcommand=update_horizontal
+            )
             content.columnconfigure(0, weight=1)
             content.rowconfigure(0, weight=1)
             text.grid(row=0, column=0, sticky="nsew")
@@ -158,7 +159,9 @@ class LogWindowManager:
                 text.configure(state="disabled")
 
             ttk.Button(toolbar, text="전체 복사", command=copy_all).pack(side="right")
-            ttk.Button(toolbar, text="화면 비우기", command=clear_view).pack(side="right", padx=(0, 8))
+            ttk.Button(toolbar, text="화면 비우기", command=clear_view).pack(
+                side="right", padx=(0, 8)
+            )
 
             messages, history = self.log_handler.subscribe()
 
@@ -172,9 +175,12 @@ class LogWindowManager:
                     # Windows에 전면·최상위 표시를 요청한다.
                     # MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 |
                     # MB_SETFOREGROUND | MB_TOPMOST
-                    confirmed = ctypes.windll.user32.MessageBoxW(
-                        0, message, "AVE 클라이언트 종료", 0x50134
-                    ) == 6  # IDYES
+                    confirmed = (
+                        ctypes.windll.user32.MessageBoxW(
+                            0, message, "AVE 클라이언트 종료", 0x50134
+                        )
+                        == 6
+                    )  # IDYES
                 except (AttributeError, OSError):
                     from tkinter import messagebox
 
@@ -233,7 +239,9 @@ class LogWindowManager:
             append_new_logs()
             root.mainloop()
         except Exception:
-            logging.getLogger(__name__).exception("클라이언트 로그 창을 열지 못했습니다.")
+            logging.getLogger(__name__).exception(
+                "클라이언트 로그 창을 열지 못했습니다."
+            )
         finally:
             if "messages" in locals():
                 self.log_handler.unsubscribe(messages)
@@ -280,7 +288,9 @@ def _shutdown(icon: pystray.Icon, server: uvicorn.Server) -> None:
             timeout=15,
         )
     except requests.RequestException:
-        logging.getLogger(__name__).warning("종료 전 작업 취소 요청을 전송하지 못했습니다.", exc_info=True)
+        logging.getLogger(__name__).warning(
+            "종료 전 작업 취소 요청을 전송하지 못했습니다.", exc_info=True
+        )
     server.should_exit = True
     icon.stop()
     LOG_WINDOW.stop()
@@ -320,7 +330,9 @@ def main() -> None:
     )
     threading.Thread(target=server.run, name="ave-local-api", daemon=True).start()
     if not _wait_for_local_server():
-        raise RuntimeError("로컬 AVE 서버를 시작하지 못했습니다. client.log를 확인하세요.")
+        raise RuntimeError(
+            "로컬 AVE 서버를 시작하지 못했습니다. client.log를 확인하세요."
+        )
 
     icon = pystray.Icon(
         "ave-client",

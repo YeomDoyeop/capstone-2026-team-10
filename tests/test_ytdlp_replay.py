@@ -103,20 +103,31 @@ def test_metadata_uses_existing_info_json_without_calling_ytdlp(tmp_path, monkey
     output_dir = tmp_path / "yt-data" / video_id
     output_dir.mkdir(parents=True)
     (output_dir / f"{video_id}.info.json").write_text(
-            json.dumps({"id": video_id, "title": "cached title", "thumbnail": "https://example.com/default.jpg", "duration": 600}),
+        json.dumps(
+            {
+                "id": video_id,
+                "title": "cached title",
+                "thumbnail": "https://example.com/default.jpg",
+                "duration": 600,
+            }
+        ),
         encoding="utf-8",
     )
     (output_dir / f"{video_id}.metadata-policy.json").write_text(
         json.dumps({"preferred_language": "ko", "version": 4}), encoding="utf-8"
     )
 
-    result = get_video_metadata(f"https://www.youtube.com/watch?v={video_id}", refresh=False)
+    result = get_video_metadata(
+        f"https://www.youtube.com/watch?v={video_id}", refresh=False
+    )
 
     assert result["title"] == "cached title"
     assert result["video_id"] == video_id
 
 
-def test_metadata_info_download_excludes_optional_material_bodies(tmp_path, monkeypatch):
+def test_metadata_info_download_excludes_optional_material_bodies(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
     video_id = "abc123def45"
     calls = []
@@ -147,7 +158,9 @@ def test_metadata_info_download_excludes_optional_material_bodies(tmp_path, monk
     assert options["extractor_args"]["youtube"]["max_comments"] == ["0"]
 
 
-def test_phase_one_info_json_removes_comment_bodies_but_keeps_count(tmp_path, monkeypatch):
+def test_phase_one_info_json_removes_comment_bodies_but_keeps_count(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
     video_id = "abc123def45"
 
@@ -184,7 +197,7 @@ def test_phase_one_info_json_removes_comment_bodies_but_keeps_count(tmp_path, mo
                 b'{"markersMap":[{"key":"DESCRIPTION_CHAPTERS","value":{"chapters":['
                 b'{"chapterRenderer":{"title":{"simpleText":"\\uc624\\ud504\\ub2dd"},"timeRangeStartMillis":0}},'
                 b'{"chapterRenderer":{"title":{"simpleText":"AI \\ubcf8\\ubb38"},"timeRangeStartMillis":90000}}'
-                b']}}]}}}}}};</script>'
+                b"]}}]}}}}}};</script>"
             )
 
     monkeypatch.setattr("app.services.live_youtube_service.YoutubeDL", Downloader)
@@ -192,7 +205,9 @@ def test_phase_one_info_json_removes_comment_bodies_but_keeps_count(tmp_path, mo
     get_video_metadata(f"https://www.youtube.com/watch?v={video_id}")
 
     saved = json.loads(
-        (tmp_path / "yt-data" / video_id / f"{video_id}.info.json").read_text(encoding="utf-8")
+        (tmp_path / "yt-data" / video_id / f"{video_id}.info.json").read_text(
+            encoding="utf-8"
+        )
     )
     assert saved["comment_count"] == 2
     assert "comments" not in saved
@@ -208,7 +223,12 @@ def test_comment_download_does_not_overwrite_info_json(tmp_path, monkeypatch):
     output_dir = tmp_path / "yt-data" / video_id
     output_dir.mkdir(parents=True)
     info_path = output_dir / f"{video_id}.info.json"
-    original_info = {"id": video_id, "title": "title", "duration": 600, "comment_count": 1}
+    original_info = {
+        "id": video_id,
+        "title": "title",
+        "duration": 600,
+        "comment_count": 1,
+    }
     info_path.write_text(json.dumps(original_info), encoding="utf-8")
     (output_dir / f"{video_id}.metadata-policy.json").write_text(
         json.dumps({"preferred_language": "ko", "version": 4}), encoding="utf-8"
@@ -245,7 +265,9 @@ def test_comment_download_does_not_overwrite_info_json(tmp_path, monkeypatch):
     assert json.loads(info_path.read_text(encoding="utf-8")) == original_info
 
 
-def test_material_step_prepares_video_without_subtitles_when_nothing_is_selected(tmp_path, monkeypatch):
+def test_material_step_prepares_video_without_subtitles_when_nothing_is_selected(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
     video_id = "abc123def45"
     output_dir = tmp_path / "yt-data" / video_id
@@ -280,7 +302,9 @@ def test_material_step_prepares_video_without_subtitles_when_nothing_is_selected
     ]
 
 
-def test_legacy_metadata_cache_is_refreshed_with_korean_preference(tmp_path, monkeypatch):
+def test_legacy_metadata_cache_is_refreshed_with_korean_preference(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
     video_id = "abc123def45"
     output_dir = tmp_path / "yt-data" / video_id
@@ -322,13 +346,16 @@ def test_legacy_metadata_cache_is_refreshed_with_korean_preference(tmp_path, mon
 
 
 @pytest.mark.parametrize("duration", [599, 21_600])
-def test_metadata_rejects_videos_outside_supported_duration(tmp_path, monkeypatch, duration):
+def test_metadata_rejects_videos_outside_supported_duration(
+    tmp_path, monkeypatch, duration
+):
     monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
     video_id = "abc123def45"
     output_dir = tmp_path / "yt-data" / video_id
     output_dir.mkdir(parents=True)
     (output_dir / f"{video_id}.info.json").write_text(
-        json.dumps({"id": video_id, "title": "cached title", "duration": duration}), encoding="utf-8"
+        json.dumps({"id": video_id, "title": "cached title", "duration": duration}),
+        encoding="utf-8",
     )
     (output_dir / f"{video_id}.metadata-policy.json").write_text(
         json.dumps({"preferred_language": "ko", "version": 4}), encoding="utf-8"

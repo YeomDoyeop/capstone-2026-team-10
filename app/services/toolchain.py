@@ -64,7 +64,9 @@ def version(name: str) -> str:
     except OSError as exc:
         raise ToolchainError(f"`{name}`을(를) 실행할 수 없습니다: {exc}") from exc
     if completed.returncode != 0:
-        raise ToolchainError(completed.stderr.strip() or f"`{name}` 버전을 확인하지 못했습니다.")
+        raise ToolchainError(
+            completed.stderr.strip() or f"`{name}` 버전을 확인하지 못했습니다."
+        )
     return completed.stdout.strip().splitlines()[0]
 
 

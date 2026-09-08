@@ -13,17 +13,42 @@ class ServerJobError(RuntimeError):
     pass
 
 
-def create_job(access_token: str, *, client_job_id: str, source_id: str, source_url: str) -> str:
-    payload = _request("POST", "/api/analysis-jobs", access_token, {"client_job_id": client_job_id, "source_id": source_id, "source_url": source_url})
+def create_job(
+    access_token: str, *, client_job_id: str, source_id: str, source_url: str
+) -> str:
+    payload = _request(
+        "POST",
+        "/api/analysis-jobs",
+        access_token,
+        {
+            "client_job_id": client_job_id,
+            "source_id": source_id,
+            "source_url": source_url,
+        },
+    )
     job_id = payload.get("id")
     if not isinstance(job_id, str):
         raise ServerJobError("AVE 서버가 작업 ID를 반환하지 않았습니다.")
     return job_id
 
 
-def save_result(access_token: str, job_id: str, result: dict[str, Any], *, selection: dict[str, Any] | None = None) -> None:
-    plan = result.get("analysis_plan") if isinstance(result.get("analysis_plan"), dict) else {}
-    candidates = plan.get("candidates") if isinstance(plan.get("candidates"), list) else result.get("candidates") or []
+def save_result(
+    access_token: str,
+    job_id: str,
+    result: dict[str, Any],
+    *,
+    selection: dict[str, Any] | None = None,
+) -> None:
+    plan = (
+        result.get("analysis_plan")
+        if isinstance(result.get("analysis_plan"), dict)
+        else {}
+    )
+    candidates = (
+        plan.get("candidates")
+        if isinstance(plan.get("candidates"), list)
+        else result.get("candidates") or []
+    )
     segments = [
         {
             "segment_index": index,
@@ -36,20 +61,47 @@ def save_result(access_token: str, job_id: str, result: dict[str, Any], *, selec
             "heatmap_score": None,
             "average_volume_dbfs": _number(item.get("average_volume_dbfs")),
             "final_score": _score(item.get("final_score")),
-            "recommended": str(item.get("segment_id")) in set(plan.get("recommended_segment_ids") or result.get("recommended_segment_ids") or []),
+            "recommended": str(item.get("segment_id"))
+            in set(
+                plan.get("recommended_segment_ids")
+                or result.get("recommended_segment_ids")
+                or []
+            ),
         }
         for index, item in enumerate(candidates)
         if float(item.get("end", 0)) > float(item.get("start", 0))
     ]
-    _request("PUT", f"/api/analysis-jobs/{job_id}/result", access_token, {"script": None, "segments": segments, "heatmap": [], "recommendation": {"recommended_segment_ids": plan.get("recommended_segment_ids") or result.get("recommended_segment_ids", [])}, "selection": selection or {}})
+    _request(
+        "PUT",
+        f"/api/analysis-jobs/{job_id}/result",
+        access_token,
+        {
+            "script": None,
+            "segments": segments,
+            "heatmap": [],
+            "recommendation": {
+                "recommended_segment_ids": plan.get("recommended_segment_ids")
+                or result.get("recommended_segment_ids", [])
+            },
+            "selection": selection or {},
+        },
+    )
 
 
-def _request(method: str, path: str, access_token: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _request(
+    method: str, path: str, access_token: str, payload: dict[str, Any]
+) -> dict[str, Any]:
     base_url = get_ave_server_url()
     if not base_url.startswith("https://") or not access_token:
         raise ServerJobError("AVE_SERVER_URL과 로그인 토큰이 필요합니다.")
     try:
-        response = requests.request(method, f"{base_url}{path}", headers={"Authorization": access_token, "Content-Type": "application/json"}, json=payload, timeout=30)
+        response = requests.request(
+            method,
+            f"{base_url}{path}",
+            headers={"Authorization": access_token, "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
         response.raise_for_status()
         body = response.json()
     except requests.RequestException as exc:
@@ -61,7 +113,9 @@ def _request(method: str, path: str, access_token: str, payload: dict[str, Any])
             except (ValueError, AttributeError):
                 detail = response.text.strip()[:500]
         suffix = f": {detail}" if detail else ""
-        raise ServerJobError(f"AVE 서버와 작업 이력을 동기화하지 못했습니다{suffix}") from exc
+        raise ServerJobError(
+            f"AVE 서버와 작업 이력을 동기화하지 못했습니다{suffix}"
+        ) from exc
     except ValueError as exc:
         raise ServerJobError("AVE 서버 응답 형식이 올바르지 않습니다.") from exc
     return body if isinstance(body, dict) else {}

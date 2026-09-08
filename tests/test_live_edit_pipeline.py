@@ -5,7 +5,38 @@ import time
 import pytest
 
 from app.services import live_edit_pipeline
-from app.services.live_edit_pipeline import CHAT_REACTION_OFFSET_SECONDS, SECTION_SCORE_WEIGHTS, LiveEditPipeline, LiveEditPipelineError, SUBTITLE_FONT_SIZE, SUBTITLE_LINE_WIDTH, SUBTITLE_MARGIN_BOTTOM, SUBTITLE_MIN_DURATION_SECONDS, WHISPER_LONG_SEGMENT_CHARACTERS, WHISPER_PRIORITY_GAP_SECONDS, _adjust_chat_timestamp, _apply_final_scores, _apply_heatmap_scores, _apply_point_scores, _apply_timestamp_comment_scores, _chat_score_points, _comment_timestamp_seconds, _hardware_decoding_args, _heatmap_section_score, _select_clips, _select_coherent_clips, _split_whisper_segment, _split_whisper_segments_parallel, _time_seconds, _video_encoding_args, _volume_score_points, _whisper_transcript_path, _write_json_atomic, fixed_whisper_initial_prompt, write_selected_subtitles
+from app.services.live_edit_pipeline import (
+    CHAT_REACTION_OFFSET_SECONDS,
+    SECTION_SCORE_WEIGHTS,
+    LiveEditPipeline,
+    LiveEditPipelineError,
+    SUBTITLE_FONT_SIZE,
+    SUBTITLE_LINE_WIDTH,
+    SUBTITLE_MARGIN_BOTTOM,
+    SUBTITLE_MIN_DURATION_SECONDS,
+    WHISPER_LONG_SEGMENT_CHARACTERS,
+    WHISPER_PRIORITY_GAP_SECONDS,
+    _adjust_chat_timestamp,
+    _apply_final_scores,
+    _apply_heatmap_scores,
+    _apply_point_scores,
+    _apply_timestamp_comment_scores,
+    _chat_score_points,
+    _comment_timestamp_seconds,
+    _hardware_decoding_args,
+    _heatmap_section_score,
+    _select_clips,
+    _select_coherent_clips,
+    _split_whisper_segment,
+    _split_whisper_segments_parallel,
+    _time_seconds,
+    _video_encoding_args,
+    _volume_score_points,
+    _whisper_transcript_path,
+    _write_json_atomic,
+    fixed_whisper_initial_prompt,
+    write_selected_subtitles,
+)
 from app.services.live_youtube_service import LiveYouTubeError, load_prepared_transcript
 
 
@@ -27,13 +58,21 @@ def test_default_rendered_subtitle_style_and_short_duration_filter(tmp_path):
     count = write_selected_subtitles(
         [
             {"start": 1.0, "end": 1.01, "text": "순간 오류"},
-            {"start": 1.1, "end": 2.0, "text": "하나 둘 셋 넷 다섯 여섯 일곱 여덟 아홉 열 하나 둘 셋 넷 다섯 여섯"},
+            {
+                "start": 1.1,
+                "end": 2.0,
+                "text": "하나 둘 셋 넷 다섯 여섯 일곱 여덟 아홉 열 하나 둘 셋 넷 다섯 여섯",
+            },
         ],
         [{"start": 0.0, "end": 2.0}],
         output,
     )
 
-    assert (SUBTITLE_FONT_SIZE, SUBTITLE_MARGIN_BOTTOM, SUBTITLE_LINE_WIDTH) == (16, 12, 30)
+    assert (SUBTITLE_FONT_SIZE, SUBTITLE_MARGIN_BOTTOM, SUBTITLE_LINE_WIDTH) == (
+        16,
+        12,
+        30,
+    )
     assert SUBTITLE_MIN_DURATION_SECONDS == 0.08
     assert count == 1
     content = output.read_text(encoding="utf-8")
@@ -56,17 +95,20 @@ def test_long_whisper_segment_uses_midpoint_between_adjacent_words():
             return [{"start_word": 0, "end_word": 1}, {"start_word": 2, "end_word": 3}]
 
     text = "가나다라마바사아 아자차카타파하자 차카타파하가나다라 타파하가나다라마바사."
-    result = _split_whisper_segment({
-        "start": 1.0,
-        "end": 5.0,
-        "text": text,
-        "words": [
-            {"start": 1.1, "end": 1.8, "word": "가나다라마바사아"},
-            {"start": 1.9, "end": 2.7, "word": "아자차카타파하자"},
-            {"start": 2.8, "end": 3.7, "word": "차카타파하가나다라"},
-            {"start": 3.8, "end": 4.8, "word": "타파하가나다라마바사."},
-        ],
-    }, Analysis())
+    result = _split_whisper_segment(
+        {
+            "start": 1.0,
+            "end": 5.0,
+            "text": text,
+            "words": [
+                {"start": 1.1, "end": 1.8, "word": "가나다라마바사아"},
+                {"start": 1.9, "end": 2.7, "word": "아자차카타파하자"},
+                {"start": 2.8, "end": 3.7, "word": "차카타파하가나다라"},
+                {"start": 3.8, "end": 4.8, "word": "타파하가나다라마바사."},
+            ],
+        },
+        Analysis(),
+    )
 
     assert result[0]["start"] == 1.0
     assert result[0]["end"] == result[1]["start"] == 2.75
@@ -80,17 +122,20 @@ def test_long_whisper_segment_prioritizes_silent_gap_without_midpoint():
         def split_subtitle_words(self, *_args, **_kwargs):
             raise AssertionError("무음 경계로 만든 짧은 조각은 LLM에 보내면 안 됩니다.")
 
-    result = _split_whisper_segment({
-        "start": 1.0,
-        "end": 6.0,
-        "text": "가나다라마바사 아자차카타파하 차카타파하가나다 타파하가나다라마",
-        "words": [
-            {"start": 1.1, "end": 1.8, "word": "가나다라마바사"},
-            {"start": 1.9, "end": 2.7, "word": "아자차카타파하"},
-            {"start": 3.3, "end": 4.1, "word": "차카타파하가나다"},
-            {"start": 4.2, "end": 5.8, "word": "타파하가나다라마"},
-        ],
-    }, Analysis())
+    result = _split_whisper_segment(
+        {
+            "start": 1.0,
+            "end": 6.0,
+            "text": "가나다라마바사 아자차카타파하 차카타파하가나다 타파하가나다라마",
+            "words": [
+                {"start": 1.1, "end": 1.8, "word": "가나다라마바사"},
+                {"start": 1.9, "end": 2.7, "word": "아자차카타파하"},
+                {"start": 3.3, "end": 4.1, "word": "차카타파하가나다"},
+                {"start": 4.2, "end": 5.8, "word": "타파하가나다라마"},
+            ],
+        },
+        Analysis(),
+    )
 
     assert WHISPER_LONG_SEGMENT_CHARACTERS == 25
     assert WHISPER_PRIORITY_GAP_SECONDS == 0.5
@@ -140,11 +185,20 @@ def test_timestamp_comment_score_is_applied_to_every_matching_section_by_maximum
     _apply_timestamp_comment_scores(
         sections,
         comments,
-        [{"index": 0, "score": 0.7}, {"index": 1, "score": 0.85}, {"index": 2, "score": 0.5}],
+        [
+            {"index": 0, "score": 0.7},
+            {"index": 1, "score": 0.85},
+            {"index": 2, "score": 0.5},
+        ],
     )
 
     assert _comment_timestamp_seconds(comments[0]["text"]) == [10.0, 90.0]
-    assert [section.get("comment_score") for section in sections] == [0.7, 0.85, 0.5, None]
+    assert [section.get("comment_score") for section in sections] == [
+        0.7,
+        0.85,
+        0.5,
+        None,
+    ]
 
 
 def test_heatmap_score_uses_interpolated_maximum_inside_section():
@@ -189,7 +243,10 @@ def test_sparse_chat_scores_collective_burst_higher_than_quiet_section():
 
 def test_chat_score_is_unsupported_when_fewer_than_ten_events():
     points = _chat_score_points(
-        [{"elapsed_seconds": float(index), "author_id": f"user-{index}"} for index in range(9)],
+        [
+            {"elapsed_seconds": float(index), "author_id": f"user-{index}"}
+            for index in range(9)
+        ],
         60,
     )
     assert points == []
@@ -212,7 +269,9 @@ def test_chat_analysis_timestamp_compensates_reaction_delay_without_negative_tim
 
 
 def test_volume_score_detects_sustained_relative_rise():
-    samples = [(float(index), -30.0 if 40 <= index < 45 else -50.0) for index in range(90)]
+    samples = [
+        (float(index), -30.0 if 40 <= index < 45 else -50.0) for index in range(90)
+    ]
     points = _volume_score_points(samples)
     quiet = max(score for timestamp, score in points if 10 <= timestamp <= 20)
     loud = max(score for timestamp, score in points if 40 <= timestamp <= 45)
@@ -221,7 +280,9 @@ def test_volume_score_detects_sustained_relative_rise():
 
 
 def test_volume_score_uses_first_thirty_seconds_only_as_warmup():
-    samples = [(float(index), -20.0 if 5 <= index < 10 else -50.0) for index in range(60)]
+    samples = [
+        (float(index), -20.0 if 5 <= index < 10 else -50.0) for index in range(60)
+    ]
     points = _volume_score_points(samples)
 
     assert all(score == 0.0 for timestamp, score in points if timestamp < 30.0)
@@ -237,11 +298,13 @@ def test_final_score_is_weighted_and_renormalizes_missing_features():
         > SECTION_SCORE_WEIGHTS["volume_score"]
     )
     assert sum(SECTION_SCORE_WEIGHTS.values()) == pytest.approx(1.0)
-    sections = [{
-        "chapter_llm_score": 0.8,
-        "llm_score": 0.6,
-        "heatmap_score": 1.0,
-    }]
+    sections = [
+        {
+            "chapter_llm_score": 0.8,
+            "llm_score": 0.6,
+            "heatmap_score": 1.0,
+        }
+    ]
 
     _apply_final_scores(sections)
 
@@ -259,8 +322,20 @@ def test_final_score_is_weighted_and_renormalizes_missing_features():
 
 def test_summary_selection_uses_final_score_instead_of_section_llm_score():
     sections = [
-        {"segment_id": "llm-high", "start": 0.0, "end": 60.0, "llm_score": 1.0, "final_score": 0.2},
-        {"segment_id": "total-high", "start": 60.0, "end": 120.0, "llm_score": 0.1, "final_score": 0.9},
+        {
+            "segment_id": "llm-high",
+            "start": 0.0,
+            "end": 60.0,
+            "llm_score": 1.0,
+            "final_score": 0.2,
+        },
+        {
+            "segment_id": "total-high",
+            "start": 60.0,
+            "end": 120.0,
+            "llm_score": 0.1,
+            "final_score": 0.9,
+        },
     ]
 
     selected = _select_clips(sections, 60)
@@ -278,7 +353,15 @@ def test_coherent_selection_preserves_anchor_and_expands_only_required_links():
             return ["s0", "s2"] if anchor_id == "s1" else []
 
     sections = [
-        {"segment_id": f"s{index}", "chapter_id": "c0", "chapter_summary": "요약", "start": index * 20.0, "end": (index + 1) * 20.0, "text": str(index), "final_score": score}
+        {
+            "segment_id": f"s{index}",
+            "chapter_id": "c0",
+            "chapter_summary": "요약",
+            "start": index * 20.0,
+            "end": (index + 1) * 20.0,
+            "text": str(index),
+            "final_score": score,
+        }
         for index, score in enumerate([0.2, 1.0, 0.3, 0.8])
     ]
     analysis = Analysis()
@@ -300,9 +383,30 @@ def test_coherent_selection_calls_each_chapter_only_once_and_moves_to_next_ranke
             return []
 
     sections = [
-        {"segment_id": "a-high", "chapter_id": "a", "start": 0.0, "end": 20.0, "text": "", "final_score": 1.0},
-        {"segment_id": "a-next", "chapter_id": "a", "start": 20.0, "end": 40.0, "text": "", "final_score": 0.9},
-        {"segment_id": "b-high", "chapter_id": "b", "start": 40.0, "end": 60.0, "text": "", "final_score": 0.8},
+        {
+            "segment_id": "a-high",
+            "chapter_id": "a",
+            "start": 0.0,
+            "end": 20.0,
+            "text": "",
+            "final_score": 1.0,
+        },
+        {
+            "segment_id": "a-next",
+            "chapter_id": "a",
+            "start": 20.0,
+            "end": 40.0,
+            "text": "",
+            "final_score": 0.9,
+        },
+        {
+            "segment_id": "b-high",
+            "chapter_id": "b",
+            "start": 40.0,
+            "end": 60.0,
+            "text": "",
+            "final_score": 0.8,
+        },
     ]
     analysis = Analysis()
 
@@ -312,7 +416,9 @@ def test_coherent_selection_calls_each_chapter_only_once_and_moves_to_next_ranke
     assert analysis.calls == ["a-high", "b-high"]
 
 
-def test_atomic_json_write_retries_transient_windows_access_denial(tmp_path, monkeypatch):
+def test_atomic_json_write_retries_transient_windows_access_denial(
+    tmp_path, monkeypatch
+):
     destination = tmp_path / "checkpoint.json"
     real_replace = live_edit_pipeline.os.replace
     attempts = 0
@@ -344,8 +450,15 @@ def test_hardware_encoder_detection_uses_supported_gpu_encoder(monkeypatch):
         stdout = " V....D h264_qsv Intel QSV H.264 encoder\n V....D h264_amf AMD AMF H.264 encoder\n V....D h264_nvenc NVIDIA NVENC H.264 encoder\n"
         stderr = ""
 
-    monkeypatch.setattr(live_edit_pipeline.subprocess, "run", lambda *_args, **_kwargs: Completed())
-    assert live_edit_pipeline._render_encoder_candidates() == ("h264_nvenc", "h264_amf", "h264_qsv", None)
+    monkeypatch.setattr(
+        live_edit_pipeline.subprocess, "run", lambda *_args, **_kwargs: Completed()
+    )
+    assert live_edit_pipeline._render_encoder_candidates() == (
+        "h264_nvenc",
+        "h264_amf",
+        "h264_qsv",
+        None,
+    )
     assert _video_encoding_args("h264_nvenc")[:2] == ["-c:v", "h264_nvenc"]
     assert _hardware_decoding_args("h264_nvenc") == ["-hwaccel", "auto"]
     assert _hardware_decoding_args(None) == []
@@ -362,15 +475,25 @@ def test_hardware_encoder_priority_prefers_amd_over_intel(monkeypatch):
         stdout = " V....D h264_qsv Intel QSV H.264 encoder\n V....D h264_amf AMD AMF H.264 encoder\n"
         stderr = ""
 
-    monkeypatch.setattr(live_edit_pipeline.subprocess, "run", lambda *_args, **_kwargs: Completed())
-    assert live_edit_pipeline._render_encoder_candidates() == ("h264_amf", "h264_qsv", None)
+    monkeypatch.setattr(
+        live_edit_pipeline.subprocess, "run", lambda *_args, **_kwargs: Completed()
+    )
+    assert live_edit_pipeline._render_encoder_candidates() == (
+        "h264_amf",
+        "h264_qsv",
+        None,
+    )
     live_edit_pipeline._render_encoder_candidates.cache_clear()
 
 
 def test_auto_rendering_tries_remaining_gpus_before_cpu(monkeypatch, tmp_path):
     attempts = []
     statuses = []
-    monkeypatch.setattr(live_edit_pipeline, "_render_encoder_candidates", lambda: ("h264_nvenc", "h264_amf", None))
+    monkeypatch.setattr(
+        live_edit_pipeline,
+        "_render_encoder_candidates",
+        lambda: ("h264_nvenc", "h264_amf", None),
+    )
 
     def render(*args):
         attempts.append(args[-1])
@@ -379,7 +502,12 @@ def test_auto_rendering_tries_remaining_gpus_before_cpu(monkeypatch, tmp_path):
         args[2].write_bytes(b"rendered")
 
     monkeypatch.setattr(live_edit_pipeline, "_render_final", render)
-    backend = live_edit_pipeline.render_final(tmp_path / "source.mp4", [], tmp_path / "output.mp4", status_callback=statuses.append)
+    backend = live_edit_pipeline.render_final(
+        tmp_path / "source.mp4",
+        [],
+        tmp_path / "output.mp4",
+        status_callback=statuses.append,
+    )
 
     assert attempts == ["h264_nvenc", "h264_amf"]
     assert backend == "AMD GPU (AMF)"
@@ -389,7 +517,11 @@ def test_auto_rendering_tries_remaining_gpus_before_cpu(monkeypatch, tmp_path):
 
 def test_auto_rendering_falls_back_to_cpu_after_all_gpus_fail(monkeypatch, tmp_path):
     attempts = []
-    monkeypatch.setattr(live_edit_pipeline, "_render_encoder_candidates", lambda: ("h264_nvenc", "h264_amf", None))
+    monkeypatch.setattr(
+        live_edit_pipeline,
+        "_render_encoder_candidates",
+        lambda: ("h264_nvenc", "h264_amf", None),
+    )
 
     def render(*args):
         attempts.append(args[-1])
@@ -398,7 +530,9 @@ def test_auto_rendering_falls_back_to_cpu_after_all_gpus_fail(monkeypatch, tmp_p
         args[2].write_bytes(b"rendered")
 
     monkeypatch.setattr(live_edit_pipeline, "_render_final", render)
-    backend = live_edit_pipeline.render_final(tmp_path / "source.mp4", [], tmp_path / "output.mp4")
+    backend = live_edit_pipeline.render_final(
+        tmp_path / "source.mp4", [], tmp_path / "output.mp4"
+    )
 
     assert attempts == ["h264_nvenc", "h264_amf", None]
     assert backend == "CPU (libx264)"
@@ -413,9 +547,13 @@ def test_prepared_transcript_uses_the_requested_language(tmp_path, monkeypatch):
     (metadata_dir / "dQw4w9WgXcQ.ko.captions-transcript.json").write_text(
         json.dumps({"segments": [{"text": "한국어"}]}), encoding="utf-8"
     )
-    monkeypatch.setattr("app.services.live_youtube_service.get_media_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        "app.services.live_youtube_service.get_media_root", lambda: tmp_path
+    )
 
-    assert load_prepared_transcript("dQw4w9WgXcQ", "captions", "ko") == [{"text": "한국어"}]
+    assert load_prepared_transcript("dQw4w9WgXcQ", "captions", "ko") == [
+        {"text": "한국어"}
+    ]
     with pytest.raises(LiveYouTubeError, match="en subtitles"):
         load_prepared_transcript("dQw4w9WgXcQ", "subtitles", "en")
 
@@ -428,7 +566,9 @@ def test_selection_render_preserves_render_intermediates(tmp_path, monkeypatch):
     source.write_bytes(b"source")
     plan = {
         "source_video_path": str(source),
-        "candidates": [{"segment_id": "segment-a", "start": 10.0, "end": 20.0, "text": "후보"}],
+        "candidates": [
+            {"segment_id": "segment-a", "start": 10.0, "end": 20.0, "text": "후보"}
+        ],
         "recommended_segment_ids": ["segment-a"],
         "selected_segment_ids": ["segment-a"],
         "clips": [{"start": 9.6, "end": 20.6}],
@@ -440,7 +580,9 @@ def test_selection_render_preserves_render_intermediates(tmp_path, monkeypatch):
         output.write_bytes(b"rendered")
 
     monkeypatch.setattr("app.services.live_edit_pipeline.render_final", fake_render)
-    result = LiveEditPipeline(tmp_path).rerender_from_selection(job_id, ["segment-a"], plan=plan)
+    result = LiveEditPipeline(tmp_path).rerender_from_selection(
+        job_id, ["segment-a"], plan=plan
+    )
 
     assert (output_dir / result["rendered_filename"]).read_bytes() == b"rendered"
     assert list(output_dir.glob(f"{job_id}.render-input.*.srt"))
@@ -450,7 +592,8 @@ def test_selection_render_preserves_render_intermediates(tmp_path, monkeypatch):
 def test_selection_rejects_unknown_segment(tmp_path):
     try:
         LiveEditPipeline(tmp_path).rerender_from_selection(
-            "bad-selection", ["missing"],
+            "bad-selection",
+            ["missing"],
             plan={"candidates": [{"segment_id": "chapter-00", "start": 0, "end": 10}]},
         )
     except LiveEditPipelineError as exc:
@@ -460,15 +603,46 @@ def test_selection_rejects_unknown_segment(tmp_path):
 
 
 def test_review_exposes_chapter_section_hierarchy(tmp_path):
-    review = LiveEditPipeline(tmp_path).get_segment_review("review-job", {
-        "target_seconds": 60,
-        "selected_segment_ids": ["chapter-00-section-00"],
-        "recommended_segment_ids": ["chapter-00-section-00"],
-        "candidates": [{"segment_id": "chapter-00-section-00", "chapter_id": "chapter-00", "section_id": "chapter-00-section-00", "start": 0, "end": 4, "text": "섹션", "llm_score": 0.9}],
-        "chapters": [{"chapter_id": "chapter-00", "summary": "주제 요약", "llm_score": 0.812, "start": 0, "end": 4, "sections": [{"section_id": "chapter-00-section-00", "start": 0, "end": 4, "segment_ids": ["chapter-00-section-00"]}]}],
-    })
+    review = LiveEditPipeline(tmp_path).get_segment_review(
+        "review-job",
+        {
+            "target_seconds": 60,
+            "selected_segment_ids": ["chapter-00-section-00"],
+            "recommended_segment_ids": ["chapter-00-section-00"],
+            "candidates": [
+                {
+                    "segment_id": "chapter-00-section-00",
+                    "chapter_id": "chapter-00",
+                    "section_id": "chapter-00-section-00",
+                    "start": 0,
+                    "end": 4,
+                    "text": "섹션",
+                    "llm_score": 0.9,
+                }
+            ],
+            "chapters": [
+                {
+                    "chapter_id": "chapter-00",
+                    "summary": "주제 요약",
+                    "llm_score": 0.812,
+                    "start": 0,
+                    "end": 4,
+                    "sections": [
+                        {
+                            "section_id": "chapter-00-section-00",
+                            "start": 0,
+                            "end": 4,
+                            "segment_ids": ["chapter-00-section-00"],
+                        }
+                    ],
+                }
+            ],
+        },
+    )
 
-    assert review["chapters"][0]["sections"][0]["segment_ids"] == ["chapter-00-section-00"]
+    assert review["chapters"][0]["sections"][0]["segment_ids"] == [
+        "chapter-00-section-00"
+    ]
     assert "segments" not in review
     assert review["chapters"][0]["llm_score"] == 0.812
     assert review["chapters"][0]["sections"][0]["llm_score"] == 0.9
