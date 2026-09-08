@@ -18,9 +18,12 @@ GENRE_GUIDES = {
     "game": "게임: 높은 점수는 전략의 전제→실행→결과, 패치·시스템 변화, 전문 용어, 중요한 판단·전환점·반전이다. 낮은 점수는 광고·반복·침묵·근거 없는 과장이다. 사실과 플레이 감상·추측을 구분한다.",
 }
 CHAPTER_SYSTEM = '''역할: 낮은 오류 허용도의 영상 편집용 스크립트 구조화기.
-목표: 입력 JSONL 전체를 시간순으로 완전 분할한 챕터 JSON만 반환한다.
+목표: 입력 JSONL 전체를 시간순으로 완전 분할하되, 챕터는 뒤의 세부 섹션보다 명확히 큰 상위 주제 단위로 만든다.
 입력 형식: 각 줄은 {"id": 정수, "text": 문자열}이며 id는 시간순이다.
-판단 기준: 실제 주제 전환, 논점 변화, 사건 흐름, 결론을 기준으로만 나눈다. 균등 분할, 단순 시간 기준 분할, 임의 챕터 수는 금지한다.
+큰 단위 원칙: 하나의 중심 질문·사건·논점·목표를 다루는 동안에는 설명, 질문과 답변, 주장과 근거, 사례, 반론, 결과와 결론이 이어져도 같은 챕터로 유지한다. 같은 대상을 더 자세히 설명하거나 말투·화자·소주제가 바뀌는 것만으로 챕터를 나누지 않는다.
+분할 허용: 이후 내용의 중심 질문·사건·논점·목표가 이전 내용과 분명히 달라져, 앞 챕터의 맥락 없이도 별개의 큰 주제로 설명될 때만 경계를 만든다.
+분할 금지: 질문과 답변 사이, 주장과 필수 근거 사이, 원인과 직접 결과 사이, 도입과 그 설명 사이를 자르지 않는다. 균등 분할, 단순 시간·길이 기준, 문장 수 맞추기, 잦은 소제목 생성, 임의 챕터 수를 금지한다. 애매하면 나누지 않고 큰 챕터로 유지한다.
+자기 점검: 인접한 두 챕터를 같은 한 문장 제목으로 자연스럽게 요약할 수 있다면 합친다. 한 챕터가 단일 답변·사례·짧은 설명에 불과하면 상위 주제가 같은 인접 챕터에 합친다.
 사실성 금지: 입력 text 밖의 사실·시간·원인·결론·id를 만들지 않는다.
 범위·검증 규칙: 제공된 JSONL id만 사용한다. 첫 항목 start_id는 첫 입력 id, 다음 항목 start_id는 바로 앞 end_id+1, 마지막 end_id는 마지막 입력 id다. 빈틈·겹침·중복·누락·역순은 금지한다.
 summary: 이 챕터에서 실제로 말한 내용을 160자 이내로 요약한다. 판단할 수 없으면 빈 문자열을 쓴다.
@@ -28,15 +31,66 @@ score: 이 챕터가 최종 편집에서 갖는 중요도를 0~1000 정수로 �
 출력 규칙: JSON 외 텍스트, Markdown, 코드펜스, 설명, 주석을 절대 쓰지 말고 아래 JSON 객체만 반환한다.
 출력 형식: {"chapters":[{"start_id":number,"end_id":number,"summary":string,"score":number}]}'''
 SECTION_SYSTEM = '''역할: 영상 편집용 챕터 내부 최소 의미 단위 분할기.
-목표: 한 주장·근거·사건·설명이 끝나는 최소 연속 범위로 입력 전체를 분할한다.
+목표: 챕터 안의 입력 전체를 각각 독립적으로 선택·제외할 수 있는 가능한 한 작은 의미 단위로 완전 분할한다.
 입력 형식: 각 줄은 {"id": 정수, "text": 문자열} JSONL이다.
-판단·금지: 문장마다 기계적으로 쪼개기, 서로 다른 논점을 한 범위로 과도하게 합치기, 입력 밖 사실·시간·id 추가를 금지한다.
+작은 단위 원칙: 질문, 직접 답변, 주장, 개별 근거, 사례, 반론, 원인, 결과, 결론처럼 편집 판단이 달라질 수 있는 내용은 각각 별도 섹션으로 분리한다. 하나의 기능만 수행하는 최소 연속 범위를 선호한다.
+경계 판단: 다음 입력부터 담화 기능이나 독립적으로 평가할 의미가 바뀌면 경계를 만든다. 한 섹션 안의 일부를 제거해도 나머지 의미가 성립한다면 제거 가능한 부분을 별도 섹션으로 나눈다.
+과분할 금지: 문장이 문법적으로 끝나지 않았거나 대명사·접속어·수식어만 남는 경계, 하나의 짧은 주장이나 답변을 문장마다 기계적으로 자르는 경계는 만들지 않는다. 최소 단위는 단독으로 읽었을 때 역할을 판별할 수 있어야 한다.
+과소분할 금지: 질문과 답변, 주장과 근거, 원인과 결과, 서로 다른 사례를 하나의 큰 섹션으로 합치지 않는다. 여러 기능이 들어 있으면 각 기능의 끝에서 나눈다.
+자기 점검: 각 섹션에 질문·답변·주장·근거·사례·원인·결과·결론 중 주된 역할 하나를 붙일 수 있는지 확인한다. 두 역할 이상이면 가능한 의미 경계에서 더 나눈다.
+입력 밖 사실·시간·id 추가를 금지한다.
 범위·검증 규칙: 제공된 id만 사용한다. 첫 항목 start_id는 첫 입력 id, 다음 항목 start_id는 바로 앞 end_id+1, 마지막 end_id는 마지막 입력 id다. 빈틈·겹침·중복·누락·역순은 금지한다.
 출력 규칙: JSON 외 텍스트, Markdown, 코드펜스, 설명, 주석을 절대 쓰지 말고 아래 JSON 객체만 반환한다.
 출력 형식: {"sections":[{"start_id":number,"end_id":number}]}'''
 CHAPTER_RESPONSE_SCHEMA={"type":"object","additionalProperties":False,"required":["chapters"],"properties":{"chapters":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["start_id","end_id","summary","score"],"properties":{"start_id":{"type":"integer"},"end_id":{"type":"integer"},"summary":{"type":"string"},"score":{"type":"integer","minimum":0,"maximum":1000}}}}}}
 SECTION_RESPONSE_SCHEMA={"type":"object","additionalProperties":False,"required":["sections"],"properties":{"sections":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["start_id","end_id"],"properties":{"start_id":{"type":"integer"},"end_id":{"type":"integer"}}}}}}
 SCORE_RESPONSE_SCHEMA={"type":"object","additionalProperties":False,"required":["items"],"properties":{"items":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["id","score"],"properties":{"id":{"type":"string"},"score":{"type":"integer","minimum":0,"maximum":1000}}}}}}
+COMMENT_SCORE_RESPONSE_SCHEMA={"type":"object","additionalProperties":False,"required":["items"],"properties":{"items":{"type":"array","items":{"type":"object","additionalProperties":False,"required":["index","score"],"properties":{"index":{"type":"integer","minimum":0},"score":{"type":"integer","minimum":0,"maximum":1000}}}}}}
+ANCHOR_LINK_RESPONSE_SCHEMA={"type":"object","additionalProperties":False,"required":["before_ids","after_ids"],"properties":{"before_ids":{"type":"array","maxItems":2,"items":{"type":"string"}},"after_ids":{"type":"array","maxItems":2,"items":{"type":"string"}}}}
+ANCHOR_LINK_SYSTEM = '''역할: 영상 요약 편집의 최소 필수 관계 판정기.
+최우선 목표: anchor는 이미 반드시 포함되는 핵심 하이라이트다. anchor를 대체하거나 제외할 대상을 고르지 말고, 시청자가 앞뒤 원본을 보지 않아도 anchor의 맥락과 결말을 자연스럽게 이해할 수 있는 최소 편집 묶음을 만든다.
+판정 절차:
+1. 먼저 anchor가 질문·답변·원인·결과·주장·근거·결론·사례 중 어떤 역할인지 판단한다.
+2. anchor가 질문이면 직접 답변까지, 답변이면 질문 또는 답변의 대상을 특정하는 바로 앞 맥락까지 연결한다.
+3. anchor가 원인이면 직접 결과까지, 결과이면 직접 원인까지 연결한다.
+4. anchor가 주장이나 결론이면 납득에 필요한 최소 근거·전제까지, 사례이면 무엇을 설명하는 사례인지 알 수 있는 주장까지 연결한다.
+5. anchor가 앞 문장의 지시어·생략된 주어·접속 표현을 이어받거나 뒤 섹션에서 의미가 마무리되면 해당 섹션을 연결한다.
+완결성 기준: 시간순으로 이어 보았을 때 도입만 있고 결론이 없거나, 질문만 있고 답이 없거나, 결과만 있고 원인이 없어서는 안 된다. 일반적으로 anchor 외 1~3개가 자연스러운 결과이며, anchor 하나만으로 발화의 시작·맥락·핵심·마무리가 모두 독립적으로 성립할 때만 빈 배열을 반환한다.
+필수성 검사: 후보를 빼면 대상이 불명확해지거나 논리적 비약·갑작스러운 시작·미완성된 결말이 생기는 경우에는 반드시 포함한다.
+선택 금지: 같은 주제라는 이유, 흥미로운 보충, 유사 사례, 배경 상식, 간접 원인·결과, 반복, 핵심 이해에 필요하지 않은 일반적 도입·마무리, 있으면 좋은 설명은 모두 제외한다.
+확산 금지: 선택한 섹션에 다시 필요한 원인·결과를 연쇄적으로 찾지 않는다. 오직 anchor와 직접 연결된 1단계 관계만 판정한다.
+수량 제한: anchor 외 총 4개 이하, 시간상 anchor 이전은 최대 2개, 이후는 최대 2개다. 완결성을 만드는 범위에서 가장 적은 수를 선택한다.
+ID 제한: 제공된 같은 챕터의 ID만 정확히 복사한다. anchor ID, 중복 ID, 입력에 없는 ID는 반환하지 않는다.
+출력 계약: anchor 이전의 필수 ID는 before_ids에 시간순으로 최대 2개, 이후의 필수 ID는 after_ids에 시간순으로 최대 2개를 넣는다. 해당 방향에 필수 ID가 없으면 빈 배열을 쓴다.
+출력 규칙: JSON 외 텍스트·설명·Markdown을 금지한다. {"before_ids":[string],"after_ids":[string]}만 반환한다.'''
+TIMESTAMP_COMMENT_SCORE_SYSTEM = '''역할: 영상 타임스탬프 댓글의 편집 가치 판정기.
+목표: 댓글 작성자가 특정 시각을 표시한 목적과 반응 강도를 댓글 원문만으로 판정하여, 해당 시각이 편집 하이라이트 후보로 갖는 가치를 0~1000 정수로 평가한다.
+
+핵심 원칙:
+1. 점수는 댓글의 문장 품질이나 길이가 아니라 타임스탬프가 가리키는 장면에 대한 시청자의 의도를 평가한다.
+2. 입력에 없는 영상 내용, 감정, 사건, 인물 또는 맥락을 추측하지 않는다.
+3. 타임스탬프가 여러 개 있어도 댓글 하나에는 하나의 점수를 부여한다. 클라이언트가 그 점수를 댓글에 포함된 모든 시각에 적용한다.
+4. 좋아요 수, 작성자, 게시 시각 등 제공되지 않은 신호를 가정하지 않는다.
+5. 모든 입력을 서로 비교하여 같은 종류의 반응에도 표현의 명확성·강도에 따라 일의 자리까지 구분한다. 습관적으로 둥근 점수만 반복하지 않는다.
+
+목적별 점수 기준:
+- 0~80: 챕터 목차, 구간 제목 목록, 진행 순서 정리, 단순 탐색 안내처럼 장면의 흥미와 무관한 표식. 명백한 챕터 표기는 0점에 가깝게 평가한다.
+- 81~300: 오류 정정, 출처·링크 메모, 질문 위치 안내, 기술적 기록처럼 유용하지만 하이라이트 선호를 나타내지 않는 표식.
+- 301~550: 타임스탬프만 있거나 의도가 불분명한 짧은 북마크, 별다른 평가가 없는 중립적 언급. 내용이 없다는 이유만으로 0점을 주지 않는다.
+- 551~750: 재미, 공감, 유익함, 다시 보고 싶은 지점을 비교적 분명하게 표현한 반응.
+- 751~900: 강한 웃음·놀라움·감탄·몰입, 핵심이라고 지목함, 반복 재생이나 적극 추천처럼 높은 관심을 명확히 나타낸 반응.
+- 901~1000: 댓글만으로도 해당 순간이 매우 강한 화제성·감정 반응·결정적 하이라이트임이 예외적으로 명백한 경우. 과도하게 남발하지 않는다.
+
+판정 순서:
+1. 타임스탬프 주변 문구가 목차나 구간 제목인지 먼저 판정한다.
+2. 그렇지 않으면 기록·질문·정정·중립 북마크인지 판정한다.
+3. 감정이나 선호가 있으면 강도와 구체성을 판정한다.
+4. 모호하면 중립 범위로 보수적으로 평가한다.
+5. 입력 index를 그대로 유지하고 모든 항목을 정확히 한 번 반환한다.
+
+입력 형식: {"comments":[{"index":정수,"text":"댓글 원문"}]}
+출력 규칙: JSON 외 텍스트, Markdown, 코드펜스, 설명, 목적 분류, 이유를 반환하지 않는다.
+출력 형식: {"items":[{"index":정수,"score":0~1000 정수}]}'''
 WHISPER_SETTINGS_SYSTEM = '''역할: 영상 메타데이터에서 Whisper STT용 고유명사 핫워드만 보수적으로 추출하는 개체명 판별기.
 
 고유명사 판정:
@@ -127,7 +181,10 @@ class LLMAnalysisService:
         for attempt in range(20):
             if cancel_callback: cancel_callback()
             self._wait_for_request_slot(cancel_callback)
-            rule="" if attempt==0 else "\n직전 응답은 JSON 문법 또는 배열 길이·ID 범위 계약을 지키지 못했습니다. 설명하지 말고 완결된 JSON 객체 하나만 반환하세요. 입력 순서와 길이, 문자열·쉼표·대괄호·중괄호를 확인하세요."
+            rule = "" if attempt == 0 else (
+                "\n직전 응답 거부 사유: " + str(last_error)
+                + " 설명하지 말고 이 사유를 고쳐 완결된 JSON 객체 하나만 반환하세요."
+            )
             try:
                 raw=json.loads(self.gateway.request_json(system+rule,prompt,response_schema=response_schema))
                 value = validator(raw) if validator else raw
@@ -141,7 +198,8 @@ class LLMAnalysisService:
                 return value
             except LLMGatewayError as exc: raise LLMAnalysisError(f"구조화 JSON 요청에 실패했습니다: {exc}") from exc
             except (json.JSONDecodeError,LLMAnalysisError) as exc: last_error=exc
-        raise LLMAnalysisError("LLM이 스무 번 연속 JSON 문법 또는 응답 계약을 지키지 않았습니다.") from last_error
+        detail = f": {last_error}" if last_error is not None else ""
+        raise LLMAnalysisError(f"LLM이 스무 번 연속 JSON 문법 또는 응답 계약을 지키지 않았습니다{detail}") from last_error
     @staticmethod
     def _validated_whisper_settings(raw: Any, *, metadata_text: str = "") -> dict[str, Any]:
         if not isinstance(raw, dict) or set(raw) != {"hotwords"}:
@@ -280,7 +338,7 @@ class LLMAnalysisService:
             expected=[item["id"] for item in payload]
             if len(scores)!=len(expected) or set(scores)!=set(expected): raise LLMAnalysisError("섹션 중요도 ID가 입력과 일치하지 않습니다.")
             if any(type(scores[item_id]) is not int or not 0<=scores[item_id]<=1000 for item_id in expected): raise LLMAnalysisError("섹션 중요도 점수 형식이 올바르지 않습니다.")
-            return [{**section,"llm_score":float(scores[item["id"]])} for section,item in zip(chapter_sections,payload)]
+            return [{**section,"llm_score":round(float(scores[item["id"]])/1000,3)} for section,item in zip(chapter_sections,payload)]
         result=[]
         with ThreadPoolExecutor(max_workers=min(getattr(self, "_max_parallel_requests", 100),len(groups))) as executor:
             futures=[executor.submit(score, group) for group in groups.values()]
@@ -289,3 +347,67 @@ class LLMAnalysisService:
                 result.extend(future.result())
                 if progress_callback: progress_callback(completed,len(futures),"챕터별 섹션 중요도 평가")
         return sorted(result,key=lambda item:(str(item.get("chapter_id","")),float(item.get("start",0))))
+
+    def score_timestamp_comments(
+        self,
+        comments: list[dict[str, Any]],
+        *,
+        cancel_callback: Callable[[], None] | None = None,
+    ) -> list[dict[str, int | float]]:
+        rows = [
+            {"index": index, "text": str(comment.get("text") or "").strip()}
+            for index, comment in enumerate(comments)
+        ]
+        if not rows:
+            return []
+
+        def validate(raw: Any) -> list[dict[str, int | float]]:
+            if not isinstance(raw, dict) or set(raw) != {"items"}:
+                raise LLMAnalysisError("타임스탬프 댓글 점수 응답 객체 형식이 올바르지 않습니다.")
+            items = raw.get("items")
+            if not isinstance(items, list) or len(items) != len(rows):
+                raise LLMAnalysisError("타임스탬프 댓글 점수 응답이 입력과 일치하지 않습니다.")
+            if any(not isinstance(item, dict) or set(item) != {"index", "score"} for item in items):
+                raise LLMAnalysisError("타임스탬프 댓글 점수 항목 필드가 응답 계약과 다릅니다.")
+            scores = {item.get("index"): item.get("score") for item in items}
+            expected = list(range(len(rows)))
+            if len(scores) != len(expected) or set(scores) != set(expected):
+                raise LLMAnalysisError("타임스탬프 댓글 인덱스가 입력과 일치하지 않습니다.")
+            if any(type(scores[index]) is not int or not 0 <= scores[index] <= 1000 for index in expected):
+                raise LLMAnalysisError("타임스탬프 댓글 점수 형식이 올바르지 않습니다.")
+            return [
+                {"index": index, "score": round(float(scores[index]) / 1000, 3)}
+                for index in expected
+            ]
+
+        return self._request_json(
+            TIMESTAMP_COMMENT_SCORE_SYSTEM,
+            json.dumps({"comments": rows}, ensure_ascii=False, separators=(",", ":")),
+            response_schema=COMMENT_SCORE_RESPONSE_SCHEMA,
+            validator=validate,
+            cancel_callback=cancel_callback,
+        )
+
+    def required_anchor_links(self, anchor_id: str, chapter_summary: str, sections: list[dict[str, Any]], *, cancel_callback: Callable[[], None] | None = None) -> list[str]:
+        ids = [str(item["id"]) for item in sections]
+        if anchor_id not in ids:
+            raise LLMAnalysisError("관계 확장 앵커가 챕터에 없습니다.")
+        anchor_index = ids.index(anchor_id)
+        def validate(raw: Any) -> list[str]:
+            if not isinstance(raw, dict) or set(raw) != {"before_ids", "after_ids"}:
+                raise LLMAnalysisError("필수 관계 응답 형식이 올바르지 않습니다.")
+            before_values, after_values = raw.get("before_ids"), raw.get("after_ids")
+            if not isinstance(before_values, list) or not isinstance(after_values, list):
+                raise LLMAnalysisError("필수 관계의 이전·이후 ID는 배열이어야 합니다.")
+            values = [*before_values, *after_values]
+            if len(before_values) > 2 or len(after_values) > 2 or any(not isinstance(value, str) for value in values) or len(values) != len(set(values)):
+                raise LLMAnalysisError("필수 관계 ID 개수 또는 형식이 올바르지 않습니다.")
+            if anchor_id in values or any(value not in ids for value in values):
+                raise LLMAnalysisError("필수 관계 ID가 입력과 일치하지 않습니다.")
+            if any(ids.index(value) >= anchor_index for value in before_values):
+                raise LLMAnalysisError("before_ids에는 anchor 이전 ID만 사용할 수 있습니다.")
+            if any(ids.index(value) <= anchor_index for value in after_values):
+                raise LLMAnalysisError("after_ids에는 anchor 이후 ID만 사용할 수 있습니다.")
+            return values
+        payload = {"chapter_summary": chapter_summary, "anchor_id": anchor_id, "sections": sections}
+        return self._request_json(ANCHOR_LINK_SYSTEM, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), response_schema=ANCHOR_LINK_RESPONSE_SCHEMA, validator=validate, cancel_callback=cancel_callback)

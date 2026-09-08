@@ -1,9 +1,11 @@
 import json
+import threading
+import time
 
 import pytest
 
 from app.services import live_edit_pipeline
-from app.services.live_edit_pipeline import LiveEditPipeline, LiveEditPipelineError, SUBTITLE_FONT_SIZE, SUBTITLE_LINE_WIDTH, SUBTITLE_MARGIN_BOTTOM, SUBTITLE_MIN_DURATION_SECONDS, WHISPER_LONG_SEGMENT_CHARACTERS, WHISPER_PRIORITY_GAP_SECONDS, _hardware_decoding_args, _split_whisper_segment, _time_seconds, _video_encoding_args, _whisper_transcript_path, _write_json_atomic, fixed_whisper_initial_prompt, write_selected_subtitles
+from app.services.live_edit_pipeline import CHAT_REACTION_OFFSET_SECONDS, SECTION_SCORE_WEIGHTS, LiveEditPipeline, LiveEditPipelineError, SUBTITLE_FONT_SIZE, SUBTITLE_LINE_WIDTH, SUBTITLE_MARGIN_BOTTOM, SUBTITLE_MIN_DURATION_SECONDS, WHISPER_LONG_SEGMENT_CHARACTERS, WHISPER_PRIORITY_GAP_SECONDS, _adjust_chat_timestamp, _apply_final_scores, _apply_heatmap_scores, _apply_point_scores, _apply_timestamp_comment_scores, _chat_score_points, _comment_timestamp_seconds, _hardware_decoding_args, _heatmap_section_score, _select_clips, _select_coherent_clips, _split_whisper_segment, _split_whisper_segments_parallel, _time_seconds, _video_encoding_args, _volume_score_points, _whisper_transcript_path, _write_json_atomic, fixed_whisper_initial_prompt, write_selected_subtitles
 from app.services.live_youtube_service import LiveYouTubeError, load_prepared_transcript
 
 
@@ -94,6 +96,220 @@ def test_long_whisper_segment_prioritizes_silent_gap_without_midpoint():
     assert WHISPER_PRIORITY_GAP_SECONDS == 0.5
     assert result[0]["end"] == 2.7
     assert result[1]["start"] == 3.3
+
+
+def test_whisper_sentence_splits_run_in_parallel_and_preserve_order(monkeypatch):
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+
+    def fake_split(segment, _service, **_kwargs):
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return [{"text": segment["text"]}]
+
+    monkeypatch.setattr(live_edit_pipeline, "_split_whisper_segment", fake_split)
+    service = type("Analysis", (), {"_max_parallel_requests": 3})()
+    result = _split_whisper_segments_parallel(
+        [{"text": str(index)} for index in range(6)],
+        service,
+    )
+
+    assert maximum > 1
+    assert [item["text"] for item in result] == [str(index) for index in range(6)]
+
+
+def test_timestamp_comment_score_is_applied_to_every_matching_section_by_maximum():
+    sections = [
+        {"start": 0.0, "end": 60.0},
+        {"start": 60.0, "end": 120.0},
+        {"start": 120.0, "end": 180.0},
+        {"start": 180.0, "end": 240.0},
+    ]
+    comments = [
+        {"text": "0:10 재미있음 1:30 다시 보기"},
+        {"text": "01:30 핵심 장면"},
+        {"text": "2:59 마지막"},
+    ]
+
+    _apply_timestamp_comment_scores(
+        sections,
+        comments,
+        [{"index": 0, "score": 0.7}, {"index": 1, "score": 0.85}, {"index": 2, "score": 0.5}],
+    )
+
+    assert _comment_timestamp_seconds(comments[0]["text"]) == [10.0, 90.0]
+    assert [section.get("comment_score") for section in sections] == [0.7, 0.85, 0.5, None]
+
+
+def test_heatmap_score_uses_interpolated_maximum_inside_section():
+    heatmap = [
+        {"start_time": 0.0, "end_time": 10.0, "value": 0.0},
+        {"start_time": 10.0, "end_time": 20.0, "value": 1.0},
+        {"start_time": 20.0, "end_time": 30.0, "value": 0.4},
+    ]
+    sections = [{"start": 7.0, "end": 12.0}, {"start": 16.0, "end": 22.0}]
+
+    _apply_heatmap_scores(sections, heatmap)
+
+    assert _heatmap_section_score(heatmap, 7.0, 12.0) == 0.7
+    assert sections[0]["heatmap_score"] == 0.7
+    assert sections[1]["heatmap_score"] == 0.94
+
+
+def test_unsupported_heatmap_does_not_create_score_field():
+    sections = [{"start": 0.0, "end": 60.0}]
+
+    _apply_heatmap_scores(sections, [])
+
+    assert "heatmap_score" not in sections[0]
+
+
+def test_sparse_chat_scores_collective_burst_higher_than_quiet_section():
+    chat = [
+        {"elapsed_seconds": float(second), "author_id": f"user-{index % 4}"}
+        for index, second in enumerate(range(5, 120, 10))
+    ]
+    chat.extend(
+        {"elapsed_seconds": float(second), "author_id": f"burst-{index}"}
+        for index, second in enumerate(range(125, 150, 2))
+    )
+    points = _chat_score_points(chat, 240)
+    sections = [{"start": 30.0, "end": 90.0}, {"start": 120.0, "end": 180.0}]
+
+    _apply_point_scores(sections, points, "chat_score")
+
+    assert sections[1]["chat_score"] > sections[0]["chat_score"]
+
+
+def test_chat_score_is_unsupported_when_fewer_than_ten_events():
+    points = _chat_score_points(
+        [{"elapsed_seconds": float(index), "author_id": f"user-{index}"} for index in range(9)],
+        60,
+    )
+    assert points == []
+
+
+def test_chat_score_uses_thirty_second_warmup():
+    chat = [
+        {"elapsed_seconds": float(index * 2), "author_id": f"user-{index}"}
+        for index in range(15)
+    ]
+    points = _chat_score_points(chat, 120)
+
+    assert all(score == 0.0 for timestamp, score in points if timestamp < 30.0)
+
+
+def test_chat_analysis_timestamp_compensates_reaction_delay_without_negative_time():
+    assert CHAT_REACTION_OFFSET_SECONDS == 3.0
+    assert _adjust_chat_timestamp(10.0) == 7.0
+    assert _adjust_chat_timestamp(2.0) == 0.0
+
+
+def test_volume_score_detects_sustained_relative_rise():
+    samples = [(float(index), -30.0 if 40 <= index < 45 else -50.0) for index in range(90)]
+    points = _volume_score_points(samples)
+    quiet = max(score for timestamp, score in points if 10 <= timestamp <= 20)
+    loud = max(score for timestamp, score in points if 40 <= timestamp <= 45)
+
+    assert loud > quiet
+
+
+def test_volume_score_uses_first_thirty_seconds_only_as_warmup():
+    samples = [(float(index), -20.0 if 5 <= index < 10 else -50.0) for index in range(60)]
+    points = _volume_score_points(samples)
+
+    assert all(score == 0.0 for timestamp, score in points if timestamp < 30.0)
+
+
+def test_final_score_is_weighted_and_renormalizes_missing_features():
+    assert (
+        SECTION_SCORE_WEIGHTS["heatmap_score"]
+        > SECTION_SCORE_WEIGHTS["comment_score"]
+        > SECTION_SCORE_WEIGHTS["llm_score"]
+        > SECTION_SCORE_WEIGHTS["chapter_llm_score"]
+        > SECTION_SCORE_WEIGHTS["chat_score"]
+        > SECTION_SCORE_WEIGHTS["volume_score"]
+    )
+    assert sum(SECTION_SCORE_WEIGHTS.values()) == pytest.approx(1.0)
+    sections = [{
+        "chapter_llm_score": 0.8,
+        "llm_score": 0.6,
+        "heatmap_score": 1.0,
+    }]
+
+    _apply_final_scores(sections)
+
+    expected = (
+        0.8 * SECTION_SCORE_WEIGHTS["chapter_llm_score"]
+        + 0.6 * SECTION_SCORE_WEIGHTS["llm_score"]
+        + 1.0 * SECTION_SCORE_WEIGHTS["heatmap_score"]
+    ) / (
+        SECTION_SCORE_WEIGHTS["chapter_llm_score"]
+        + SECTION_SCORE_WEIGHTS["llm_score"]
+        + SECTION_SCORE_WEIGHTS["heatmap_score"]
+    )
+    assert sections[0]["final_score"] == pytest.approx(expected, abs=1e-6)
+
+
+def test_summary_selection_uses_final_score_instead_of_section_llm_score():
+    sections = [
+        {"segment_id": "llm-high", "start": 0.0, "end": 60.0, "llm_score": 1.0, "final_score": 0.2},
+        {"segment_id": "total-high", "start": 60.0, "end": 120.0, "llm_score": 0.1, "final_score": 0.9},
+    ]
+
+    selected = _select_clips(sections, 60)
+
+    assert [item["segment_id"] for item in selected] == ["total-high"]
+
+
+def test_coherent_selection_preserves_anchor_and_expands_only_required_links():
+    class Analysis:
+        def __init__(self):
+            self.calls = []
+
+        def required_anchor_links(self, anchor_id, _summary, _sections, **_kwargs):
+            self.calls.append(anchor_id)
+            return ["s0", "s2"] if anchor_id == "s1" else []
+
+    sections = [
+        {"segment_id": f"s{index}", "chapter_id": "c0", "chapter_summary": "요약", "start": index * 20.0, "end": (index + 1) * 20.0, "text": str(index), "final_score": score}
+        for index, score in enumerate([0.2, 1.0, 0.3, 0.8])
+    ]
+    analysis = Analysis()
+
+    selected, reviews = _select_coherent_clips(sections, 60, analysis)
+
+    assert [item["segment_id"] for item in selected] == ["s0", "s1", "s2"]
+    assert analysis.calls == ["s1"]
+    assert reviews == []
+
+
+def test_coherent_selection_calls_each_chapter_only_once_and_moves_to_next_ranked_chapter():
+    class Analysis:
+        def __init__(self):
+            self.calls = []
+
+        def required_anchor_links(self, anchor_id, _summary, _sections, **_kwargs):
+            self.calls.append(anchor_id)
+            return []
+
+    sections = [
+        {"segment_id": "a-high", "chapter_id": "a", "start": 0.0, "end": 20.0, "text": "", "final_score": 1.0},
+        {"segment_id": "a-next", "chapter_id": "a", "start": 20.0, "end": 40.0, "text": "", "final_score": 0.9},
+        {"segment_id": "b-high", "chapter_id": "b", "start": 40.0, "end": 60.0, "text": "", "final_score": 0.8},
+    ]
+    analysis = Analysis()
+
+    selected, _reviews = _select_coherent_clips(sections, 60, analysis)
+
+    assert [item["segment_id"] for item in selected] == ["a-high", "b-high"]
+    assert analysis.calls == ["a-high", "b-high"]
 
 
 def test_atomic_json_write_retries_transient_windows_access_denial(tmp_path, monkeypatch):
@@ -248,12 +464,14 @@ def test_review_exposes_chapter_section_hierarchy(tmp_path):
         "target_seconds": 60,
         "selected_segment_ids": ["chapter-00-section-00"],
         "recommended_segment_ids": ["chapter-00-section-00"],
-        "candidates": [{"segment_id": "chapter-00-section-00", "chapter_id": "chapter-00", "section_id": "chapter-00-section-00", "start": 0, "end": 4, "text": "섹션", "llm_score": 900}],
-        "chapters": [{"chapter_id": "chapter-00", "summary": "주제 요약", "llm_score": 812, "start": 0, "end": 4, "sections": [{"section_id": "chapter-00-section-00", "start": 0, "end": 4, "segment_ids": ["chapter-00-section-00"]}]}],
+        "candidates": [{"segment_id": "chapter-00-section-00", "chapter_id": "chapter-00", "section_id": "chapter-00-section-00", "start": 0, "end": 4, "text": "섹션", "llm_score": 0.9}],
+        "chapters": [{"chapter_id": "chapter-00", "summary": "주제 요약", "llm_score": 0.812, "start": 0, "end": 4, "sections": [{"section_id": "chapter-00-section-00", "start": 0, "end": 4, "segment_ids": ["chapter-00-section-00"]}]}],
     })
 
     assert review["chapters"][0]["sections"][0]["segment_ids"] == ["chapter-00-section-00"]
     assert "segments" not in review
-    assert review["chapters"][0]["llm_score"] == 812
-    assert review["chapters"][0]["sections"][0]["llm_score"] == 900
+    assert review["chapters"][0]["llm_score"] == 0.812
+    assert review["chapters"][0]["sections"][0]["llm_score"] == 0.9
     assert "final_score" not in review["chapters"][0]["sections"][0]
+    assert "volume_score" not in review["chapters"][0]["sections"][0]
+    assert "chat_score" not in review["chapters"][0]["sections"][0]

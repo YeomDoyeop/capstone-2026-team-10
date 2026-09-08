@@ -54,6 +54,8 @@ class LiveEditRequest(BaseModel):
     llm_provider: Literal["gemini", "deepseek"] = "deepseek"
     genre: Literal["ai_news", "stock", "game"] = "ai_news"
     target_duration_seconds: int = Field(default=600, ge=60, le=7200)
+    use_timestamp_comments: bool = False
+    use_chat_score: bool = False
     transcription_source: Literal["youtube_caption", "youtube_subtitle", "whisper_api"] = "youtube_caption"
     transcript_language: str | None = Field(default=None, min_length=1, max_length=40)
     stt_language: str | None = Field(default="ko", max_length=20)

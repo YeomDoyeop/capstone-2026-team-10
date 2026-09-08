@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import textwrap
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -29,6 +32,15 @@ SUBTITLE_MIN_DURATION_SECONDS = 0.08
 WHISPER_LONG_SEGMENT_CHARACTERS = 25
 WHISPER_SPLIT_TARGET_CHARACTERS = 20
 WHISPER_PRIORITY_GAP_SECONDS = 0.5
+CHAT_REACTION_OFFSET_SECONDS = 3.0
+SECTION_SCORE_WEIGHTS = {
+    "chapter_llm_score": 0.15,
+    "llm_score": 0.18,
+    "heatmap_score": 0.25,
+    "chat_score": 0.12,
+    "comment_score": 0.20,
+    "volume_score": 0.10,
+}
 WHISPER_PUNCTUATION_PROMPTS = {
     "ko": "문장은 자연스럽게 이어지고, 의미가 바뀌면 정확히 구분됩니다.",
     "en": "Sentences flow naturally, and punctuation is used accurately.",
@@ -36,7 +48,7 @@ WHISPER_PUNCTUATION_PROMPTS = {
     "ja": "文章は自然に続き、意味の変化に合わせて正確に区切られます。",
 }
 from app.services.llm_analysis_service import LLMAnalysisError, LLMAnalysisService
-from app.services.youtube_importer import YouTubeImporter
+from app.services.youtube_importer import YouTubeImporter, YouTubeImportError
 from app.services.live_youtube_service import LiveYouTubeError, extract_video_id, load_prepared_transcript, prepared_metadata_paths
 
 
@@ -94,6 +106,281 @@ def _whisper_transcript_path(media_root: Path, job_id: str) -> Path:
 
 def _nonspace_length(value: str) -> int:
     return len(re.sub(r"\s+", "", value))
+
+
+def _comment_timestamp_seconds(text: str) -> list[float]:
+    """댓글 원문에 포함된 모든 MM:SS 또는 HH:MM:SS 시각을 반환한다."""
+
+    values: list[float] = []
+    for match in re.finditer(r"(?<!\d)(?:(\d{1,3}):)?(\d{1,2}):(\d{2})(?!\d)", text):
+        hours, minutes, seconds = match.groups()
+        minute_value, second_value = int(minutes), int(seconds)
+        if second_value >= 60 or hours is not None and minute_value >= 60:
+            continue
+        value = (int(hours) * 3600 if hours is not None else 0) + minute_value * 60 + second_value
+        if value not in values:
+            values.append(float(value))
+    return values
+
+
+def _apply_timestamp_comment_scores(
+    sections: list[dict[str, Any]],
+    comments: list[dict[str, Any]],
+    scores: list[dict[str, int | float]],
+) -> None:
+    """각 댓글 점수를 댓글의 모든 타임스탬프가 속한 섹션에 부여한다."""
+
+    ordered = sorted(sections, key=lambda item: float(item.get("start", 0)))
+    score_by_index = {item["index"]: item["score"] for item in scores}
+    for index, comment in enumerate(comments):
+        score = score_by_index.get(index)
+        if score is None:
+            continue
+        for timestamp in _comment_timestamp_seconds(str(comment.get("text") or "")):
+            for section_index, section in enumerate(ordered):
+                start, end = float(section["start"]), float(section["end"])
+                is_last = section_index == len(ordered) - 1
+                if start <= timestamp < end or is_last and timestamp == end:
+                    section["comment_score"] = round(max(
+                        float(section.get("comment_score", 0.0)),
+                        float(score),
+                    ), 3)
+                    break
+
+
+def _heatmap_section_score(
+    heatmap: list[dict[str, Any]],
+    section_start: float,
+    section_end: float,
+) -> float | None:
+    """히트맵 표본을 선형 보간해 섹션 범위의 최댓값을 반환한다."""
+
+    points: list[tuple[float, float]] = []
+    for item in heatmap:
+        if not isinstance(item, dict):
+            continue
+        start, end, value = item.get("start_time"), item.get("end_time"), item.get("value")
+        if (
+            not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not isinstance(value, (int, float))
+            or isinstance(start, bool)
+            or isinstance(end, bool)
+            or isinstance(value, bool)
+            or float(end) < float(start)
+        ):
+            continue
+        points.append(((float(start) + float(end)) / 2, min(1.0, max(0.0, float(value)))))
+    if not points or section_end < section_start:
+        return None
+    points.sort(key=lambda point: point[0])
+
+    def estimate(timestamp: float) -> float:
+        if timestamp <= points[0][0]:
+            return points[0][1]
+        if timestamp >= points[-1][0]:
+            return points[-1][1]
+        for index in range(1, len(points)):
+            right_time, right_value = points[index]
+            if timestamp <= right_time:
+                left_time, left_value = points[index - 1]
+                if right_time == left_time:
+                    return max(left_value, right_value)
+                ratio = (timestamp - left_time) / (right_time - left_time)
+                return left_value + (right_value - left_value) * ratio
+        return points[-1][1]
+
+    values = [estimate(section_start), estimate(section_end)]
+    values.extend(
+        value
+        for timestamp, value in points
+        if section_start <= timestamp <= section_end
+    )
+    return round(max(values), 6)
+
+
+def _apply_heatmap_scores(
+    sections: list[dict[str, Any]],
+    heatmap: list[dict[str, Any]],
+) -> None:
+    for section in sections:
+        score = _heatmap_section_score(
+            heatmap,
+            float(section.get("start", 0)),
+            float(section.get("end", 0)),
+        )
+        if score is not None:
+            section["heatmap_score"] = score
+
+
+def _percentile(values: list[float], ratio: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    position = min(1.0, max(0.0, ratio)) * (len(ordered) - 1)
+    left = int(position)
+    right = min(left + 1, len(ordered) - 1)
+    fraction = position - left
+    return ordered[left] + (ordered[right] - ordered[left]) * fraction
+
+
+def _normalize_points(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """P50을 0, P95를 1로 두어 영상 내부의 상대 급증을 정규화한다."""
+
+    values = [value for _, value in points]
+    low, high = _percentile(values, 0.5), _percentile(values, 0.95)
+    if high <= low:
+        return [(timestamp, 0.0) for timestamp, _ in points]
+    return [
+        (timestamp, round(min(1.0, max(0.0, (value - low) / (high - low))), 6))
+        for timestamp, value in points
+    ]
+
+
+def _section_point_score(points: list[tuple[float, float]], start: float, end: float) -> float | None:
+    """섹션 표본의 상위 10% 평균 70%와 전체 평균 30%를 결합한다."""
+
+    values = [value for timestamp, value in points if start <= timestamp <= end]
+    if not values:
+        return None
+    top_count = max(1, math.ceil(len(values) * 0.1))
+    top_mean = statistics.fmean(sorted(values, reverse=True)[:top_count])
+    return round(0.7 * top_mean + 0.3 * statistics.fmean(values), 6)
+
+
+def _chat_score_points(chat_items: list[dict[str, Any]], duration: float) -> list[tuple[float, float]]:
+    """희소 채팅을 30초 이동창과 직전 3분 기준선으로 상대 평가한다."""
+
+    events = sorted(
+        (_adjust_chat_timestamp(float(item["elapsed_seconds"])), str(item["author_id"]))
+        for item in chat_items
+        if isinstance(item, dict)
+        and isinstance(item.get("elapsed_seconds"), (int, float))
+        and item.get("author_id")
+    )
+    if len(events) < 10 or duration <= 0:
+        return []
+
+    def activity(left: float, right: float) -> float:
+        counts: dict[str, int] = {}
+        for timestamp, author_id in events:
+            if left < timestamp <= right:
+                counts[author_id] = min(3, counts.get(author_id, 0) + 1)
+        return 0.5 * sum(counts.values()) + 0.5 * len(counts)
+
+    global_density = activity(-float("inf"), duration) / duration
+    samples: list[tuple[float, float, float]] = []
+    timestamp = 0.0
+    while timestamp <= duration:
+        recent = activity(timestamp - 30, timestamp)
+        baseline = activity(timestamp - 210, timestamp - 30)
+        if timestamp < 30.0:
+            relative = 0.0
+            recent = 0.0
+        else:
+            available_baseline_seconds = min(180.0, timestamp - 30.0)
+            local_density = (
+                baseline / available_baseline_seconds
+                if available_baseline_seconds > 0
+                else global_density
+            )
+            confidence = available_baseline_seconds / 180.0
+            baseline_density = confidence * local_density + (1.0 - confidence) * global_density
+            ratio = ((recent + 1) / 30) / max(1 / 30, baseline_density)
+            relative = min(1.0, max(0.0, math.log2(max(1.0, ratio)) / 3))
+        samples.append((timestamp, recent, relative))
+        timestamp += 5
+    recent_values = [recent for _, recent, _ in samples]
+    raw = []
+    for timestamp, recent, relative in samples:
+        rank = sum(value <= recent for value in recent_values) / len(recent_values)
+        raw.append((timestamp, 0.6 * relative + 0.4 * rank))
+    return _normalize_points(raw)
+
+
+def _adjust_chat_timestamp(timestamp: float) -> float:
+    """사람의 반응·입력 지연을 보정하되 원본 저장 시각은 변경하지 않는다."""
+
+    return max(0.0, timestamp - CHAT_REACTION_OFFSET_SECONDS)
+
+
+def _volume_score_points(samples: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """1초 RMS를 3초 평활하고 직전 30초보다 갑자기 커진 구간을 평가한다."""
+
+    if len(samples) < 10:
+        return []
+    smoothed = [
+        (timestamp, statistics.median(value for _, value in samples[max(0, index - 1):index + 2]))
+        for index, (timestamp, _) in enumerate(samples)
+    ]
+    raw: list[tuple[float, float]] = []
+    elevated: list[bool] = []
+    increases: list[float] = []
+    for index, (timestamp, value) in enumerate(smoothed):
+        baseline_values = [item[1] for item in smoothed[max(0, index - 30):index]]
+        baseline = statistics.median(baseline_values) if baseline_values else value
+        increase = max(0.0, value - baseline)
+        if timestamp < 30.0:
+            # 영상 초반 30초는 지역 기준선을 모으는 워밍업 구간이다. 무음 뒤
+            # 첫 발화나 인트로 음악이 상대 급증으로 과대평가되지 않게 한다.
+            increase = 0.0
+        increases.append(increase)
+        elevated.append(timestamp >= 30.0 and value >= -45.0 and increase >= 3.0)
+    for index, (timestamp, _) in enumerate(smoothed):
+        # 1초짜리 순간 노이즈는 제외하고 최소 두 표본 연속 상승만 인정한다.
+        sustained = elevated[index] and (index > 0 and elevated[index - 1] or index + 1 < len(elevated) and elevated[index + 1])
+        raw.append((timestamp, increases[index] if sustained else 0.0))
+    return _normalize_points(raw)
+
+
+def _extract_volume_samples(source: Path) -> list[tuple[float, float]]:
+    """FFmpeg로 원본 오디오의 1초별 전체 채널 RMS(dBFS)를 읽는다."""
+
+    command = [
+        str(get_ffmpeg()), "-hide_banner", "-nostdin", "-i", str(source),
+        "-vn", "-af",
+        "aresample=48000,asetnsamples=n=48000:p=1,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-",
+        "-f", "null", "-",
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    except (OSError, ToolchainError):
+        return []
+    if completed.returncode != 0:
+        return []
+    samples: list[tuple[float, float]] = []
+    timestamp: float | None = None
+    for line in completed.stdout.splitlines():
+        if match := re.search(r"pts_time:([0-9.]+)", line):
+            timestamp = float(match.group(1))
+        elif timestamp is not None and (match := re.search(r"lavfi\.astats\.Overall\.RMS_level=(-?(?:\d+(?:\.\d+)?|inf))", line)):
+            value = float(match.group(1))
+            if math.isfinite(value):
+                samples.append((timestamp, value))
+            timestamp = None
+    return samples
+
+
+def _apply_point_scores(sections: list[dict[str, Any]], points: list[tuple[float, float]], field: str) -> None:
+    for section in sections:
+        score = _section_point_score(points, float(section["start"]), float(section["end"]))
+        if score is not None:
+            section[field] = score
+
+
+def _apply_final_scores(sections: list[dict[str, Any]]) -> None:
+    """사용 가능한 점수의 가중치만 재정규화해 섹션 총점을 계산한다."""
+
+    for section in sections:
+        weighted_sum = 0.0
+        available_weight = 0.0
+        for field, weight in SECTION_SCORE_WEIGHTS.items():
+            value = section.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                weighted_sum += min(1.0, max(0.0, float(value))) * weight
+                available_weight += weight
+        if available_weight > 0:
+            section["final_score"] = round(weighted_sum / available_weight, 6)
 
 
 def _word_text_spans(text: str, words: list[dict[str, Any]]) -> list[tuple[int, int]] | None:
@@ -211,6 +498,41 @@ def _split_whisper_segment(
     return result
 
 
+def _split_whisper_segments_parallel(
+    segments: list[dict[str, Any]],
+    analysis_service: LLMAnalysisService,
+    *,
+    cancel_callback: Callable[[], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[dict[str, Any]]:
+    """공급자별 요청 제한 안에서 Whisper 긴 문장 분할을 병렬 수행한다."""
+
+    indexed: list[tuple[int, list[dict[str, Any]]]] = []
+
+    def split(index: int, segment: dict[str, Any]) -> tuple[int, list[dict[str, Any]]]:
+        if cancel_callback:
+            cancel_callback()
+        return index, _split_whisper_segment(
+            segment,
+            analysis_service,
+            cancel_callback=cancel_callback,
+        )
+
+    worker_count = min(
+        max(1, int(getattr(analysis_service, "_max_parallel_requests", 1))),
+        len(segments),
+    )
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(split, index, segment) for index, segment in enumerate(segments)]
+        for completed, future in enumerate(as_completed(futures), 1):
+            if cancel_callback:
+                cancel_callback()
+            indexed.append(future.result())
+            if progress_callback:
+                progress_callback(completed, len(futures))
+    return [part for _, parts in sorted(indexed) for part in parts]
+
+
 def _ensure_candidate_ids(candidates: list[dict[str, Any]]) -> None:
     """Give legacy and current candidates unique deterministic IDs in place."""
 
@@ -228,7 +550,7 @@ def _ensure_candidate_ids(candidates: list[dict[str, Any]]) -> None:
 
 
 def _select_clips(sections: list[dict[str, Any]], target_seconds: int) -> list[dict[str, Any]]:
-    """섹션 LLM 점수와 정확한 섹션 경계만으로 배낭 선택을 수행한다."""
+    """섹션 총점과 정확한 섹션 경계로 목표 길이의 요약본을 선택한다."""
 
     candidates = [item for item in sections if item["end"] - item["start"] >= 5.0]
     unit = 2
@@ -237,7 +559,7 @@ def _select_clips(sections: list[dict[str, Any]], target_seconds: int) -> list[d
     states: dict[int, tuple[float, list[dict[str, Any]]]] = {0: (0.0, [])}
     for item in candidates:
         duration = max(1, round((item["end"] - item["start"]) * unit))
-        value = float(item.get("llm_score", 0.0))
+        value = float(item.get("final_score", item.get("llm_score", 0.0)))
         snapshot = list(states.items())
         for used, (score, selected) in snapshot:
             new_used = used + duration
@@ -251,6 +573,80 @@ def _select_clips(sections: list[dict[str, Any]], target_seconds: int) -> list[d
         valid = [(abs(used - target), -score, selected) for used, (score, selected) in states.items()]
     valid.sort(key=lambda value: (value[0], value[1]))
     return sorted(valid[0][2], key=lambda item: item["start"])
+
+
+def _selected_groups(ordered: list[dict[str, Any]], selected_ids: set[str]) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    previous_index = -2
+    previous_chapter = ""
+    for index, section in enumerate(ordered):
+        section_id = str(section["segment_id"])
+        if section_id not in selected_ids:
+            continue
+        chapter_id = str(section.get("chapter_id") or "")
+        if current and (index != previous_index + 1 or chapter_id != previous_chapter):
+            groups.append(current)
+            current = []
+        current.append(section)
+        previous_index = index
+        previous_chapter = chapter_id
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _select_coherent_clips(
+    sections: list[dict[str, Any]],
+    target_seconds: int,
+    analysis_service: LLMAnalysisService,
+    *,
+    cancel_callback: Callable[[], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """고득점 앵커를 보존하면서 최소 필수 관계만 확장한다."""
+
+    ordered = sorted(
+        (item for item in sections if float(item["end"]) - float(item["start"]) >= 5.0),
+        key=lambda item: float(item["start"]),
+    )
+    if not ordered:
+        return [], []
+    by_id = {str(item["segment_id"]): item for item in ordered}
+    chapter_sections: dict[str, list[dict[str, Any]]] = {}
+    for item in ordered:
+        chapter_sections.setdefault(str(item.get("chapter_id") or ""), []).append(item)
+    ranked = sorted(ordered, key=lambda item: (-float(item.get("final_score", 0.0)), float(item["start"])))
+    selected_ids: set[str] = set()
+    processed_chapter_ids: set[str] = set()
+    lower = max(0.0, target_seconds - 30.0)
+
+    def duration(ids: set[str]) -> float:
+        return sum(float(by_id[value]["end"]) - float(by_id[value]["start"]) for value in ids)
+
+    total_chapters = len(chapter_sections)
+    for anchor in ranked:
+        if cancel_callback:
+            cancel_callback()
+        anchor_id = str(anchor["segment_id"])
+        chapter_id = str(anchor.get("chapter_id") or "")
+        if chapter_id in processed_chapter_ids:
+            continue
+        processed_chapter_ids.add(chapter_id)
+        peers = chapter_sections[chapter_id]
+        relation_rows = [{"id": str(item["segment_id"]), "text": str(item.get("text") or "")} for item in peers]
+        required_ids = analysis_service.required_anchor_links(
+            anchor_id,
+            str(anchor.get("chapter_summary") or ""),
+            relation_rows,
+            cancel_callback=cancel_callback,
+        )
+        selected_ids.update([anchor_id, *required_ids])
+        if progress_callback:
+            progress_callback(len(processed_chapter_ids), total_chapters)
+        if duration(selected_ids) >= lower:
+            break
+    return [item for item in ordered if str(item["segment_id"]) in selected_ids], []
 
 
 def _srt_timestamp(seconds: float) -> str:
@@ -572,16 +968,22 @@ class LiveEditPipeline:
             checkpoint=checkpoint,
             checkpoint_callback=save_checkpoint,
         ) if needs_split else None
-        segments: list[dict[str, Any]] = []
         try:
-            for index, segment in enumerate(whisper_segments):
-                check_cancelled()
-                if analysis_service is None:
-                    segments.append({"start": float(segment["start"]), "end": float(segment["end"]), "text": str(segment["text"]).strip()})
-                else:
-                    segments.extend(_split_whisper_segment(segment, analysis_service, cancel_callback=cancel_callback))
-                if progress_callback:
-                    progress_callback(80 + int(19 * (index + 1) / max(1, len(whisper_segments))), "긴 Whisper 문장을 자막 단위로 분할하는 중입니다.")
+            if analysis_service is None:
+                segments = [
+                    {"start": float(segment["start"]), "end": float(segment["end"]), "text": str(segment["text"]).strip()}
+                    for segment in whisper_segments
+                ]
+            else:
+                segments = _split_whisper_segments_parallel(
+                    whisper_segments,
+                    analysis_service,
+                    cancel_callback=cancel_callback,
+                    progress_callback=lambda done, total: progress_callback(
+                        80 + int(19 * done / max(1, total)),
+                        f"긴 Whisper 문장을 병렬 분할하는 중입니다. ({done}/{total})",
+                    ) if progress_callback else None,
+                )
         except LLMAnalysisError as exc:
             raise LiveEditPaused(f"LLM 자막 분할이 재시도 한도에 도달했습니다: {exc}") from exc
         _write_json_atomic(transcript_path, {"segments": segments})
@@ -596,6 +998,8 @@ class LiveEditPipeline:
         genre: str = "ai_news",
         llm_provider: str = "deepseek",
         target_seconds: int = 600,
+        use_timestamp_comments: bool = False,
+        use_chat_score: bool = False,
         transcription_source: str = "youtube_caption",
         transcript_language: str | None = None,
         stt_language: str | None = "ko",
@@ -767,8 +1171,9 @@ class LiveEditPipeline:
                     "chapter_id": chapter_id,
                     "section_id": section_id,
                     "chapter_summary": chapter["summary"],
+                    "chapter_llm_score": round(float(chapter["score"]) / 1000, 3),
                 })
-            chapters.append({"chapter_id": chapter_id, "summary": chapter["summary"], "llm_score": float(chapter["score"]), "start": float(first["start"]), "end": float(last["end"]), "sections": chapter_sections})
+            chapters.append({"chapter_id": chapter_id, "summary": chapter["summary"], "llm_score": round(float(chapter["score"]) / 1000, 3), "start": float(first["start"]), "end": float(last["end"]), "sections": chapter_sections})
         report(55, "LLM이 전체 스크립트를 챕터와 섹션으로 분할했습니다.")
         try:
             scored = analysis_service.score_sections(
@@ -779,27 +1184,108 @@ class LiveEditPipeline:
             )
         except LLMAnalysisError as exc:
             raise LiveEditPaused(f"LLM 섹션 중요도 평가가 재시도 한도에 도달했습니다: {exc}") from exc
+        report(76, f"LLM이 섹션 {len(scored):,}개의 중요도를 평가했습니다.")
+        metadata_path = Path(str(imported.get("metadata_path") or ""))
+        if not metadata_path.is_absolute():
+            metadata_path = (Path.cwd() / metadata_path).resolve()
+        heatmap: list[dict[str, Any]] = []
+        if metadata_path.is_file():
+            try:
+                stored_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                stored_heatmap = stored_metadata.get("heatmap") if isinstance(stored_metadata, dict) else None
+                if isinstance(stored_heatmap, list):
+                    heatmap = [item for item in stored_heatmap if isinstance(item, dict)]
+            except (OSError, json.JSONDecodeError):
+                heatmap = []
+        _apply_heatmap_scores(scored, heatmap)
+        if heatmap:
+            report(78, "히트맵 점수를 섹션별로 집계했습니다.")
+        # 음량은 영상별 최고 품질 원본 MP3가 준비된 경우에만 계산한다.
+        report(79, "원본 오디오의 음량 변화를 분석하는 중입니다.")
+        try:
+            volume_audio = importer.prepare_best_audio(vod_url, video_id)
+            volume_points = _volume_score_points(_extract_volume_samples(volume_audio))
+        except (YouTubeImportError, OSError):
+            volume_points = []
+        _apply_point_scores(scored, volume_points, "volume_score")
+        report(84, "원본 오디오의 음량 점수를 섹션별로 집계했습니다.")
+
+        chat_path = prepared_metadata_paths(video_id)["chat_times"]
+        chat_items: list[dict[str, Any]] = []
+        if use_chat_score and chat_path.is_file():
+            try:
+                loaded_chat = json.loads(chat_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_chat, list):
+                    chat_items = [item for item in loaded_chat if isinstance(item, dict)]
+            except (OSError, json.JSONDecodeError):
+                chat_items = []
+        chat_points = _chat_score_points(chat_items, float(imported.get("duration") or 0.0))
+        _apply_point_scores(scored, chat_points, "chat_score")
+        if use_chat_score:
+            report(86, "채팅 반응 점수를 섹션별로 집계했습니다.")
+        timestamp_comments: list[dict[str, Any]] = []
+        timestamp_comments_path = (
+            prepared_metadata_paths(video_id)["directory"]
+            / f"{video_id}.comments-timestamps.json"
+        )
+        if use_timestamp_comments and timestamp_comments_path.is_file():
+            try:
+                loaded_comments = json.loads(timestamp_comments_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_comments, list):
+                    timestamp_comments = [
+                        comment
+                        for comment in loaded_comments
+                        if isinstance(comment, dict)
+                        and _comment_timestamp_seconds(str(comment.get("text") or ""))
+                    ]
+            except (OSError, json.JSONDecodeError) as exc:
+                raise LiveEditPipelineError("타임스탬프 댓글 파일 형식이 올바르지 않습니다.") from exc
+        if timestamp_comments:
+            try:
+                comment_scores = analysis_service.score_timestamp_comments(
+                    timestamp_comments,
+                    cancel_callback=cancel_callback,
+                )
+            except LLMAnalysisError as exc:
+                raise LiveEditPaused(f"LLM 타임스탬프 댓글 평가가 재시도 한도에 도달했습니다: {exc}") from exc
+            _apply_timestamp_comment_scores(scored, timestamp_comments, comment_scores)
+            report(89, f"LLM이 타임스탬프 댓글 {len(timestamp_comments):,}개의 목적을 평가했습니다.")
+        _apply_final_scores(scored)
         # Keep the completed request checkpoint with the job. Cancelled and
         # failed job files are preserved locally even though they are not
         # restored automatically.
-        report(80, f"LLM이 섹션 {len(scored):,}개의 중요도를 평가했습니다.")
+        report(90, "분석 점수를 모두 준비했습니다.")
         # Stable IDs let the browser send a compact, auditable selection back
         # without trusting client-provided timestamps or text.
         _ensure_candidate_ids(scored)
         duration = float(imported.get("duration") or 0.0)
-        selected = _select_clips(scored, target_seconds)
+        try:
+            selected, selection_reviews = _select_coherent_clips(
+                scored,
+                target_seconds,
+                analysis_service,
+                cancel_callback=cancel_callback,
+                progress_callback=lambda done, total: report(
+                    90 + int(8 * done / max(1, total)),
+                    f"핵심 지점의 최소 필수 원인·결과를 연결하는 중입니다. ({done}/{total})",
+                ),
+            )
+        except LLMAnalysisError as exc:
+            raise LiveEditPaused(f"LLM 요약 구간 관계 분석이 재시도 한도에 도달했습니다: {exc}") from exc
         recommended_segment_ids = [str(item["segment_id"]) for item in selected]
         clips = selected
         if not clips:
             raise LiveEditPipelineError("편집할 하이라이트 구간을 선택하지 못했습니다.")
 
-        report(88, f"최종 하이라이트 {len(clips):,}개 구간을 선택했습니다.")
+        report(94, f"최종 하이라이트 {len(clips):,}개 구간을 선택했습니다.")
         plan = {
             "vod_url": vod_url,
             "genre": genre,
             "llm_provider": llm_provider,
             "transcription_source": transcription_source,
             "target_seconds": target_seconds,
+            "use_timestamp_comments": use_timestamp_comments,
+            "use_chat_score": use_chat_score,
             "source_video_path": str(source.resolve()),
             "rendered_filename": "edited.mp4",
             "source_duration_seconds": duration,
@@ -808,6 +1294,7 @@ class LiveEditPipeline:
             "recommended_segment_ids": recommended_segment_ids,
             "selected_segment_ids": recommended_segment_ids,
             "clips": clips,
+            "selection_reviews": selection_reviews,
         }
         _write_json_atomic(
             output_dir / f"{job_id}.analysis-plan.json",
@@ -834,7 +1321,7 @@ class LiveEditPipeline:
             "awaiting_selection": defer_render,
         }
         if defer_render:
-            report(90, "AI 분석이 완료되었습니다. 웹에서 원하는 구간을 선택하세요.")
+            report(100, "AI 분석이 완료되었습니다. 웹에서 원하는 구간을 선택하세요.")
             return base_result
 
         rendered = output_dir / f"{job_id}.edited.mp4"
@@ -881,12 +1368,22 @@ class LiveEditPipeline:
                 candidate = candidate_by_id.get(str(section.get("section_id")))
                 if not candidate:
                     continue
-                sections.append({
+                review_section = {
                     **section,
                     "text": candidate.get("text", ""),
-                    "llm_score": candidate.get("llm_score"),
                     "selected": str(candidate["segment_id"]) in selected_set,
-                })
+                }
+                for score_field in (
+                    "final_score",
+                    "llm_score",
+                    "heatmap_score",
+                    "volume_score",
+                    "chat_score",
+                    "comment_score",
+                ):
+                    if isinstance(candidate.get(score_field), (int, float)) and not isinstance(candidate.get(score_field), bool):
+                        review_section[score_field] = candidate[score_field]
+                sections.append(review_section)
             chapters.append({**chapter, "sections": sections})
         clips = plan.get("clips") or []
         return {

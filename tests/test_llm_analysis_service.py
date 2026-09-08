@@ -9,6 +9,9 @@ def test_prompts_define_summary_and_precise_score_contract():
     assert "summary" in CHAPTER_SYSTEM and "title" not in CHAPTER_SYSTEM
     assert "summary" not in SECTION_SYSTEM and "reason" not in SECTION_SYSTEM
     assert "균등 분할" in CHAPTER_SYSTEM and "문장마다 기계적으로" in SECTION_SYSTEM
+    assert "애매하면 나누지 않고 큰 챕터" in CHAPTER_SYSTEM
+    assert "가능한 한 작은 의미 단위" in SECTION_SYSTEM
+    assert "질문과 답변" in CHAPTER_SYSTEM and "질문과 답변" in SECTION_SYSTEM
 
 
 def test_whisper_settings_uses_strict_json_and_keeps_proper_nouns_as_hotwords(monkeypatch):
@@ -118,8 +121,36 @@ def test_score_sends_one_section_id_text_array_and_chapter_summary_per_chapter(m
         {"chapter_id": "a", "chapter_summary": "첫 챕터 요약", "section_id": "a-1", "text": "첫 섹션"}, {"chapter_id": "a", "chapter_summary": "첫 챕터 요약", "section_id": "a-2", "text": "둘째 섹션"}, {"chapter_id": "b", "chapter_summary": "둘째 챕터 요약", "section_id": "b-1", "text": "다른 챕터"},
     ])
     assert prompts == [{"chapter_summary": "첫 챕터 요약", "sections": [{"id": "a-1", "text": "첫 섹션"}, {"id": "a-2", "text": "둘째 섹션"}]}, {"chapter_summary": "둘째 챕터 요약", "sections": [{"id": "b-1", "text": "다른 챕터"}]}]
-    assert [item["llm_score"] for item in result] == [721.0, 814.0, 903.0]
+    assert [item["llm_score"] for item in result] == [0.721, 0.814, 0.903]
     assert all("reason" not in item for item in result)
+
+
+def test_timestamp_comments_are_scored_in_one_indexed_request(monkeypatch):
+    agent = object.__new__(LLMAnalysisService)
+    captured = {}
+
+    def request(system, prompt, **kwargs):
+        captured["system"] = system
+        captured["prompt"] = json.loads(prompt)
+        captured["schema"] = kwargs["response_schema"]
+        return kwargs["validator"](
+            {"items": [{"index": 0, "score": 0}, {"index": 1, "score": 847}]}
+        )
+
+    monkeypatch.setattr(agent, "_request_json", request)
+    result = agent.score_timestamp_comments([
+        {"text": "00:10 도입부"},
+        {"text": "1:20 여기 정말 재미있다"},
+    ])
+
+    assert captured["prompt"] == {"comments": [
+        {"index": 0, "text": "00:10 도입부"},
+        {"index": 1, "text": "1:20 여기 정말 재미있다"},
+    ]}
+    assert result == [{"index": 0, "score": 0.0}, {"index": 1, "score": 0.847}]
+    assert "챕터 표기" in captured["system"]
+    assert "타임스탬프가 여러 개" in captured["system"]
+    assert captured["schema"]["required"] == ["items"]
 
 
 def test_score_rejects_wrong_score_count(monkeypatch):
@@ -158,6 +189,48 @@ def test_request_json_stops_after_twenty_invalid_responses():
     else:
         raise AssertionError("ten invalid responses must fail")
     assert agent.gateway.calls == 20
+
+
+def test_request_json_returns_last_contract_failure_reason():
+    class Gateway:
+        def request_json(self, *_args, **_kwargs):
+            return '{"value":1}'
+
+    agent = object.__new__(LLMAnalysisService)
+    agent.gateway = Gateway()
+
+    try:
+        agent._request_json(
+            "계약",
+            "입력",
+            validator=lambda _raw: (_ for _ in ()).throw(LLMAnalysisError("before_ids 방향 오류")),
+        )
+    except LLMAnalysisError as exc:
+        assert "before_ids 방향 오류" in str(exc)
+    else:
+        raise AssertionError("last validation reason must be exposed")
+
+
+def test_anchor_links_separate_before_and_after_ids_in_contract(monkeypatch):
+    agent = object.__new__(LLMAnalysisService)
+    captured = {}
+
+    def request(_system, _prompt, **kwargs):
+        captured["schema"] = kwargs["response_schema"]
+        return kwargs["validator"]({"before_ids": ["s0"], "after_ids": ["s2"]})
+
+    monkeypatch.setattr(agent, "_request_json", request)
+
+    result = agent.required_anchor_links(
+        "s1",
+        "요약",
+        [{"id": "s0", "text": "앞"}, {"id": "s1", "text": "핵심"}, {"id": "s2", "text": "뒤"}],
+    )
+
+    assert result == ["s0", "s2"]
+    assert captured["schema"]["required"] == ["before_ids", "after_ids"]
+    assert captured["schema"]["properties"]["before_ids"]["maxItems"] == 2
+    assert captured["schema"]["properties"]["after_ids"]["maxItems"] == 2
 
 
 def test_chapter_score_requires_an_integer_in_range():

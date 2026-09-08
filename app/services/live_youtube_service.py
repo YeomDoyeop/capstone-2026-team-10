@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
+import os
 import re
 from typing import Callable
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from uuid import uuid4
 
 from app.config import get_media_root
 from app.services.ytdlp_binary import YoutubeDL
@@ -196,6 +199,7 @@ def _normalize_ytdlp_replay_action(action: dict) -> list[dict]:
         messages.append({
             "id": renderer.get("id"),
             "author": _chat_text(renderer.get("authorName")) or None,
+            "author_id": renderer.get("authorExternalChannelId"),
             "elapsed_seconds": elapsed_seconds,
             "message": message,
             "type": renderer_name,
@@ -293,6 +297,30 @@ def _rolling_caption_rows(rows: list[dict]) -> list[dict]:
             continue
         cleaned.append(row)
         previous_text = text
+    return cleaned
+
+
+_CAPTION_NON_SPEECH_LABELS = {
+    "음악", "노래", "박수", "웃음", "환호", "탄식", "비명", "효과음", "잡음",
+    "music", "applause", "laughter", "laughs", "cheering", "sighs", "screaming",
+    "sound effect", "noise", "silence",
+}
+
+
+def _clean_caption_rows(rows: list[dict]) -> list[dict]:
+    """캡션의 비언어 단독 큐를 버리고 발화자 전환 기호만 제거한다."""
+
+    cleaned: list[dict] = []
+    for row in rows:
+        text = str(row.get("text") or "").strip()
+        label_match = re.fullmatch(r"[\[\(（【]\s*([^\]\)）】]+?)\s*[\]\)）】]", text)
+        if label_match and label_match.group(1).strip().casefold() in _CAPTION_NON_SPEECH_LABELS:
+            continue
+        if re.fullmatch(r"[♪♫♬♩\s]+", text):
+            continue
+        text = re.sub(r"^\s*(?:(?:>{1,2}|＞{1,2}|≫)\s*)+", "", text).strip()
+        if text:
+            cleaned.append({**row, "text": text})
     return cleaned
 
 
@@ -686,8 +714,28 @@ def download_metadata_materials(
             except json.JSONDecodeError:
                 continue
         times_path = _metadata_edit_dir(video_id) / f"{video_id}.chat-times.json"
-        chat_times = [{"elapsed_seconds": item["elapsed_seconds"]} for item in preview if isinstance(item.get("elapsed_seconds"), (int, float))]
-        times_path.write_text(json.dumps(chat_times, ensure_ascii=False, indent=2), encoding="utf-8")
+        chat_times = []
+        for item in preview:
+            if not isinstance(item.get("elapsed_seconds"), (int, float)):
+                continue
+            # 분석 파일에는 원본 채널 ID나 표시 이름을 남기지 않는다. 영상별
+            # 식별자는 동일 작성자의 반복 채팅만 판별할 수 있으면 충분하다.
+            identity = str(item.get("author_id") or item.get("author") or item.get("id") or "")
+            if not identity:
+                continue
+            anonymous_id = hashlib.sha256(f"{video_id}\0{identity}".encode("utf-8")).hexdigest()[:20]
+            chat_times.append({
+                "elapsed_seconds": item["elapsed_seconds"],
+                "author_id": anonymous_id,
+            })
+        pending_times_path = times_path.with_name(f".{times_path.name}.{uuid4().hex}.tmp")
+        try:
+            pending_times_path.write_text(
+                json.dumps(chat_times, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(pending_times_path, times_path)
+        finally:
+            pending_times_path.unlink(missing_ok=True)
         artifacts.append({"kind": "chat", "label": "채팅", "path": str(path.resolve()), "analysis_path": str(times_path.resolve()), "format": "JSONL", "count": len(preview), "preview": preview})
         complete_material("채팅")
 
@@ -729,7 +777,7 @@ def download_metadata_materials(
             row
             for path in paths
             for row in (
-                _rolling_caption_rows(_parse_vtt_rows(path.read_text(encoding="utf-8", errors="replace"), path.name))
+                _clean_caption_rows(_rolling_caption_rows(_parse_vtt_rows(path.read_text(encoding="utf-8", errors="replace"), path.name)))
                 if kind == "captions"
                 else _parse_vtt_rows(path.read_text(encoding="utf-8", errors="replace"), path.name)
             )

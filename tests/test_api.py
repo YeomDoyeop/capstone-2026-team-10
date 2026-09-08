@@ -66,13 +66,41 @@ def test_workflow_uses_current_endpoints_and_restored_options():
     assert "whisperActive" in options
     assert options.index("whisper_api") < options.index("youtube_subtitle") < options.index("youtube_caption")
     assert "review.segments" not in source
-    assert "section.final_score" not in source
+    assert "총점 {section.final_score.toFixed(2)}" in source
+    assert ".review-layout .final-score-badge" in styles
+    assert 'className="score-badge chapter-score-badge"' in source
+    assert ".review-layout .chapter-score-badge" in styles
     assert 'className="score-badge"' in source
+    assert "댓글 {section.comment_score.toFixed(2)}" in source
+    assert 'typeof section.comment_score === "number"' in source
+    assert ".review-layout .comment-score-badge" in styles
+    assert "히트맵 {section.heatmap_score.toFixed(2)}" in source
+    assert ".review-layout .heatmap-score-badge" in styles
+    assert "음량 {section.volume_score.toFixed(2)}" in source
+    assert ".review-layout .volume-score-badge" in styles
+    assert "채팅 {section.chat_score.toFixed(2)}" in source
+    assert ".review-layout .chat-score-badge" in styles
+    llm_badge = source.index("LLM {section.llm_score.toFixed(2)}")
+    heatmap_badge = source.index("히트맵 {section.heatmap_score.toFixed(2)}")
+    comment_badge = source.index("댓글 {section.comment_score.toFixed(2)}")
+    volume_badge = source.index("음량 {section.volume_score.toFixed(2)}")
+    chat_badge = source.index("채팅 {section.chat_score.toFixed(2)}")
+    final_badge = source.index("총점 {section.final_score.toFixed(2)}")
+    assert final_badge < heatmap_badge < comment_badge < llm_badge < chat_badge < volume_badge
+    assert 'className="score-separator"' in source
+    assert '>◀</span>' in source
+    assert 'className="segment-scores"' in source
+    assert "use_timestamp_comments: materialSelections.comments" in source
+    assert "use_chat_score: materialSelections.chat" in source
     assert "Math.round((Number(body.duration_seconds) || 0) / 4 / 30) * 30" in compact_source
     assert "초기값은 원본 영상 길이의 1/4입니다." not in source
     assert 'button:disabled { cursor: default;' in styles
     assert ':disabled, [aria-disabled="true"], .disabled, .disabled * { cursor: default !important; }' in styles
     assert ".whisper-activation * { cursor: default; }" in styles
+    assert "activeProgress.log" in source
+    assert 'className="progress-log"' in source
+    assert "progress-log-pan" in styles
+    assert "mask-image: linear-gradient(to right" not in styles
     assert "function transitionToPhase" in source
     assert "runTransition" not in source
     assert "async function advanceToAnalysis()" in source
@@ -362,8 +390,8 @@ def test_selection_render_persists_clips_and_sends_them_to_server(monkeypatch, t
     job_id = "selection-persistence"
     owner_id = "user-1"
     candidates = [
-        {"segment_id": "section-a", "start": 10.0, "end": 20.0, "llm_score": 750},
-        {"segment_id": "section-b", "start": 30.0, "end": 42.0, "llm_score": 920},
+        {"segment_id": "section-a", "start": 10.0, "end": 20.0, "llm_score": 0.75},
+        {"segment_id": "section-b", "start": 30.0, "end": 42.0, "llm_score": 0.92},
     ]
     LIVE_EDIT_JOBS[job_id] = {
         "job_id": job_id,
@@ -417,8 +445,8 @@ def test_selection_render_persists_clips_and_sends_them_to_server(monkeypatch, t
     )
 
     expected = [
-        {"segment_id": "section-b", "start": 30.0, "end": 42.0, "llm_score": 920},
-        {"segment_id": "section-a", "start": 10.0, "end": 20.0, "llm_score": 750},
+        {"segment_id": "section-b", "start": 30.0, "end": 42.0, "llm_score": 0.92},
+        {"segment_id": "section-a", "start": 10.0, "end": 20.0, "llm_score": 0.75},
     ]
     assert LIVE_EDIT_JOBS[job_id]["result"]["analysis_plan"]["clips"] == expected
     stored = LocalJobStore(tmp_path / "db").get_completed(job_id)

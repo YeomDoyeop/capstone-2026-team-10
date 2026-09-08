@@ -66,7 +66,7 @@ def test_job_result_sends_only_analysis_data_to_server(monkeypatch):
                     "start": 1.5,
                     "end": 4.0,
                     "text": "중요 발언",
-                    "llm_score": 900,
+                    "llm_score": 0.9,
                     "final_score": 0.8,
                 }
             ],
@@ -80,7 +80,7 @@ def test_job_result_sends_only_analysis_data_to_server(monkeypatch):
     assert result_request["json"]["script"] is None
     assert result_request["json"]["segments"][0]["start_ms"] == 1500
     assert result_request["json"]["segments"][0]["script_importance"] == 0.9
-    assert result_request["json"]["segments"][0]["final_score"] == 0.9
+    assert result_request["json"]["segments"][0]["final_score"] == 0.8
     assert "video_path" not in result_request["json"]
 
 
@@ -107,7 +107,7 @@ def test_repeated_result_sync_reuses_same_server_job(monkeypatch):
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [(0, 0.0), (500, 0.5), (1000, 1.0), (-5, 0.0), (1200, 1.0), ("bad", None)],
+    [(0, 0.0), (0.5, 0.5), (1, 1.0), (-0.5, 0.0), (1.2, 1.0), ("bad", None)],
 )
-def test_server_score_normalizes_client_scale(raw, expected):
+def test_server_score_accepts_normalized_client_scale(raw, expected):
     assert _score(raw) == expected

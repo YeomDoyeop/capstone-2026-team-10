@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import "./WorkflowApp.css";
@@ -10,6 +10,7 @@ type Job = {
   progress: number;
   transcription_progress?: number;
   phase?: string;
+  task_name?: string;
   message: string;
   error?: string;
   result?: { revision?: number };
@@ -47,7 +48,12 @@ type Section = {
   end: number;
   segment_ids: string[];
   text: string;
+  final_score?: number;
   llm_score?: number;
+  heatmap_score?: number;
+  volume_score?: number;
+  chat_score?: number;
+  comment_score?: number;
   selected: boolean;
 };
 type Chapter = {
@@ -810,22 +816,33 @@ export default function WorkflowApp() {
         "awaiting_selection",
       ].includes(job.status),
     );
-  const progressValue = materialDownload
-    ? materialDownload.progress
-    : whisperTranscript
-      ? whisperTranscript.progress
-      : job?.phase === "transcription"
-        ? job.transcription_progress || 0
-        : job?.progress || 0;
-  const progressLabel = materialDownload
-    ? "추가 메타데이터 진행률"
-    : whisperTranscript
-      ? "Whisper 전사 진행률"
-      : job?.phase === "transcription"
-        ? "Whisper 전사 진행률"
-        : phase === "render"
-          ? "렌더링 진행률"
-          : "AI 편집 진행률";
+  const materialActive = materialDownload?.status === "running";
+  const whisperProgressActive = Boolean(
+    whisperTranscript &&
+      ["running", "cancel_requested", "paused"].includes(whisperTranscript.status),
+  );
+  const jobProgressActive = Boolean(
+    job &&
+      !["completed", "failed", "cancelled", "awaiting_selection"].includes(job.status),
+  );
+  const activeProgress = materialActive
+    ? { kind: "materials", status: materialDownload.status, value: materialDownload.progress, label: "추가 메타데이터 다운로드", log: materialDownload.error || materialDownload.message }
+    : whisperProgressActive && !jobProgressActive
+      ? { kind: "whisper", status: whisperTranscript!.status, value: whisperTranscript!.progress, label: "Whisper 전사", log: whisperTranscript!.error || whisperTranscript!.message }
+      : job
+        ? {
+            kind: "edit",
+            status: job.status,
+            value: job.phase === "transcription" ? (job.transcription_progress ?? job.progress) : job.progress,
+            label: job.task_name || (job.phase === "render" ? "영상 렌더링" : job.phase === "transcription" ? "Whisper 전사" : job.phase === "selection" ? "구간 선택" : "영상 분석"),
+            log: job.error || job.message,
+          }
+        : whisperTranscript
+          ? { kind: "whisper", status: whisperTranscript.status, value: whisperTranscript.progress, label: "Whisper 전사", log: whisperTranscript.error || whisperTranscript.message }
+          : materialDownload
+            ? { kind: "materials", status: materialDownload.status, value: materialDownload.progress, label: "추가 메타데이터 다운로드", log: materialDownload.error || materialDownload.message }
+            : { kind: "idle", status: "idle", value: 0, label: "대기 중", log: message };
+  const progressValue = Math.max(0, Math.min(100, Math.round(Number(activeProgress.value) || 0)));
   const setSetting = <K extends keyof typeof initialSettings>(
     key: K,
     value: (typeof initialSettings)[K],
@@ -1218,6 +1235,8 @@ export default function WorkflowApp() {
           job_id: workflowJobId,
           vod_url: url.trim(),
           ...settings,
+          use_timestamp_comments: materialSelections.comments,
+          use_chat_score: materialSelections.chat,
           transcription_source: transcriptionSource,
           stt_language:
             settings.stt_language === "auto" ? null : settings.stt_language,
@@ -1679,8 +1698,8 @@ export default function WorkflowApp() {
                     ariaLabel="LLM 엔진"
                     value={settings.llm_provider}
                     options={[
-                      { value: "deepseek", label: "DeepSeek" },
-                      { value: "gemini", label: "Gemini" },
+                      { value: "deepseek", label: "DeepSeek-V4-Flash" },
+                      { value: "gemini", label: "Gemini 3.5 Flash-Lite" },
                     ]}
                     disabled={busy}
                     onChange={(value) => setSetting("llm_provider", value)}
@@ -1907,8 +1926,8 @@ export default function WorkflowApp() {
                               <span className="header-separator">
                                 ·
                               </span>섹션 {chapter.sections.length}개{" "}
-                              <em className="score-badge">
-                                LLM 점수 {Math.round(chapter.llm_score)}
+                              <em className="score-badge chapter-score-badge">
+                                LLM {chapter.llm_score.toFixed(2)}
                               </em>
                             </b>
                             <p>{chapter.summary}</p>
@@ -1952,21 +1971,50 @@ export default function WorkflowApp() {
                                     updateSelection(ids);
                                   }}
                                 />
-                                <span>
+                                <div className="segment-content">
                                   <b>
                                     섹션 {sectionIndex + 1}
                                     <span className="header-separator">·</span>
                                     <DetailedTime value={section.start} />–
-                                    <DetailedTime value={section.end} />{" "}
-                                    {section.llm_score !== undefined && (
-                                      <em className="score-badge">
-                                        LLM 점수 {Math.round(section.llm_score)}
+                                    <DetailedTime value={section.end} />
+                                  </b>
+                                  <div className="segment-scores">
+                                    {typeof section.final_score === "number" && (
+                                      <>
+                                        <em className="score-badge final-score-badge">
+                                          총점 {section.final_score.toFixed(2)}
+                                        </em>
+                                        <span className="score-separator" aria-hidden="true">◀</span>
+                                      </>
+                                    )}
+                                    {typeof section.heatmap_score === "number" && (
+                                      <em className="score-badge heatmap-score-badge">
+                                        히트맵 {section.heatmap_score.toFixed(2)}
                                       </em>
                                     )}
-                                  </b>
-                                  <br />
-                                  {section.text}
-                                </span>
+                                    {typeof section.comment_score === "number" && (
+                                      <em className="score-badge comment-score-badge">
+                                        댓글 {section.comment_score.toFixed(2)}
+                                      </em>
+                                    )}
+                                    {typeof section.llm_score === "number" && (
+                                      <em className="score-badge">
+                                        LLM {section.llm_score.toFixed(2)}
+                                      </em>
+                                    )}
+                                    {typeof section.chat_score === "number" && (
+                                      <em className="score-badge chat-score-badge">
+                                        채팅 {section.chat_score.toFixed(2)}
+                                      </em>
+                                    )}
+                                    {typeof section.volume_score === "number" && (
+                                      <em className="score-badge volume-score-badge">
+                                        음량 {section.volume_score.toFixed(2)}
+                                      </em>
+                                    )}
+                                  </div>
+                                  <div className="segment-text">{section.text}</div>
+                                </div>
                                 <button
                                   type="button"
                                   className="ghost compact"
@@ -2034,10 +2082,11 @@ export default function WorkflowApp() {
       </main>
       <aside
         className="progress-dock"
-        data-state={job?.status || whisperTranscript?.status || "idle"}
+        data-state={activeProgress.status}
+        data-kind={activeProgress.kind}
       >
+        <b className="progress-task-name">{activeProgress.label}</b>
         <div className="progress-main">
-          <b>{progressLabel}</b>
           <div className="progress-track">
             <span style={{ width: `${progressValue}%` }} />
           </div>
@@ -2080,7 +2129,7 @@ export default function WorkflowApp() {
               작업 취소
             </button>
           ) : null}
-        <p>{message}</p>
+        <ScrollingProgressLog text={activeProgress.log} />
         <FooterActions
           phase={phase}
           metadataReady={Boolean(metadata)}
@@ -2096,6 +2145,33 @@ export default function WorkflowApp() {
           onRestart={restart}
         />
       </aside>
+    </div>
+  );
+}
+
+function ScrollingProgressLog({ text }: { text: string }) {
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const trackRef = useRef<HTMLSpanElement>(null);
+  const [travel, setTravel] = useState(0);
+
+  useEffect(() => {
+    const measure = () => {
+      const viewport = viewportRef.current;
+      const track = trackRef.current;
+      setTravel(viewport && track ? Math.max(0, Math.ceil(track.scrollWidth - viewport.clientWidth)) : 0);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    if (viewportRef.current) observer.observe(viewportRef.current);
+    if (trackRef.current) observer.observe(trackRef.current);
+    return () => observer.disconnect();
+  }, [text]);
+
+  return (
+    <div className="progress-log" ref={viewportRef} title={text}>
+      <span ref={trackRef} className={travel > 0 ? "overflowing" : ""} style={{ "--progress-log-travel": `-${travel}px` } as CSSProperties}>
+        {text}
+      </span>
     </div>
   );
 }

@@ -5,6 +5,7 @@ import pytest
 
 from app.services.live_youtube_service import (
     LiveYouTubeError,
+    _clean_caption_rows,
     _download_thumbnail_list,
     _parse_vtt_rows,
     _rolling_caption_rows,
@@ -41,6 +42,25 @@ def test_rolling_caption_completion_markers_restore_spoken_intervals():
     assert [(row["start"], row["end"], row["text"]) for row in completed] == [
         ("00:00:00.040", "00:00:01.949", "첫 구간"),
         ("00:00:02.000", "00:00:04.030", "둘째 구간"),
+    ]
+
+
+def test_caption_special_notation_removes_non_speech_cues_and_speaker_markers():
+    rows = [
+        {"text": "[음악]"},
+        {"text": "(박수)"},
+        {"text": "♪ ♫"},
+        {"text": ">> 안녕하세요"},
+        {"text": "≫ 두 번째 발화자"},
+        {"text": "[중요] 실제 발화"},
+    ]
+
+    result = _clean_caption_rows(rows)
+
+    assert [row["text"] for row in result] == [
+        "안녕하세요",
+        "두 번째 발화자",
+        "[중요] 실제 발화",
     ]
 
 

@@ -220,6 +220,22 @@ def _update_live_edit_job(job_id: str, **values) -> None:
         job.update(values)
 
 
+def _analysis_task_name(message: str) -> str:
+    if "음량" in message or "오디오" in message:
+        return "음량 분석"
+    if "채팅" in message:
+        return "채팅 분석"
+    if "댓글" in message:
+        return "댓글 분석"
+    if "히트맵" in message:
+        return "히트맵 분석"
+    if "하이라이트" in message or "구간을 선택" in message:
+        return "하이라이트 선정"
+    if "LLM" in message or "챕터" in message or "섹션" in message:
+        return "LLM 영상 분석"
+    return "영상 분석 준비"
+
+
 def _raise_if_cancel_requested(job_id: str) -> None:
     if job_id in LIVE_EDIT_CANCEL_REQUESTS or LIVE_EDIT_JOBS.get(job_id, {}).get("status") == "cancel_requested":
         raise LiveEditCancelled("사용자가 작업을 취소했습니다.")
@@ -262,7 +278,13 @@ async def _run_live_edit_job(
 
     def report_analysis(progress: int, message: str) -> None:
         _raise_if_cancel_requested(job_id)
-        _update_live_edit_job(job_id, progress=progress, phase="analysis", message=message)
+        _update_live_edit_job(
+            job_id,
+            progress=progress,
+            phase="analysis",
+            task_name=_analysis_task_name(message),
+            message=message,
+        )
 
     def report_transcription(progress: int, message: str) -> None:
         _raise_if_cancel_requested(job_id)
@@ -279,7 +301,7 @@ async def _run_live_edit_job(
         _update_live_edit_job(job_id, whisper_preparing=True, phase="transcription", message="Whisper 전사를 준비하는 중입니다.")
 
     try:
-        _update_live_edit_job(job_id, status="running", progress=3, message="2단계에서 준비한 영상 자료를 확인하는 중입니다.")
+        _update_live_edit_job(job_id, status="running", progress=3, phase="analysis", task_name="영상 분석 준비", message="2단계에서 준비한 영상 자료를 확인하는 중입니다.")
         vod_id = extract_video_id(request.vod_url)
 
         pipeline = LiveEditPipeline(get_media_root())
@@ -290,6 +312,8 @@ async def _run_live_edit_job(
             genre=request.genre,
             llm_provider=request.llm_provider,
             target_seconds=request.target_duration_seconds,
+            use_timestamp_comments=request.use_timestamp_comments,
+            use_chat_score=request.use_chat_score,
             transcription_source=request.transcription_source,
             transcript_language=request.transcript_language,
             stt_language=request.stt_language,
@@ -395,6 +419,7 @@ async def start_live_edit(
         "status": "queued",
         "progress": 0,
         "phase": "analysis",
+        "task_name": "영상 분석 준비",
         "message": "AI 편집 작업을 준비하는 중입니다.",
         "transcription_source": request.transcription_source,
         "owner_id": _user_id(user),
@@ -415,7 +440,7 @@ async def resume_live_edit(job_id: str, authorization: str | None = Header(defau
     except Exception as exc:
         raise HTTPException(status_code=409, detail="재개할 작업 설정을 찾을 수 없습니다.") from exc
     LIVE_EDIT_ACCESS_TOKENS[job_id] = authorization or ""
-    _update_live_edit_job(job_id, status="queued", error=None, message="중단된 LLM 분석을 재개하는 중입니다.")
+    _update_live_edit_job(job_id, status="queued", task_name="LLM 영상 분석", error=None, message="중단된 LLM 분석을 재개하는 중입니다.")
     asyncio.create_task(_run_live_edit_job(job_id, request, authorization))
     return LIVE_EDIT_JOBS[job_id]
 
@@ -810,7 +835,7 @@ async def _run_segment_selection_job(
 
         def report_render(progress: int, message: str) -> None:
             _raise_if_cancel_requested(job_id)
-            _update_live_edit_job(job_id, progress=progress, message=message)
+            _update_live_edit_job(job_id, progress=progress, phase="render", task_name="영상 렌더링", message=message)
 
         try:
             _update_live_edit_job(
@@ -818,6 +843,7 @@ async def _run_segment_selection_job(
                 status="running",
                 progress=0,
                 phase="render",
+                task_name="영상 렌더링",
                 message="사용자가 선택한 구간으로 편집을 준비하는 중입니다.",
             )
             pipeline = LiveEditPipeline(get_media_root())
@@ -946,6 +972,7 @@ async def update_edit_segments(
             "status": "queued",
             "progress": 0,
             "phase": "render",
+            "task_name": "영상 렌더링",
             "message": "선택 구간 렌더링을 준비하는 중입니다.",
         }
     else:
@@ -954,6 +981,7 @@ async def update_edit_segments(
                 "status": "queued",
                 "progress": 0,
                 "phase": "render",
+                "task_name": "영상 렌더링",
                 "message": "선택 구간 렌더링을 준비하는 중입니다.",
                 "error": None,
             }

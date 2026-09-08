@@ -35,9 +35,7 @@ def save_result(access_token: str, job_id: str, result: dict[str, Any], *, selec
             "comment_timestamp_count": None,
             "heatmap_score": None,
             "average_volume_dbfs": _number(item.get("average_volume_dbfs")),
-            # 현재 선택 근거는 섹션 LLM 점수 하나뿐이다. 서버의 기존
-            # final_score 필드는 별도 보정 점수가 아니라 이 값을 기록한다.
-            "final_score": _score(item.get("llm_score")),
+            "final_score": _score(item.get("final_score")),
             "recommended": str(item.get("segment_id")) in set(plan.get("recommended_segment_ids") or result.get("recommended_segment_ids") or []),
         }
         for index, item in enumerate(candidates)
@@ -87,7 +85,6 @@ def _score(value: object) -> float | None:
     number = _number(value)
     if number is None:
         return None
-    # The client analysis contract deliberately uses a detailed 0..1000
-    # integer scale. The server history contract stores normalized values.
-    # Clamp before division so malformed values cannot escape that contract.
-    return min(1000.0, max(0.0, number)) / 1000.0
+    # LLM은 세밀한 판별을 위해 0..1000 정수를 반환하지만 클라이언트가
+    # 검증 직후 정규화하므로 서버에는 0.0..1.0 값을 그대로 전달한다.
+    return min(1.0, max(0.0, number))
