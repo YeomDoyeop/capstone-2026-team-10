@@ -1,0 +1,5 @@
+/.build/
+/release/
+*.log
+__pycache__/
+*.py[cod]
