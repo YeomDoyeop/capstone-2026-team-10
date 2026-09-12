@@ -163,6 +163,7 @@ def test_phase_one_info_json_removes_comment_bodies_but_keeps_count(
 ):
     monkeypatch.setenv("MEDIA_ROOT", str(tmp_path))
     video_id = "abc123def45"
+    extraction_calls = 0
 
     class Downloader:
         def __init__(self, _options):
@@ -175,6 +176,8 @@ def test_phase_one_info_json_removes_comment_bodies_but_keeps_count(
             return False
 
         def extract_info(self, _url, download=True):
+            nonlocal extraction_calls
+            extraction_calls += 1
             return {
                 "id": video_id,
                 "title": "title",
@@ -211,10 +214,27 @@ def test_phase_one_info_json_removes_comment_bodies_but_keeps_count(
     )
     assert saved["comment_count"] == 2
     assert "comments" not in saved
+    assert json.loads(
+        (
+            tmp_path
+            / "yt-data"
+            / video_id
+            / f"{video_id}.comments.json"
+        ).read_text(encoding="utf-8")
+    ) == [{"id": "one"}, {"id": "two"}]
     assert saved["chapters"] == [
         {"start_time": 0.0, "end_time": 90.0, "title": "오프닝"},
         {"start_time": 90.0, "end_time": 600.0, "title": "AI 본문"},
     ]
+    monkeypatch.setattr(
+        "app.services.live_youtube_service.YouTubeImporter.prepare_source_video",
+        lambda *_args, **_kwargs: {},
+    )
+    download_metadata_materials(
+        f"https://www.youtube.com/watch?v={video_id}",
+        {"comments": True, "chat": False, "subtitles": False, "captions": False},
+    )
+    assert extraction_calls == 1
 
 
 def test_comment_download_does_not_overwrite_info_json(tmp_path, monkeypatch):

@@ -584,8 +584,15 @@ def get_video_metadata(url: str, *, refresh: bool = True) -> dict:
         raise LiveYouTubeError("YouTube 메타데이터 형식이 올바르지 않습니다.")
     # writecomments=False는 별도 댓글 파일 생성을 막지만 yt-dlp 버전에
     # 따라 추출 결과 객체와 info.json에 comments 본문이 남을 수 있다.
-    # 1단계 메타데이터에는 개수만 유지하고 본문은 선택 수집 단계로 격리한다.
-    info.pop("comments", None)
+    # 이미 받은 댓글을 버리면 선택 수집 단계가 같은 댓글을 다시 요청하므로,
+    # comments.json 캐시로 먼저 승격한 뒤 메타데이터 본문에서 제거한다.
+    embedded_comments = info.pop("comments", None)
+    comments_path = output_dir / f"{video_id}.comments.json"
+    if isinstance(embedded_comments, list) and not comments_path.is_file():
+        comments_path.write_text(
+            json.dumps(embedded_comments, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     try:
         info = format_info_json(
             info_path,

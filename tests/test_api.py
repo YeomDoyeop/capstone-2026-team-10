@@ -18,6 +18,7 @@ from app.main import (
     get_current_user,
     get_youtube_metadata_material_job,
     index,
+    score_live_edit,
     start_live_edit,
     update_edit_segments,
 )
@@ -28,6 +29,7 @@ from app.schemas import (
     YouTubeMetadataMaterialsRequest,
 )
 from app.services.local_job_store import LocalJobStore
+from app.services.live_edit_pipeline import LiveEditCancelled
 
 
 def test_frontend_index_is_served():
@@ -63,6 +65,32 @@ def test_target_duration_accepts_every_second_from_one_minute_to_two_hours():
         )
 
 
+def test_scoring_can_only_start_from_completed_structure(monkeypatch):
+    job_id = "dQw4w9WgXcQ.structure"
+    LIVE_EDIT_JOBS[job_id] = {
+        "job_id": job_id,
+        "owner_id": "user-1",
+        "status": "awaiting_scoring",
+        "request": LiveEditRequest(
+            job_id=job_id,
+            vod_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ).model_dump(),
+    }
+
+    def discard_task(coroutine):
+        coroutine.close()
+
+    monkeypatch.setattr("app.main.asyncio.create_task", discard_task)
+    result = asyncio.run(
+        score_live_edit(job_id, "Bearer session", {"id": "user-1"}, 300)
+    )
+
+    assert result["status"] == "queued"
+    assert result["stop_after_structure"] is False
+    assert result["request"]["target_duration_seconds"] == 300
+    LIVE_EDIT_JOBS.pop(job_id, None)
+
+
 def test_whisper_auto_language_is_represented_by_an_omitted_language_hint():
     request = LiveEditRequest(
         job_id="test-job",
@@ -95,7 +123,9 @@ def test_workflow_uses_current_endpoints_and_restored_options():
         "/api/youtube/metadata/whisper-settings",
         "/api/youtube/metadata/whisper-transcript",
         "/api/youtube/metadata/whisper-transcript/start",
+        "/api/youtube/edit/script",
         "/api/youtube/edit/start",
+        "/api/youtube/edit/${job.job_id}/score",
         "transcript_language",
         "stt_language",
         "stt_initial_prompt",
@@ -107,6 +137,16 @@ def test_workflow_uses_current_endpoints_and_restored_options():
     assert "/subtitles" not in source
     assert "subtitle_offset_seconds" not in source
     assert "scriptSourceOptions" in source
+    assert "스크립트 문장" in source
+    assert "onClick={startAnalysis}" in source and "> 분할 </button>" in compact_source
+    assert "다음: 챕터 내 필수 관계 판별" in source
+    assert 'className="script-workflow-card"' in source
+    assert 'className="script-workflow-card scored-workflow-card"' in source
+    assert "onBlur={commitTargetDurationInput}" in source
+    assert 'chapter_split_mode: "automatic"' in source
+    assert 'label: "업로더 기준"' in source
+    assert 'label: "자동 분할"' in source
+    assert ".scored-workflow-card .review-layout > .preview-card { position: sticky;" in styles
     options_start = source.index("const scriptSourceOptions")
     options_end = source.index("function transitionToPhase", options_start)
     options = source[options_start:options_end]
@@ -183,7 +223,7 @@ def test_workflow_uses_current_endpoints_and_restored_options():
     assert "!materialSelections.subtitles && !materialSelections.captions" in source
     assert "const whisperActive = whisperEnabled || whisperRequired" in source
     assert "setWhisperEnabled(true)" in source
-    assert "setWhisperEnabled(requiresWhisper)" in source
+    assert "requiresWhisper || Boolean(body.default_whisper_cache_available)" in source
     assert ': "whisper_api"' in source
     assert "controlsLocked || whisperRequired" in source
     assert 'artifacts[0]?.kind || (whisperRequired ? "whisper" : null)' in source
@@ -194,8 +234,11 @@ def test_workflow_uses_current_endpoints_and_restored_options():
     assert "onClick={retryWhisperTranscript}" in source
     assert 'if (current.status === "paused") {' in source
     assert (
-        'if (await prepareWhisperTranscript()) transitionToPhase("analysis")' in source
+        'if (await prepareWhisperTranscript()) transitionToPhase("review")' in source
     )
+    assert '{phase === "review" && !review && (' in source
+    assert "{!structuredChapters.length && (" in source
+    assert 'onClick={() => changePhase("analysis")}' not in source
     assert ">\n            재시도\n          </button>" in source
     assert ">\n            분석 재개\n          </button>" not in source
     assert "disabled={busy}" in source and 'setSetting("llm_provider", value)' in source
@@ -569,8 +612,15 @@ def test_selection_render_persists_clips_and_sends_them_to_server(
             pass
 
         def rerender_from_selection(
-            self, _job_id, segment_ids, *, plan, progress_callback
+            self,
+            _job_id,
+            segment_ids,
+            *,
+            plan,
+            progress_callback,
+            cancel_callback,
         ):
+            cancel_callback()
             progress_callback(100, "렌더링 완료")
             return {
                 "selected_segment_ids": list(segment_ids),
@@ -620,4 +670,60 @@ def test_selection_render_persists_clips_and_sends_them_to_server(
         }
     ]
     assert job_id not in EDIT_JOB_LOCKS
+    LIVE_EDIT_JOBS.pop(job_id, None)
+
+
+def test_selection_render_cancel_preserves_the_users_latest_selection(
+    monkeypatch, tmp_path
+):
+    job_id = "selection-cancel"
+    candidates = [
+        {"segment_id": "ai-choice", "start": 0.0, "end": 10.0, "llm_score": 0.9},
+        {"segment_id": "user-choice", "start": 20.0, "end": 35.0, "llm_score": 0.5},
+    ]
+    LIVE_EDIT_JOBS[job_id] = {
+        "job_id": job_id,
+        "owner_id": "user-1",
+        "status": "awaiting_selection",
+        "phase": "selection",
+        "result": {
+            "analysis_plan": {
+                "candidates": candidates,
+                "recommended_segment_ids": ["ai-choice"],
+                "selected_segment_ids": ["ai-choice"],
+                "clips": [candidates[0]],
+            }
+        },
+    }
+
+    class CancelledPipeline:
+        def __init__(self, _media_root):
+            pass
+
+        def rerender_from_selection(self, *_args, **_kwargs):
+            raise LiveEditCancelled()
+
+    async def run_direct(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr("app.main.LiveEditPipeline", CancelledPipeline)
+    monkeypatch.setattr("app.main.asyncio.to_thread", run_direct)
+    monkeypatch.setattr("app.main.get_media_root", lambda: tmp_path)
+
+    asyncio.run(
+        _run_segment_selection_job(
+            job_id,
+            SegmentSelectionRequest(segment_ids=["user-choice"]),
+        )
+    )
+
+    job = LIVE_EDIT_JOBS[job_id]
+    assert job["status"] == "awaiting_selection"
+    assert job["result"]["analysis_plan"]["selected_segment_ids"] == [
+        "user-choice"
+    ]
+    assert job["result"]["analysis_plan"]["recommended_segment_ids"] == [
+        "ai-choice"
+    ]
+    assert job["result"]["analysis_plan"]["clips"] == [candidates[1]]
     LIVE_EDIT_JOBS.pop(job_id, None)

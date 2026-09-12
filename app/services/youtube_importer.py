@@ -16,34 +16,42 @@ from app.services.ytdlp_binary import YoutubeDL
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
 SUBTITLE_EXTENSIONS = {".vtt", ".srt", ".json3"}
+
 SUBTITLE_RATE_LIMIT_WARNING = (
     "Subtitle download was rate-limited by YouTube. "
     "The video was imported without subtitles."
 )
+
 FFMPEG_MISSING_WARNING = (
     "ffmpeg is not installed. Downloaded a single-file video stream; "
     "quality may be lower."
 )
+
 YTDLP_CLIENT_FALLBACK_WARNING = (
     "YouTube download required a fallback player client. "
     "Set YTDLP_COOKIES_FROM_BROWSER or YTDLP_COOKIEFILE if 403 continues."
 )
+
 YTDLP_COOKIE_WARNING = (
     "Browser cookie database could not be copied. "
     "Close the browser completely or use YTDLP_COOKIEFILE."
 )
+
 YTDLP_COOKIE_403_WARNING = (
     "YouTube rejected the cookie-authenticated stream with HTTP 403. "
     "Retried the download without browser cookies."
 )
+
 YTDLP_DRM_WARNING = (
     "YouTube marked this VOD as DRM protected. "
     "yt-dlp cannot download the protected stream; use an authorized local source video."
 )
+
 YTDLP_SEPARATE_STREAMS_WARNING = (
     "A combined video format was unavailable. Downloaded separate video and audio "
     "streams and merged them with ffmpeg."
 )
+
 YTDLP_STREAM_403_WARNING = (
     "YouTube metadata was readable, but the video stream returned HTTP 403. "
     "This is usually a player-client or PO Token restriction; use the web_embedded "

@@ -1,14 +1,17 @@
 import json
 
-from app.services.llm_analysis_service import (
-    CHAPTER_SYSTEM,
-    GENRE_GUIDES,
-    SECTION_SYSTEM,
-    SUBTITLE_SPLIT_SYSTEM,
-    WHISPER_SETTINGS_SYSTEM,
-    LLMAnalysisError,
-    LLMAnalysisService,
-)
+import pytest
+
+from app.services.llm_analysis_service import LLMAnalysisError, LLMAnalysisService
+from app.services.prompt_store import list_user_prompts, system_prompt
+
+CHAPTER_SYSTEM = system_prompt("chapter")
+SECTION_SYSTEM = system_prompt("section")
+SUBTITLE_SPLIT_SYSTEM = system_prompt("subtitle_split")
+WHISPER_SETTINGS_SYSTEM = system_prompt("whisper_settings")
+GENRE_GUIDES = {
+    item["id"]: str(item.get("criteria") or "") for item in list_user_prompts()
+}
 
 
 def test_prompts_define_summary_and_precise_score_contract():
@@ -102,12 +105,14 @@ def test_subtitle_split_requires_contiguous_word_ranges(monkeypatch):
 
     monkeypatch.setattr(agent, "_request_json", request)
     result = agent.split_subtitle_words(
-        [{"word": value} for value in ["하나", " 둘", " 셋", " 넷"]], 2
+        [{"word": value} for value in ["하나", " 둘", " 셋", " 넷"]]
     )
 
     assert result[-1]["end_word"] == 3
-    assert captured["prompt"]["target_count"] == 2
-    assert "20자" in SUBTITLE_SPLIT_SYSTEM
+    assert set(captured["prompt"]) == {"words"}
+    assert "목표 개수는 주어지지 않는다" in SUBTITLE_SPLIT_SYSTEM
+    assert "공백 제외 약 30자" in SUBTITLE_SPLIT_SYSTEM
+    assert "자막" in SUBTITLE_SPLIT_SYSTEM
 
 
 def test_subtitle_split_converts_boundary_indexes_to_contiguous_ranges(monkeypatch):
@@ -123,7 +128,6 @@ def test_subtitle_split_converts_boundary_indexes_to_contiguous_ranges(monkeypat
             {"word": value}
             for value in ["가나다", "라마", "바사", "아자", "차카", "타파하"]
         ],
-        3,
     )
 
     assert result == [
@@ -131,6 +135,21 @@ def test_subtitle_split_converts_boundary_indexes_to_contiguous_ranges(monkeypat
         {"start_word": 2, "end_word": 3},
         {"start_word": 4, "end_word": 5},
     ]
+
+
+def test_subtitle_split_accepts_no_boundary_when_llm_cannot_split(monkeypatch):
+    agent = object.__new__(LLMAnalysisService)
+    monkeypatch.setattr(
+        agent,
+        "_request_json",
+        lambda *_args, **kwargs: kwargs["validator"]({"indexes": []}),
+    )
+
+    result = agent.split_subtitle_words(
+        [{"word": value} for value in ["나누기", "어려운", "자막"]]
+    )
+
+    assert result == [{"start_word": 0, "end_word": 2}]
 
 
 def test_structure_requires_contiguous_ids_and_summaries(monkeypatch):
@@ -162,16 +181,16 @@ def test_score_sends_one_section_id_text_array_and_chapter_summary_per_chapter(
 ):
     agent = object.__new__(LLMAnalysisService)
     prompts = []
-    scores = iter(
-        [
-            {"items": [{"id": "a-1", "score": 721}, {"id": "a-2", "score": 814}]},
-            {"items": [{"id": "b-1", "score": 903}]},
-        ]
-    )
-
     def request(_system, prompt, **_kwargs):
-        prompts.append(json.loads(prompt))
-        return next(scores)
+        parsed = json.loads(prompt)
+        prompts.append(parsed)
+        base = 903 if parsed["chapter_summary"] == "둘째 챕터 요약" else 721
+        return {
+            "items": [
+                {"id": item["id"], "score": base + item["id"] * 93}
+                for item in parsed["sections"]
+            ]
+        }
 
     monkeypatch.setattr(agent, "_request_json", request)
     result = agent.score_sections(
@@ -196,17 +215,21 @@ def test_score_sends_one_section_id_text_array_and_chapter_summary_per_chapter(
             },
         ]
     )
+    criteria_profiles = [prompt.pop("criteria_profile") for prompt in prompts]
+    assert [profile["id"] for profile in criteria_profiles] == ["ai_news", "ai_news"]
+    assert all(profile["criteria"] for profile in criteria_profiles)
+    prompts.sort(key=lambda prompt: prompt["chapter_summary"], reverse=True)
     assert prompts == [
         {
             "chapter_summary": "첫 챕터 요약",
             "sections": [
-                {"id": "a-1", "text": "첫 섹션"},
-                {"id": "a-2", "text": "둘째 섹션"},
+                {"id": 0, "text": "첫 섹션"},
+                {"id": 1, "text": "둘째 섹션"},
             ],
         },
         {
             "chapter_summary": "둘째 챕터 요약",
-            "sections": [{"id": "b-1", "text": "다른 챕터"}],
+            "sections": [{"id": 0, "text": "다른 챕터"}],
         },
     ]
     assert [item["llm_score"] for item in result] == [0.721, 0.814, 0.903]
@@ -250,7 +273,7 @@ def test_score_rejects_wrong_score_count(monkeypatch):
     monkeypatch.setattr(
         agent,
         "_request_json",
-        lambda *_args, **_kwargs: {"items": [{"id": "a-1", "score": 900}]},
+        lambda *_args, **_kwargs: {"items": [{"id": 0, "score": 900}]},
     )
     try:
         agent.score_sections(
@@ -290,7 +313,7 @@ def test_request_json_retries_after_range_error():
     assert result[0]["start_id"] == 0 and agent.gateway.calls == 2
 
 
-def test_request_json_stops_after_twenty_invalid_responses():
+def test_request_json_stops_after_one_hundred_invalid_responses():
     class Gateway:
         def __init__(self):
             self.calls = 0
@@ -304,10 +327,10 @@ def test_request_json_stops_after_twenty_invalid_responses():
     try:
         agent._request_json("계약", "입력")
     except LLMAnalysisError as exc:
-        assert "스무 번" in str(exc)
+        assert "백 번" in str(exc)
     else:
         raise AssertionError("ten invalid responses must fail")
-    assert agent.gateway.calls == 20
+    assert agent.gateway.calls == 100
 
 
 def test_request_json_returns_last_contract_failure_reason():
@@ -323,22 +346,22 @@ def test_request_json_returns_last_contract_failure_reason():
             "계약",
             "입력",
             validator=lambda _raw: (_ for _ in ()).throw(
-                LLMAnalysisError("before_ids 방향 오류")
+                LLMAnalysisError("ids 시간순 오류")
             ),
         )
     except LLMAnalysisError as exc:
-        assert "before_ids 방향 오류" in str(exc)
+        assert "ids 시간순 오류" in str(exc)
     else:
         raise AssertionError("last validation reason must be exposed")
 
 
-def test_anchor_links_separate_before_and_after_ids_in_contract(monkeypatch):
+def test_anchor_links_use_index_array_contract(monkeypatch):
     agent = object.__new__(LLMAnalysisService)
     captured = {}
 
     def request(_system, _prompt, **kwargs):
         captured["schema"] = kwargs["response_schema"]
-        return kwargs["validator"]({"before_ids": ["s0"], "after_ids": ["s2"]})
+        return kwargs["validator"]({"indexes": [0, 2]})
 
     monkeypatch.setattr(agent, "_request_json", request)
 
@@ -353,9 +376,37 @@ def test_anchor_links_separate_before_and_after_ids_in_contract(monkeypatch):
     )
 
     assert result == ["s0", "s2"]
-    assert captured["schema"]["required"] == ["before_ids", "after_ids"]
-    assert captured["schema"]["properties"]["before_ids"]["maxItems"] == 2
-    assert captured["schema"]["properties"]["after_ids"]["maxItems"] == 2
+    assert captured["schema"]["required"] == ["indexes"]
+    indexes_schema = captured["schema"]["properties"]["indexes"]
+    assert indexes_schema["items"] == {"type": "integer"}
+    assert indexes_schema["uniqueItems"] is True
+
+
+def test_anchor_links_skip_llm_when_chapter_has_no_other_section(monkeypatch):
+    agent = object.__new__(LLMAnalysisService)
+    monkeypatch.setattr(
+        agent,
+        "_request_json",
+        lambda *_args, **_kwargs: pytest.fail("후보가 없으면 LLM을 호출하면 안 됩니다."),
+    )
+
+    assert agent.required_anchor_links(
+        "s1", "요약", [{"id": "s1", "text": "핵심"}]
+    ) == []
+
+
+def test_anchor_links_allow_returned_anchor_id(monkeypatch):
+    agent = object.__new__(LLMAnalysisService)
+
+    def request(_system, _prompt, **kwargs):
+        return kwargs["validator"]({"indexes": [1]})
+
+    monkeypatch.setattr(agent, "_request_json", request)
+    assert agent.required_anchor_links(
+        "s1",
+        "요약",
+        [{"id": "s0", "text": "앞"}, {"id": "s1", "text": "핵심"}],
+    ) == ["s1"]
 
 
 def test_chapter_score_requires_an_integer_in_range():
@@ -457,7 +508,7 @@ def test_parallel_section_work_never_requests_more_than_ten_workers(monkeypatch)
     monkeypatch.setattr(
         agent,
         "_request_json",
-        lambda *_args, **_kwargs: {"items": [{"id": "section", "score": 500}]},
+        lambda *_args, **_kwargs: {"items": [{"id": 0, "score": 500}]},
     )
 
     agent.score_sections(
@@ -487,7 +538,7 @@ def test_parallel_chapter_splitting_never_requests_more_than_ten_workers(monkeyp
     monkeypatch.setattr(service_module, "ThreadPoolExecutor", RecordingExecutor)
 
     def request(system, _prompt, **kwargs):
-        if system == CHAPTER_SYSTEM:
+        if system == service_module.system_prompt("chapter"):
             raw = {
                 "chapters": [
                     {

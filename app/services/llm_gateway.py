@@ -9,6 +9,7 @@ import requests
 from app.config import get_ave_server_url
 
 SUPPORTED_LLM_PROVIDERS = ("gemini", "deepseek")
+
 # 공급자별 한도는 공통 분석 계약과 분리한다. 실제 계정 전체의 RPM 제한은
 # AVE Server도 적용해야 하지만, 클라이언트는 한 작업 안에서 이를 넘지 않는다.
 LLM_PROVIDER_EXECUTION_LIMITS = {

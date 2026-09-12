@@ -14,7 +14,7 @@ from app.services.live_edit_pipeline import (
     SUBTITLE_LINE_WIDTH,
     SUBTITLE_MARGIN_BOTTOM,
     SUBTITLE_MIN_DURATION_SECONDS,
-    WHISPER_LONG_SEGMENT_CHARACTERS,
+    WHISPER_SPLIT_MIN_CHARACTERS,
     WHISPER_PRIORITY_GAP_SECONDS,
     _adjust_chat_timestamp,
     _apply_final_scores,
@@ -27,6 +27,8 @@ from app.services.live_edit_pipeline import (
     _heatmap_section_score,
     _select_clips,
     _select_coherent_clips,
+    _shared_whisper_source_path,
+    _shared_whisper_transcript_path,
     _split_whisper_segment,
     _split_whisper_segments_parallel,
     _time_seconds,
@@ -35,6 +37,7 @@ from app.services.live_edit_pipeline import (
     _whisper_transcript_path,
     _write_json_atomic,
     fixed_whisper_initial_prompt,
+    has_default_whisper_transcript_cache,
     write_selected_subtitles,
 )
 from app.services.live_youtube_service import LiveYouTubeError, load_prepared_transcript
@@ -88,10 +91,206 @@ def test_whisper_transcript_path_is_scoped_to_job(tmp_path):
     )
 
 
+def test_shared_whisper_source_path_is_stable_for_the_same_settings(tmp_path):
+    request = {
+        "video_id": "dQw4w9WgXcQ",
+        "audio_size": 123,
+        "audio_mtime_ns": 456,
+        "language": "ko",
+        "initial_prompt": "",
+        "hotwords": "OpenAI",
+        "speed": 1.0,
+        "engine": "whisperx-aligned-word-v1",
+        "alignment": "ctc-forced-alignment-with-words",
+    }
+
+    first = _shared_whisper_source_path(tmp_path, "dQw4w9WgXcQ", request)
+    second = _shared_whisper_source_path(
+        tmp_path, "dQw4w9WgXcQ", dict(reversed(list(request.items())))
+    )
+    changed = _shared_whisper_source_path(
+        tmp_path, "dQw4w9WgXcQ", {**request, "speed": 2.0}
+    )
+
+    assert first == second
+    assert first != changed
+    assert first.parent == tmp_path / "yt-edit" / "dQw4w9WgXcQ" / "whisper-cache"
+
+
+def test_default_whisper_cache_is_detected_only_for_default_settings(tmp_path):
+    video_id = "dQw4w9WgXcQ"
+    request = {
+        "video_id": video_id,
+        "audio_size": 123,
+        "audio_mtime_ns": 456,
+        "language": "ko",
+        "initial_prompt": "",
+        "hotwords": "",
+        "speed": 1.0,
+        "engine": "whisperx-aligned-word-v1",
+        "alignment": "ctc-forced-alignment-with-words",
+    }
+    path = _shared_whisper_source_path(tmp_path, video_id, request)
+    _write_json_atomic(
+        path,
+        {
+            "request": request,
+            "engine": request["engine"],
+            "alignment": request["alignment"],
+            "segments": [{"start": 0, "end": 1, "text": "캐시"}],
+        },
+    )
+
+    assert has_default_whisper_transcript_cache(tmp_path, video_id) is True
+    request["speed"] = 1.5
+    _write_json_atomic(
+        path,
+        {
+            "request": request,
+            "engine": "whisperx-aligned-word-v1",
+            "alignment": "ctc-forced-alignment-with-words",
+            "segments": [{"start": 0, "end": 1, "text": "캐시"}],
+        },
+    )
+    assert has_default_whisper_transcript_cache(tmp_path, video_id) is False
+
+
+def test_whisper_reuses_matching_video_level_source_cache(tmp_path, monkeypatch):
+    video_id = "dQw4w9WgXcQ"
+    audio = tmp_path / "source.mp3"
+    audio.write_bytes(b"same audio")
+    audio_stat = audio.stat()
+    request = {
+        "video_id": video_id,
+        "audio_size": audio_stat.st_size,
+        "audio_mtime_ns": audio_stat.st_mtime_ns,
+        "language": "ko",
+        "initial_prompt": "",
+        "hotwords": "",
+        "speed": 1.0,
+        "engine": "whisperx-aligned-word-v1",
+        "alignment": "ctc-forced-alignment-with-words",
+    }
+    shared = _shared_whisper_source_path(tmp_path, video_id, request)
+    _write_json_atomic(
+        shared,
+        {
+            "request": request,
+            "language": "ko",
+            "engine": request["engine"],
+            "alignment": request["alignment"],
+            "segments": [{"start": 0.0, "end": 1.0, "text": "재사용 문장"}],
+        },
+    )
+    monkeypatch.setattr(
+        live_edit_pipeline.YouTubeImporter,
+        "prepare_best_audio",
+        lambda *_args, **_kwargs: audio,
+    )
+    monkeypatch.setattr(
+        live_edit_pipeline,
+        "upload_audio_for_transcription",
+        lambda *_args, **_kwargs: pytest.fail("공유 캐시가 있으면 업로드하면 안 됩니다."),
+    )
+
+    result = LiveEditPipeline(tmp_path).prepare_whisper_transcript(
+        job_id="new-job",
+        vod_url=f"https://www.youtube.com/watch?v={video_id}",
+        llm_provider="deepseek",
+        stt_language="ko",
+        stt_initial_prompt="",
+        stt_hotwords="",
+        stt_speed=1.0,
+        server_access_token="Bearer session",
+    )
+
+    assert result["segment_count"] == 1
+    job_source = tmp_path / "yt-edit" / "new-job" / "new-job.whisper-source.json"
+    assert json.loads(job_source.read_text(encoding="utf-8"))["segments"][0][
+        "text"
+    ] == "재사용 문장"
+
+
+def test_whisper_reuses_video_level_sentence_split_cache(tmp_path, monkeypatch):
+    video_id = "dQw4w9WgXcQ"
+    audio = tmp_path / "source.mp3"
+    audio.write_bytes(b"same audio")
+    audio_stat = audio.stat()
+    request = {
+        "video_id": video_id,
+        "audio_size": audio_stat.st_size,
+        "audio_mtime_ns": audio_stat.st_mtime_ns,
+        "language": "ko",
+        "initial_prompt": "",
+        "hotwords": "",
+        "speed": 1.0,
+        "engine": "whisperx-aligned-word-v1",
+        "alignment": "ctc-forced-alignment-with-words",
+    }
+    source_path = _shared_whisper_source_path(tmp_path, video_id, request)
+    long_segment = {
+        "start": 0.0,
+        "end": 2.0,
+        "text": "가" * 30,
+        "words": [
+            {"word": "가" * 15, "start": 0.0, "end": 0.9},
+            {"word": "가" * 15, "start": 1.0, "end": 2.0},
+        ],
+    }
+    _write_json_atomic(
+        source_path,
+        {
+            "request": request,
+            "engine": request["engine"],
+            "alignment": request["alignment"],
+            "segments": [long_segment],
+        },
+    )
+    split_calls = 0
+
+    def split_once(*_args, **_kwargs):
+        nonlocal split_calls
+        split_calls += 1
+        return [{"start": 0.0, "end": 2.0, "text": "분할 결과"}]
+
+    monkeypatch.setattr(
+        live_edit_pipeline.YouTubeImporter,
+        "prepare_best_audio",
+        lambda *_args, **_kwargs: audio,
+    )
+    monkeypatch.setattr(
+        live_edit_pipeline, "_split_whisper_segments_parallel", split_once
+    )
+
+    pipeline = LiveEditPipeline(tmp_path)
+    arguments = {
+        "vod_url": f"https://www.youtube.com/watch?v={video_id}",
+        "llm_provider": "deepseek",
+        "stt_language": "ko",
+        "stt_initial_prompt": "",
+        "stt_hotwords": "",
+        "stt_speed": 1.0,
+        "server_access_token": "Bearer session",
+    }
+    pipeline.prepare_whisper_transcript(job_id="first-job", **arguments)
+    pipeline.prepare_whisper_transcript(job_id="second-job", **arguments)
+
+    assert split_calls == 1
+    shared_transcript, _ = _shared_whisper_transcript_path(
+        tmp_path, video_id, request, "deepseek"
+    )
+    assert shared_transcript.is_file()
+    second = json.loads(
+        (tmp_path / "yt-edit" / "second-job" / "second-job.whisper-transcript.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert second["segments"] == [{"start": 0.0, "end": 2.0, "text": "분할 결과"}]
+
+
 def test_long_whisper_segment_uses_midpoint_between_adjacent_words():
     class Analysis:
-        def split_subtitle_words(self, _words, target_count, **_kwargs):
-            assert target_count == 2
+        def split_subtitle_words(self, _words, **_kwargs):
             return [{"start_word": 0, "end_word": 1}, {"start_word": 2, "end_word": 3}]
 
     text = "가나다라마바사아 아자차카타파하자 차카타파하가나다라 타파하가나다라마바사."
@@ -117,6 +316,32 @@ def test_long_whisper_segment_uses_midpoint_between_adjacent_words():
     assert result[1]["text"] == "차카타파하가나다라 타파하가나다라마바사."
 
 
+def test_whisper_segment_with_exactly_thirty_characters_uses_llm_split():
+    class Analysis:
+        called = False
+
+        def split_subtitle_words(self, _words, **_kwargs):
+            self.called = True
+            return [{"start_word": 0, "end_word": 0}, {"start_word": 1, "end_word": 1}]
+
+    analysis = Analysis()
+    result = _split_whisper_segment(
+        {
+            "start": 1.0,
+            "end": 3.0,
+            "text": f'{"가" * 15} {"나" * 15}',
+            "words": [
+                {"start": 1.0, "end": 1.9, "word": "가" * 15},
+                {"start": 2.0, "end": 3.0, "word": "나" * 15},
+            ],
+        },
+        analysis,
+    )
+
+    assert analysis.called is True
+    assert len(result) == 2
+
+
 def test_long_whisper_segment_prioritizes_silent_gap_without_midpoint():
     class Analysis:
         def split_subtitle_words(self, *_args, **_kwargs):
@@ -137,7 +362,7 @@ def test_long_whisper_segment_prioritizes_silent_gap_without_midpoint():
         Analysis(),
     )
 
-    assert WHISPER_LONG_SEGMENT_CHARACTERS == 25
+    assert WHISPER_SPLIT_MIN_CHARACTERS == 30
     assert WHISPER_PRIORITY_GAP_SECONDS == 0.5
     assert result[0]["end"] == 2.7
     assert result[1]["start"] == 3.3
@@ -366,14 +591,14 @@ def test_coherent_selection_preserves_anchor_and_expands_only_required_links():
     ]
     analysis = Analysis()
 
-    selected, reviews = _select_coherent_clips(sections, 60, analysis)
+    selected, reviews = _select_coherent_clips(sections, 59, analysis)
 
     assert [item["segment_id"] for item in selected] == ["s0", "s1", "s2"]
     assert analysis.calls == ["s1"]
     assert reviews == []
 
 
-def test_coherent_selection_calls_each_chapter_only_once_and_moves_to_next_ranked_chapter():
+def test_coherent_selection_checks_ranked_anchors_even_in_the_same_chapter():
     class Analysis:
         def __init__(self):
             self.calls = []
@@ -410,10 +635,48 @@ def test_coherent_selection_calls_each_chapter_only_once_and_moves_to_next_ranke
     ]
     analysis = Analysis()
 
-    selected, _reviews = _select_coherent_clips(sections, 60, analysis)
+    selected, _reviews = _select_coherent_clips(sections, 59, analysis)
 
-    assert [item["segment_id"] for item in selected] == ["a-high", "b-high"]
-    assert analysis.calls == ["a-high", "b-high"]
+    assert [item["segment_id"] for item in selected] == [
+        "a-high",
+        "a-next",
+        "b-high",
+    ]
+    assert analysis.calls == ["a-high", "a-next", "b-high"]
+
+
+def test_anchor_link_parallelism_tracks_quarter_of_remaining_sections(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor as RealExecutor
+
+    worker_counts = []
+
+    class RecordingExecutor(RealExecutor):
+        def __init__(self, max_workers, *args, **kwargs):
+            worker_counts.append(max_workers)
+            super().__init__(max_workers=max_workers, *args, **kwargs)
+
+    class Analysis:
+        _max_parallel_requests = 10
+
+        def required_anchor_links(self, *_args, **_kwargs):
+            return []
+
+    monkeypatch.setattr(live_edit_pipeline, "ThreadPoolExecutor", RecordingExecutor)
+    sections = [
+        {
+            "segment_id": f"s{index}",
+            "chapter_id": "c0",
+            "start": index * 10.0,
+            "end": (index + 1) * 10.0,
+            "text": str(index),
+            "final_score": 1.0 - index / 100,
+        }
+        for index in range(10)
+    ]
+
+    _select_coherent_clips(sections, 1_000, Analysis())
+
+    assert worker_counts == [3, 2, 2, 1, 1, 1]
 
 
 def test_atomic_json_write_retries_transient_windows_access_denial(
@@ -536,6 +799,90 @@ def test_auto_rendering_falls_back_to_cpu_after_all_gpus_fail(monkeypatch, tmp_p
 
     assert attempts == ["h264_nvenc", "h264_amf", None]
     assert backend == "CPU (libx264)"
+
+
+def test_render_combines_clips_and_subtitles_in_one_ffmpeg_pass(monkeypatch, tmp_path):
+    subtitles = tmp_path / "captions.srt"
+    subtitles.write_text("1\n00:00:00,000 --> 00:00:01,000\n자막\n", encoding="utf-8")
+    commands = []
+
+    def capture(command, **kwargs):
+        commands.append((command, kwargs))
+
+    monkeypatch.setattr(live_edit_pipeline, "_ffmpeg_binary", lambda: "ffmpeg")
+    monkeypatch.setattr(live_edit_pipeline, "_run_ffmpeg", capture)
+
+    live_edit_pipeline._render_final(
+        tmp_path / "source.mp4",
+        [{"start": 10.0, "end": 12.0}],
+        tmp_path / "output.mp4",
+        subtitles,
+        encoder="h264_amf",
+    )
+
+    assert len(commands) == 1
+    command, options = commands[0]
+    filter_graph = command[command.index("-filter_complex") + 1]
+    assert "[0:v]select='between(t\\,10.000000\\,12.000000)'" in filter_graph
+    assert "setpts=N/FRAME_RATE/TB[selectedv]" in filter_graph
+    assert "[0:a]aselect='between(t\\,10.000000\\,12.000000)'" in filter_graph
+    assert "asetpts=N/SR/TB[a]" in filter_graph
+    assert "[selectedv]subtitles=filename=" in filter_graph
+    assert command[command.index("-i") - 2 : command.index("-i")] == [
+        "-t",
+        "12.000000",
+    ]
+    assert command[-1] == str(tmp_path / "output.mp4")
+    assert options["duration_seconds"] == 2.0
+
+
+def test_render_balances_large_selection_expression(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(live_edit_pipeline, "_ffmpeg_binary", lambda: "ffmpeg")
+    monkeypatch.setattr(
+        live_edit_pipeline,
+        "_run_ffmpeg",
+        lambda command, **_kwargs: commands.append(command),
+    )
+    clips = [
+        {"start": float(index * 10), "end": float(index * 10 + 5)}
+        for index in range(256)
+    ]
+
+    live_edit_pipeline._render_final(
+        tmp_path / "source.mp4", clips, tmp_path / "output.mp4"
+    )
+
+    filter_graph = commands[0][commands[0].index("-filter_complex") + 1]
+    selection = filter_graph.split("select='", 1)[1].split("',setpts", 1)[0]
+    assert selection.count("between(") == 256
+    assert selection.count("(") > 256
+    assert selection.startswith("((((((((between(")
+
+
+def test_render_sorts_and_merges_overlapping_selection_intervals(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(live_edit_pipeline, "_ffmpeg_binary", lambda: "ffmpeg")
+    monkeypatch.setattr(
+        live_edit_pipeline,
+        "_run_ffmpeg",
+        lambda command, **_kwargs: commands.append(command),
+    )
+
+    live_edit_pipeline._render_final(
+        tmp_path / "source.mp4",
+        [
+            {"start": 20.0, "end": 25.0},
+            {"start": 10.0, "end": 15.0},
+            {"start": 14.0, "end": 21.0},
+        ],
+        tmp_path / "output.mp4",
+    )
+
+    filter_graph = commands[0][commands[0].index("-filter_complex") + 1]
+    selection = filter_graph.split("select='", 1)[1].split("',setpts", 1)[0]
+    assert selection == "between(t\\,10.000000\\,25.000000)"
+    assert commands[0][commands[0].index("-i") - 1] == "25.000000"
 
 
 def test_prepared_transcript_uses_the_requested_language(tmp_path, monkeypatch):

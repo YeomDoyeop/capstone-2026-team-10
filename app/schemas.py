@@ -55,7 +55,9 @@ class LiveEditRequest(BaseModel):
     )
     llm_provider: Literal["gemini", "deepseek"] = "deepseek"
     genre: Literal["ai_news", "stock", "game"] = "ai_news"
+    criteria_prompt: str = Field(default="ai_news", pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     target_duration_seconds: int = Field(default=600, ge=60, le=7200)
+    chapter_split_mode: Literal["uploader", "automatic"] = "automatic"
     use_timestamp_comments: bool = False
     use_chat_score: bool = False
     transcription_source: Literal[
@@ -66,6 +68,15 @@ class LiveEditRequest(BaseModel):
     stt_initial_prompt: str | None = Field(default=None, max_length=1_000)
     stt_hotwords: str | None = Field(default=None, max_length=1_000)
     stt_speed: Literal[1.0, 1.5, 2.0] = 1.0
+
+
+class ScriptPreviewRequest(BaseModel):
+    job_id: str = Field(..., min_length=1, max_length=200)
+    vod_url: str = Field(..., min_length=1)
+    transcription_source: Literal[
+        "youtube_caption", "youtube_subtitle", "whisper_api"
+    ]
+    transcript_language: str | None = Field(default=None, min_length=1, max_length=40)
 
 
 class SegmentSelectionRequest(BaseModel):

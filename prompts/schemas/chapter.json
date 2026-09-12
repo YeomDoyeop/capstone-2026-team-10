@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "chapters"
+  ],
+  "properties": {
+    "chapters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "start_id",
+          "end_id",
+          "summary",
+          "score"
+        ],
+        "properties": {
+          "start_id": {
+            "type": "integer"
+          },
+          "end_id": {
+            "type": "integer"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000
+          }
+        }
+      }
+    }
+  }
+}

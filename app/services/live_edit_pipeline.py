@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -37,10 +38,13 @@ SUBTITLE_FONT_SIZE = 16
 SUBTITLE_MARGIN_BOTTOM = 12
 SUBTITLE_LINE_WIDTH = 30
 SUBTITLE_MIN_DURATION_SECONDS = 0.08
-WHISPER_LONG_SEGMENT_CHARACTERS = 25
-WHISPER_SPLIT_TARGET_CHARACTERS = 20
+WHISPER_SPLIT_MIN_CHARACTERS = 30
 WHISPER_PRIORITY_GAP_SECONDS = 0.5
+WHISPER_ENGINE = "whisperx-aligned-word-v1"
+WHISPER_ALIGNMENT = "ctc-forced-alignment-with-words"
+WHISPER_SPLIT_CONTRACT = "autonomous-subtitle-word-boundary-v5"
 CHAT_REACTION_OFFSET_SECONDS = 3.0
+
 SECTION_SCORE_WEIGHTS = {
     "chapter_llm_score": 0.15,
     "llm_score": 0.18,
@@ -49,12 +53,14 @@ SECTION_SCORE_WEIGHTS = {
     "comment_score": 0.20,
     "volume_score": 0.10,
 }
+
 WHISPER_PUNCTUATION_PROMPTS = {
     "ko": "문장은 자연스럽게 이어지고, 의미가 바뀌면 정확히 구분됩니다.",
     "en": "Sentences flow naturally, and punctuation is used accurately.",
     "zh": "句子自然连贯，语义变化时会准确断句。",
     "ja": "文章は自然に続き、意味の変化に合わせて正確に区切られます。",
 }
+
 from app.services.llm_analysis_service import LLMAnalysisError, LLMAnalysisService
 from app.services.youtube_importer import YouTubeImporter, YouTubeImportError
 from app.services.live_youtube_service import (
@@ -114,6 +120,81 @@ def _whisper_transcript_path(media_root: Path, job_id: str) -> Path:
     if not job_id or Path(job_id).name != job_id:
         raise LiveEditPipelineError("잘못된 편집 작업 ID입니다.")
     return media_root / "yt-edit" / job_id / f"{job_id}.whisper-transcript.json"
+
+
+def _shared_whisper_source_path(
+    media_root: Path, video_id: str, request_fingerprint: dict[str, Any]
+) -> Path:
+    """Return a video-level WhisperX cache path for one exact STT request."""
+
+    digest = hashlib.sha256(
+        json.dumps(
+            request_fingerprint,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return media_root / "yt-edit" / video_id / "whisper-cache" / f"{digest}.json"
+
+
+def _shared_whisper_transcript_path(
+    media_root: Path,
+    video_id: str,
+    request_fingerprint: dict[str, Any],
+    llm_provider: str,
+) -> tuple[Path, dict[str, Any]]:
+    """같은 원본 전사와 분할 계약이 공유하는 최종 자막 캐시 경로다."""
+
+    split_request = {
+        "source_request": request_fingerprint,
+        "llm_provider": llm_provider,
+        "split_contract": WHISPER_SPLIT_CONTRACT,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            split_request,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    path = (
+        media_root
+        / "yt-edit"
+        / video_id
+        / "whisper-cache"
+        / f"{digest}.transcript.json"
+    )
+    return path, split_request
+
+
+def has_default_whisper_transcript_cache(media_root: Path, video_id: str) -> bool:
+    """기본 STT 설정으로 완료된 영상 공유 캐시가 있는지 확인한다."""
+
+    cache_dir = media_root / "yt-edit" / video_id / "whisper-cache"
+    for path in cache_dir.glob("*.json"):
+        try:
+            candidate = json.loads(path.read_text(encoding="utf-8"))
+            request = candidate.get("request")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            continue
+        if (
+            isinstance(request, dict)
+            and request.get("video_id") == video_id
+            and request.get("language") == "ko"
+            and request.get("initial_prompt") in (None, "")
+            and request.get("hotwords") in (None, "")
+            and request.get("speed") == 1.0
+            and request.get("engine") == WHISPER_ENGINE
+            and request.get("alignment") == WHISPER_ALIGNMENT
+            and candidate.get("engine") == WHISPER_ENGINE
+            and candidate.get("alignment") == WHISPER_ALIGNMENT
+            and isinstance(candidate.get("segments"), list)
+            and candidate["segments"]
+        ):
+            return True
+    return False
 
 
 def _nonspace_length(value: str) -> int:
@@ -477,7 +558,7 @@ def _split_whisper_segment(
     text = str(segment.get("text") or "").strip()
     words = segment.get("words")
     if (
-        _nonspace_length(text) <= WHISPER_LONG_SEGMENT_CHARACTERS
+        _nonspace_length(text) < WHISPER_SPLIT_MIN_CHARACTERS
         or not isinstance(words, list)
         or len(words) < 2
     ):
@@ -529,23 +610,11 @@ def _split_whisper_segment(
         )
         group_text = text[group_text_start:group_text_end].strip()
         if (
-            _nonspace_length(group_text) > WHISPER_LONG_SEGMENT_CHARACTERS
+            _nonspace_length(group_text) >= WHISPER_SPLIT_MIN_CHARACTERS
             and len(group_words) >= 2
         ):
-            target_count = min(
-                len(group_words),
-                max(
-                    2,
-                    (
-                        _nonspace_length(group_text)
-                        + WHISPER_SPLIT_TARGET_CHARACTERS // 2
-                    )
-                    // WHISPER_SPLIT_TARGET_CHARACTERS,
-                ),
-            )
             parts = analysis_service.split_subtitle_words(
                 group_words,
-                target_count,
                 cancel_callback=cancel_callback,
             )
             word_ranges.extend(
@@ -736,39 +805,58 @@ def _select_coherent_clips(
         key=lambda item: (-float(item.get("final_score", 0.0)), float(item["start"])),
     )
     selected_ids: set[str] = set()
-    processed_chapter_ids: set[str] = set()
-    lower = max(0.0, target_seconds - 30.0)
 
     def duration(ids: set[str]) -> float:
         return sum(
             float(by_id[value]["end"]) - float(by_id[value]["start"]) for value in ids
         )
 
-    total_chapters = len(chapter_sections)
-    for anchor in ranked:
+    def resolve(anchor: dict[str, Any]) -> tuple[str, list[str]]:
         if cancel_callback:
             cancel_callback()
         anchor_id = str(anchor["segment_id"])
         chapter_id = str(anchor.get("chapter_id") or "")
-        if chapter_id in processed_chapter_ids:
-            continue
-        processed_chapter_ids.add(chapter_id)
         peers = chapter_sections[chapter_id]
         relation_rows = [
             {"id": str(item["segment_id"]), "text": str(item.get("text") or "")}
             for item in peers
         ]
-        required_ids = analysis_service.required_anchor_links(
-            anchor_id,
-            str(anchor.get("chapter_summary") or ""),
-            relation_rows,
-            cancel_callback=cancel_callback,
+        return anchor_id, analysis_service.required_anchor_links(
+            anchor_id, str(anchor.get("chapter_summary") or ""), relation_rows,
+            cancel_callback=cancel_callback
         )
-        selected_ids.update([anchor_id, *required_ids])
-        if progress_callback:
-            progress_callback(len(processed_chapter_ids), total_chapters)
-        if duration(selected_ids) >= lower:
-            break
+
+    total_anchors = len(ranked)
+    processed_anchors = 0
+    provider_limit = max(
+        1, int(getattr(analysis_service, "_max_parallel_requests", 1))
+    )
+    while processed_anchors < total_anchors:
+        if cancel_callback:
+            cancel_callback()
+        remaining = total_anchors - processed_anchors
+        parallel_count = min(provider_limit, math.ceil(remaining / 4))
+        batch = ranked[processed_anchors : processed_anchors + parallel_count]
+        resolved: dict[str, list[str]] = {}
+        with ThreadPoolExecutor(max_workers=parallel_count) as executor:
+            futures = [executor.submit(resolve, anchor) for anchor in batch]
+            for future in as_completed(futures):
+                anchor_id, required_ids = future.result()
+                resolved[anchor_id] = required_ids
+                if progress_callback:
+                    progress_callback(
+                        processed_anchors + len(resolved), total_anchors
+                    )
+        for anchor in batch:
+            anchor_id = str(anchor["segment_id"])
+            selected_ids.update([anchor_id, *resolved[anchor_id]])
+            if duration(selected_ids) > target_seconds:
+                return [
+                    item
+                    for item in ordered
+                    if str(item["segment_id"]) in selected_ids
+                ], []
+        processed_anchors += len(batch)
     return [item for item in ordered if str(item["segment_id"]) in selected_ids], []
 
 
@@ -832,23 +920,58 @@ def write_selected_subtitles(
     return len(entries)
 
 
-def _run_ffmpeg(command: list[str]) -> None:
+def _run_ffmpeg(
+    command: list[str],
+    *,
+    progress_callback: Callable[[float], None] | None = None,
+    duration_seconds: float | None = None,
+    cancel_callback: Callable[[], None] | None = None,
+) -> None:
+    process: subprocess.Popen[str] | None = None
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
+        process = subprocess.Popen(
+            [command[0], "-nostdin", "-progress", "pipe:1", "-nostats", *command[1:]],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
-            check=False,
         )
     except OSError as exc:
         raise LiveEditPipelineError(
             "ffmpeg를 실행할 수 없습니다. PATH에 ffmpeg를 추가하세요."
         ) from exc
-    if completed.returncode != 0:
+
+    output_tail: list[str] = []
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output_tail.append(line)
+            if len(output_tail) > 200:
+                del output_tail[:100]
+            if cancel_callback:
+                cancel_callback()
+            if progress_callback and duration_seconds and line.startswith("out_time="):
+                match = re.match(r"out_time=(\d+):(\d+):([\d.]+)", line.strip())
+                if match:
+                    elapsed = (
+                        int(match.group(1)) * 3600
+                        + int(match.group(2)) * 60
+                        + float(match.group(3))
+                    )
+                    progress_callback(min(1.0, elapsed / duration_seconds))
+        returncode = process.wait()
+    except BaseException:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        raise
+    if returncode != 0:
         raise LiveEditPipelineError(
-            completed.stderr[-3000:] or "ffmpeg 편집에 실패했습니다."
+            "".join(output_tail)[-3000:] or "ffmpeg 편집에 실패했습니다."
         )
 
 
@@ -973,13 +1096,7 @@ def _render_acceleration_label(encoder: str | None) -> str:
     return labels.get(encoder or "", "CPU (libx264)")
 
 
-def _burn_subtitles(
-    source: Path,
-    subtitles: Path,
-    output: Path,
-    encoder: str | None = None,
-) -> None:
-    ffmpeg = _ffmpeg_binary()
+def _subtitle_filter(subtitles: Path) -> str:
     if not subtitles.is_file():
         raise LiveEditPipelineError(
             f"FFmpeg 자막 입력 파일을 찾을 수 없습니다: {subtitles}"
@@ -993,35 +1110,11 @@ def _burn_subtitles(
         .replace(":", r"\:")
         .replace("'", r"\'")
     )
-    subtitle_filter = (
+    return (
         f"subtitles=filename='{filter_path}':"
         f"force_style='FontName={SUBTITLE_FONT_NAME},FontSize={SUBTITLE_FONT_SIZE},"
         f"Outline=1,Shadow=0,MarginV={SUBTITLE_MARGIN_BOTTOM}'"
     )
-    try:
-        _run_ffmpeg(
-            [
-                ffmpeg,
-                "-y",
-                *_hardware_decoding_args(encoder),
-                "-i",
-                str(source),
-                "-vf",
-                subtitle_filter,
-                *_video_encoding_args(encoder),
-                "-c:a",
-                "aac",
-                "-b:a",
-                "160k",
-                "-movflags",
-                "+faststart",
-                str(output),
-            ]
-        )
-    except LiveEditPipelineError as exc:
-        raise LiveEditPipelineError(
-            f"FFmpeg 자막 합성에 실패했습니다 (자막 파일: {subtitles.resolve()}, {subtitles.stat().st_size} bytes): {exc}"
-        ) from exc
 
 
 def render_final(
@@ -1031,6 +1124,7 @@ def render_final(
     subtitles: Path | None = None,
     progress_callback: Callable[[float], None] | None = None,
     status_callback: Callable[[str], None] | None = None,
+    cancel_callback: Callable[[], None] | None = None,
 ) -> str:
     candidates = _render_encoder_candidates()
     for index, encoder in enumerate(candidates):
@@ -1049,10 +1143,18 @@ def render_final(
                 )
         try:
             _render_final(
-                source, clips, attempt_output, subtitles, progress_callback, encoder
+                source,
+                clips,
+                attempt_output,
+                subtitles,
+                progress_callback,
+                cancel_callback,
+                encoder,
             )
             _copy_file_atomic(attempt_output, output)
             return _render_acceleration_label(encoder)
+        except LiveEditCancelled:
+            raise
         except LiveEditPipelineError:
             if encoder is None:
                 raise
@@ -1061,6 +1163,8 @@ def render_final(
                 status_callback(
                     f"{_render_acceleration_label(encoder)} 렌더링에 실패하여 {_render_acceleration_label(next_encoder)} 렌더링으로 다시 시도합니다."
                 )
+        finally:
+            attempt_output.unlink(missing_ok=True)
     raise LiveEditPipelineError("렌더링 인코더를 선택하지 못했습니다.")
 
 
@@ -1070,30 +1174,66 @@ def _render_final(
     output: Path,
     subtitles: Path | None = None,
     progress_callback: Callable[[float], None] | None = None,
+    cancel_callback: Callable[[], None] | None = None,
     encoder: str | None = None,
 ) -> None:
     ffmpeg = _ffmpeg_binary()
-    joined = output.with_name(f"{output.stem}.{uuid4().hex}.joined.mp4")
-    video_parts = []
-    audio_parts = []
-    for index, clip in enumerate(clips):
-        start, end = clip["start"], clip["end"]
-        video_parts.append(
-            f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{index}]"
-        )
-        audio_parts.append(
-            f"[0:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{index}]"
-        )
-    concat_inputs = "".join(f"[v{i}][a{i}]" for i in range(len(clips)))
-    filter_graph = (
-        ";".join(video_parts + audio_parts)
-        + f";{concat_inputs}concat=n={len(clips)}:v=1:a=1[v][a]"
+    # 같은 입력 패드를 여러 trim 필터에서 재사용하면 많은 구간에서 프레임이
+    # 각 소비자로 분산되어 영상 스트림만 조기에 끝날 수 있다. 원본은 한 번만
+    # 순차 디코딩하고 선택된 시간 범위의 프레임만 남긴 뒤 타임스탬프를 압축한다.
+    intervals: list[tuple[float, float]] = []
+    ordered_ranges = sorted(
+        (float(clip["start"]), float(clip["end"])) for clip in clips
+    )
+    for start, end in ordered_ranges:
+        if end <= start:
+            continue
+        if intervals and start <= intervals[-1][1]:
+            intervals[-1] = (intervals[-1][0], max(intervals[-1][1], end))
+        else:
+            intervals.append((start, end))
+    if not intervals:
+        raise LiveEditPipelineError("렌더링할 유효한 영상 구간이 없습니다.")
+
+    expressions = [
+        f"between(t\\,{start:.6f}\\,{end:.6f})" for start, end in intervals
+    ]
+    # FFmpeg는 a+b+c+...를 왼쪽으로 깊게 중첩된 AST로 만든다. 선택 구간이
+    # 많으면 필터 초기화 중 메모리 오류가 나므로 같은 합을 균형 트리로 구성한다.
+    while len(expressions) > 1:
+        expressions = [
+            (
+                f"({expressions[index]}+{expressions[index + 1]})"
+                if index + 1 < len(expressions)
+                else expressions[index]
+            )
+            for index in range(0, len(expressions), 2)
+        ]
+    selection = expressions[0]
+    has_subtitles = bool(
+        subtitles and subtitles.exists() and subtitles.stat().st_size > 0
+    )
+    selected_video_label = "selectedv" if has_subtitles else "v"
+    filter_parts = [
+        f"[0:v]select='{selection}',setpts=N/FRAME_RATE/TB[{selected_video_label}]",
+        f"[0:a]aselect='{selection}',asetpts=N/SR/TB[a]",
+    ]
+    if has_subtitles:
+        filter_parts.append(f"[selectedv]{_subtitle_filter(subtitles)}[v]")
+    filter_graph = ";".join(filter_parts)
+    duration_seconds = sum(
+        max(0.0, float(clip["end"]) - float(clip["start"])) for clip in clips
     )
     _run_ffmpeg(
         [
             ffmpeg,
             "-y",
             *_hardware_decoding_args(encoder),
+            # select/aselect만 사용하면 마지막 선택 구간이 끝난 뒤에도 원본
+            # 전체를 디코딩한다. 출력 진행률은 이미 98%인데 긴 원본을 끝까지
+            # 훑는 것처럼 보이지 않도록 필요한 마지막 시점에서 입력을 닫는다.
+            "-t",
+            f"{intervals[-1][1]:.6f}",
             "-i",
             str(source),
             "-filter_complex",
@@ -1109,15 +1249,12 @@ def _render_final(
             "160k",
             "-movflags",
             "+faststart",
-            str(joined),
-        ]
+            str(output),
+        ],
+        progress_callback=progress_callback,
+        duration_seconds=duration_seconds,
+        cancel_callback=cancel_callback,
     )
-    if progress_callback:
-        progress_callback(0.82)
-    if subtitles and subtitles.exists() and subtitles.stat().st_size > 0:
-        _burn_subtitles(joined, subtitles, output, encoder)
-    else:
-        shutil.copyfile(joined, output)
     if progress_callback:
         progress_callback(1.0)
 
@@ -1125,6 +1262,68 @@ def _render_final(
 class LiveEditPipeline:
     def __init__(self, media_root: Path | None = None):
         self.media_root = (media_root or get_media_root()).resolve()
+
+    def load_script_segments(
+        self,
+        *,
+        job_id: str,
+        vod_url: str,
+        transcription_source: str,
+        transcript_language: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """선택한 준비 완료 스크립트를 문장 단위 미리보기 형식으로 읽는다."""
+
+        try:
+            video_id = extract_video_id(vod_url)
+        except LiveYouTubeError as exc:
+            raise LiveEditPipelineError(str(exc)) from exc
+        source_kind = {
+            "youtube_caption": "captions",
+            "youtube_subtitle": "subtitles",
+        }.get(transcription_source)
+        try:
+            if source_kind:
+                if not transcript_language:
+                    raise LiveEditPipelineError("선택한 스크립트 언어를 지정하세요.")
+                rows = load_prepared_transcript(
+                    video_id, source_kind, transcript_language
+                )
+            elif transcription_source == "whisper_api":
+                payload = json.loads(
+                    _whisper_transcript_path(self.media_root, job_id).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                rows = payload["segments"]
+            else:
+                raise LiveEditPipelineError("지원하지 않는 스크립트 소스입니다.")
+            segments = [
+                {
+                    "id": index,
+                    "start": float(row["start"]),
+                    "end": float(row["end"]),
+                    "text": str(row["text"]),
+                }
+                for index, row in enumerate(rows)
+                if isinstance(row, dict) and row.get("text")
+            ]
+        except LiveEditPipelineError:
+            raise
+        except (
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise LiveEditPipelineError(
+                "선택한 스크립트 파일을 읽지 못했습니다."
+            ) from exc
+        if not segments:
+            raise LiveEditPipelineError(
+                "시간표시가 있는 스크립트 문장을 찾지 못했습니다."
+            )
+        return segments
 
     def prepare_whisper_transcript(
         self,
@@ -1153,27 +1352,44 @@ class LiveEditPipeline:
         stt_initial_prompt = (
             fixed_whisper_initial_prompt(stt_language) if stt_initial_prompt else ""
         )
+        source_audio_path = YouTubeImporter(self.media_root).prepare_best_audio(
+            vod_url, video_id
+        )
+        source_audio_stat = source_audio_path.stat()
         request_fingerprint = {
             "video_id": video_id,
+            "audio_size": source_audio_stat.st_size,
+            "audio_mtime_ns": source_audio_stat.st_mtime_ns,
             "language": stt_language,
             "initial_prompt": stt_initial_prompt,
             "hotwords": stt_hotwords,
             "speed": stt_speed,
-            "timestamp_mode": "whisperx-aligned-word-v1",
+            "engine": WHISPER_ENGINE,
+            "alignment": WHISPER_ALIGNMENT,
         }
+        shared_source_path = _shared_whisper_source_path(
+            self.media_root, video_id, request_fingerprint
+        )
         whisper_segments: list[dict[str, Any]] = []
-        try:
-            saved_source = json.loads(source_path.read_text(encoding="utf-8"))
-            if saved_source.get("request") == request_fingerprint and isinstance(
-                saved_source.get("segments"), list
-            ):
-                whisper_segments = saved_source["segments"]
-        except (OSError, json.JSONDecodeError, AttributeError):
-            pass
+        saved_source: dict[str, Any] | None = None
+        for candidate_path in (source_path, shared_source_path):
+            try:
+                candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+                if (
+                    candidate.get("request") == request_fingerprint
+                    and candidate.get("engine") == WHISPER_ENGINE
+                    and candidate.get("alignment") == WHISPER_ALIGNMENT
+                    and isinstance(candidate.get("segments"), list)
+                    and candidate["segments"]
+                ):
+                    saved_source = candidate
+                    whisper_segments = candidate["segments"]
+                    break
+            except (OSError, json.JSONDecodeError, AttributeError):
+                continue
+        if saved_source is not None:
+            _write_json_atomic(source_path, saved_source)
         if not whisper_segments:
-            source_audio_path = YouTubeImporter(self.media_root).prepare_best_audio(
-                vod_url, video_id
-            )
             whisper_audio_path = prepare_whisper_audio(
                 source_audio_path, prepared_metadata_paths(video_id)["whisper_audio"]
             )
@@ -1211,8 +1427,8 @@ class LiveEditPipeline:
             )
             check_cancelled()
             if (
-                result.get("engine") != "whisperx-aligned-word-v1"
-                or result.get("alignment") != "ctc-forced-alignment-with-words"
+                result.get("engine") != WHISPER_ENGINE
+                or result.get("alignment") != WHISPER_ALIGNMENT
             ):
                 raise LiveEditPipelineError(
                     "WhisperX 단어 강제 정렬 API가 아닌 전사 결과를 받았습니다."
@@ -1220,16 +1436,15 @@ class LiveEditPipeline:
             whisper_segments = result.get("segments", [])
             if not whisper_segments:
                 raise LiveEditPipelineError("Whisper 전사 결과에 세그먼트가 없습니다.")
-            _write_json_atomic(
-                source_path,
-                {
-                    "request": request_fingerprint,
-                    "language": result.get("language"),
-                    "engine": result.get("engine"),
-                    "alignment": result.get("alignment"),
-                    "segments": whisper_segments,
-                },
-            )
+            saved_source = {
+                "request": request_fingerprint,
+                "language": result.get("language"),
+                "engine": result.get("engine"),
+                "alignment": result.get("alignment"),
+                "segments": whisper_segments,
+            }
+            _write_json_atomic(shared_source_path, saved_source)
+            _write_json_atomic(source_path, saved_source)
             if remote_job_id:
                 try:
                     acknowledge_transcription_result(
@@ -1237,6 +1452,29 @@ class LiveEditPipeline:
                     )
                 except ServerMediaError:
                     pass
+        shared_transcript_path, split_request = _shared_whisper_transcript_path(
+            self.media_root, video_id, request_fingerprint, llm_provider
+        )
+        for candidate_path in (transcript_path, shared_transcript_path):
+            try:
+                candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+                if (
+                    candidate.get("request") == split_request
+                    and isinstance(candidate.get("segments"), list)
+                    and candidate["segments"]
+                ):
+                    _write_json_atomic(transcript_path, candidate)
+                    if candidate_path != shared_transcript_path:
+                        _write_json_atomic(shared_transcript_path, candidate)
+                    if progress_callback:
+                        progress_callback(100, "저장된 Whisper 문장 분할 결과를 불러왔습니다.")
+                    return {
+                        "job_id": job_id,
+                        "video_id": video_id,
+                        "segment_count": len(candidate["segments"]),
+                    }
+            except (OSError, json.JSONDecodeError, AttributeError):
+                continue
         checkpoint_path = transcript_path.parent / f"{job_id}.llm-checkpoint.json"
         try:
             checkpoint = (
@@ -1254,7 +1492,7 @@ class LiveEditPipeline:
 
         needs_split = any(
             _nonspace_length(str(segment.get("text") or ""))
-            > WHISPER_LONG_SEGMENT_CHARACTERS
+            >= WHISPER_SPLIT_MIN_CHARACTERS
             and isinstance(segment.get("words"), list)
             and len(segment["words"]) >= 2
             for segment in whisper_segments
@@ -1297,7 +1535,9 @@ class LiveEditPipeline:
             raise LiveEditPaused(
                 f"LLM 자막 분할이 재시도 한도에 도달했습니다: {exc}"
             ) from exc
-        _write_json_atomic(transcript_path, {"segments": segments})
+        transcript = {"request": split_request, "segments": segments}
+        _write_json_atomic(shared_transcript_path, transcript)
+        _write_json_atomic(transcript_path, transcript)
         if progress_callback:
             progress_callback(100, "Whisper 전사를 완료했습니다.")
         return {"job_id": job_id, "video_id": video_id, "segment_count": len(segments)}
@@ -1308,8 +1548,10 @@ class LiveEditPipeline:
         job_id: str | None = None,
         vod_url: str,
         genre: str = "ai_news",
+        criteria_prompt: str = "ai_news",
         llm_provider: str = "deepseek",
         target_seconds: int = 600,
+        chapter_split_mode: str = "automatic",
         use_timestamp_comments: bool = False,
         use_chat_score: bool = False,
         transcription_source: str = "youtube_caption",
@@ -1319,6 +1561,7 @@ class LiveEditPipeline:
         stt_hotwords: str | None = None,
         stt_speed: float = 1.0,
         defer_render: bool = True,
+        stop_after_structure: bool = False,
         progress_callback: Callable[[int, str], None] | None = None,
         cancel_callback: Callable[[], None] | None = None,
         whisper_progress_callback: Callable[[int, str], None] | None = None,
@@ -1521,8 +1764,47 @@ class LiveEditPipeline:
             checkpoint_callback=save_checkpoint,
         )
         try:
+            uploader_chapters = None
+            if chapter_split_mode == "uploader":
+                metadata_path = Path(str(imported.get("metadata_path") or ""))
+                if not metadata_path.is_absolute():
+                    metadata_path = (Path.cwd() / metadata_path).resolve()
+                try:
+                    uploader_rows = (
+                        json.loads(metadata_path.read_text(encoding="utf-8")).get("chapters")
+                        or []
+                    )
+                except (OSError, json.JSONDecodeError, AttributeError):
+                    uploader_rows = []
+                uploader_chapters = []
+                for chapter_index, chapter in enumerate(uploader_rows):
+                    start = float(chapter.get("start_time", 0))
+                    end = float(chapter.get("end_time", float("inf")))
+                    chapter_ids = [
+                        int(item["id"])
+                        for item in raw_segments
+                        if start
+                        <= (float(item["start"]) + float(item["end"])) / 2
+                        < end
+                    ]
+                    if chapter_ids:
+                        uploader_chapters.append(
+                            {
+                                "start_id": min(chapter_ids),
+                                "end_id": max(chapter_ids),
+                                "summary": str(
+                                    chapter.get("title") or f"챕터 {chapter_index + 1}"
+                                ),
+                                "score": 500,
+                            }
+                        )
+                if not uploader_chapters:
+                    raise LiveEditPipelineError(
+                        "업로더가 제공한 챕터를 찾을 수 없습니다."
+                    )
             structure = analysis_service.structure_transcript(
                 raw_segments,
+                chapters=uploader_chapters,
                 progress_callback=lambda done, total, label: report(
                     25 + int(25 * done / max(1, total)), f"LLM {label} ({done}/{total})"
                 ),
@@ -1550,18 +1832,21 @@ class LiveEditPipeline:
                 section_first = subtitle_by_id[section["start_id"]]
                 section_last = subtitle_by_id[section["end_id"]]
                 section_id = f"{chapter_id}-section-{section_index:02d}"
+                section_text_segments = [
+                    str(item["text"])
+                    for item in raw_segments
+                    if section["start_id"] <= int(item["id"]) <= section["end_id"]
+                ]
+                text = " ".join(section_text_segments)
                 chapter_sections.append(
                     {
                         "section_id": section_id,
                         "start": float(section_first["start"]),
                         "end": float(section_last["end"]),
                         "segment_ids": [section_id],
+                        "text": text,
+                        "text_segments": section_text_segments,
                     }
-                )
-                text = " ".join(
-                    str(item["text"])
-                    for item in raw_segments
-                    if section["start_id"] <= int(item["id"]) <= section["end_id"]
                 )
                 candidates.append(
                     {
@@ -1569,6 +1854,7 @@ class LiveEditPipeline:
                         "start": float(section_first["start"]),
                         "end": float(section_last["end"]),
                         "text": text,
+                        "text_segments": section_text_segments,
                         "chapter_id": chapter_id,
                         "section_id": section_id,
                         "chapter_summary": chapter["summary"],
@@ -1590,6 +1876,7 @@ class LiveEditPipeline:
             scored = analysis_service.score_sections(
                 candidates,
                 genre=genre,
+                criteria_prompt=criteria_prompt,
                 progress_callback=lambda done, total, label: report(
                     55 + int(25 * done / max(1, total)), f"LLM {label} ({done}/{total})"
                 ),
@@ -1621,15 +1908,33 @@ class LiveEditPipeline:
         _apply_heatmap_scores(scored, heatmap)
         if heatmap:
             report(78, "히트맵 점수를 섹션별로 집계했습니다.")
-        # 음량은 영상별 최고 품질 원본 MP3가 준비된 경우에만 계산한다.
-        report(79, "원본 오디오의 음량 변화를 분석하는 중입니다.")
-        try:
-            volume_audio = importer.prepare_best_audio(vod_url, video_id)
-            volume_points = _volume_score_points(_extract_volume_samples(volume_audio))
-        except (YouTubeImportError, OSError):
-            volume_points = []
+        # 음량 분석은 LLM 계약 오류와 무관한 고정 영상 단위 작업이다. 이후 LLM
+        # 단계에서 일시중지되면 같은 MP3를 다시 분석하지 않도록 점을 보존한다.
+        volume_cache = checkpoint.setdefault("volume_score_points", {})
+        cached_volume_points = volume_cache.get(video_id)
+        if isinstance(cached_volume_points, list) and all(
+            isinstance(item, list)
+            and len(item) == 2
+            and all(isinstance(value, (int, float)) for value in item)
+            for item in cached_volume_points
+        ):
+            volume_points = [
+                (float(item[0]), float(item[1])) for item in cached_volume_points
+            ]
+        else:
+            report(79, "원본 오디오의 음량 변화를 분석하는 중입니다.")
+            try:
+                volume_audio = importer.prepare_best_audio(vod_url, video_id)
+                volume_points = _volume_score_points(
+                    _extract_volume_samples(volume_audio)
+                )
+            except (YouTubeImportError, OSError):
+                volume_points = []
+            volume_cache[video_id] = [list(item) for item in volume_points]
+            save_checkpoint()
         _apply_point_scores(scored, volume_points, "volume_score")
-        report(84, "원본 오디오의 음량 점수를 섹션별로 집계했습니다.")
+        if cached_volume_points is None:
+            report(84, "원본 오디오의 음량 점수를 섹션별로 집계했습니다.")
 
         chat_path = prepared_metadata_paths(video_id)["chat_times"]
         chat_items: list[dict[str, Any]] = []
@@ -1693,6 +1998,33 @@ class LiveEditPipeline:
         # without trusting client-provided timestamps or text.
         _ensure_candidate_ids(scored)
         duration = float(imported.get("duration") or 0.0)
+        if stop_after_structure:
+            interim_plan = {
+                "vod_url": vod_url,
+                "genre": genre,
+                "criteria_prompt": criteria_prompt,
+                "llm_provider": llm_provider,
+                "transcription_source": transcription_source,
+                "target_seconds": target_seconds,
+                "use_timestamp_comments": use_timestamp_comments,
+                "use_chat_score": use_chat_score,
+                "source_video_path": str(source.resolve()),
+                "source_duration_seconds": duration,
+                "candidates": scored,
+                "chapters": chapters,
+                "recommended_segment_ids": [],
+                "selected_segment_ids": [],
+                "clips": [],
+            }
+            return {
+                "job_id": job_id,
+                "vod_url": vod_url,
+                "transcription_source": transcription_source,
+                "script_segments": raw_segments,
+                "chapters": chapters,
+                "analysis_plan": {**interim_plan, "script_segments": raw_segments},
+                "awaiting_scoring": True,
+            }
         try:
             selected, selection_reviews = _select_coherent_clips(
                 scored,
@@ -1717,6 +2049,7 @@ class LiveEditPipeline:
         plan = {
             "vod_url": vod_url,
             "genre": genre,
+            "criteria_prompt": criteria_prompt,
             "llm_provider": llm_provider,
             "transcription_source": transcription_source,
             "target_seconds": target_seconds,
@@ -1742,6 +2075,7 @@ class LiveEditPipeline:
             "vod_url": vod_url,
             "vod_video_id": imported.get("job_id"),
             "genre": genre,
+            "criteria_prompt": criteria_prompt,
             "llm_provider": llm_provider,
             "source_video_path": str(source),
             "transcription_source": transcription_source,
@@ -1773,6 +2107,7 @@ class LiveEditPipeline:
             pending_output,
             subtitles,
             status_callback=lambda message: report(90, message),
+            cancel_callback=cancel_callback,
         )
         _copy_file_atomic(pending_output, rendered)
         report(100, f"AI 영상 편집이 완료되었습니다. 최종 렌더링: {rendering_backend}")
@@ -1848,6 +2183,7 @@ class LiveEditPipeline:
         *,
         plan: dict[str, Any],
         progress_callback: Callable[[int, str], None] | None = None,
+        cancel_callback: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Render an existing analysis again from user-selected candidates."""
 
@@ -1923,8 +2259,10 @@ class LiveEditPipeline:
             pending_subtitles,
             progress_callback=report_render_progress,
             status_callback=report_render_status,
+            cancel_callback=cancel_callback,
         )
 
+        report(99, "렌더링 결과 파일을 마무리하는 중입니다.")
         _copy_file_atomic(pending_output, output)
         plan.update(
             {

@@ -23,6 +23,7 @@ from app.schemas import (
     WhisperSettingsRequest,
     WhisperPreparationRequest,
     LiveEditRequest,
+    ScriptPreviewRequest,
     SegmentSelectionRequest,
 )
 from app.services.live_youtube_service import (
@@ -36,8 +37,16 @@ from app.services.live_edit_pipeline import (
     LiveEditPaused,
     LiveEditPipeline,
     LiveEditPipelineError,
+    has_default_whisper_transcript_cache,
 )
 from app.services.llm_analysis_service import LLMAnalysisError, LLMAnalysisService
+from app.services.prompt_store import (
+    PromptStoreError,
+    delete_user_prompt,
+    list_user_prompts,
+    save_user_prompt,
+)
+from app.services.youtube_importer import YouTubeImporter
 from app.services.local_job_store import LocalJobStore
 from app.services.server_job_service import (
     ServerJobError,
@@ -248,6 +257,36 @@ async def auth_me(user=Depends(get_current_user)):
     return {"id": str(_user_value(user, "id")), "email": _user_value(user, "email")}
 
 
+@app.get("/api/prompts/user")
+async def get_user_prompts(user=Depends(get_current_user)):
+    del user
+    try:
+        return {"prompts": list_user_prompts()}
+    except PromptStoreError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.put("/api/prompts/user/{prompt_id}")
+async def put_user_prompt(
+    prompt_id: str, value: dict, create: bool = False, user=Depends(get_current_user)
+):
+    del user
+    try:
+        return save_user_prompt(prompt_id, value, create=create)
+    except PromptStoreError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/api/prompts/user/{prompt_id}")
+async def remove_user_prompt(prompt_id: str, user=Depends(get_current_user)):
+    del user
+    try:
+        delete_user_prompt(prompt_id)
+        return {"status": "deleted"}
+    except PromptStoreError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 def _update_live_edit_job(job_id: str, **values) -> None:
     job = LIVE_EDIT_JOBS.get(job_id)
     if job is not None:
@@ -365,8 +404,10 @@ async def _run_live_edit_job(
             job_id=job_id,
             vod_url=request.vod_url,
             genre=request.genre,
+            criteria_prompt=request.criteria_prompt,
             llm_provider=request.llm_provider,
             target_seconds=request.target_duration_seconds,
+            chapter_split_mode=request.chapter_split_mode,
             use_timestamp_comments=request.use_timestamp_comments,
             use_chat_score=request.use_chat_score,
             transcription_source=request.transcription_source,
@@ -376,6 +417,9 @@ async def _run_live_edit_job(
             stt_hotwords=request.stt_hotwords,
             stt_speed=request.stt_speed,
             defer_render=True,
+            stop_after_structure=bool(
+                LIVE_EDIT_JOBS.get(job_id, {}).get("stop_after_structure")
+            ),
             server_access_token=server_access_token,
             server_job_id=server_job_id,
             progress_callback=report_analysis,
@@ -390,7 +434,19 @@ async def _run_live_edit_job(
             ),
         )
         result["vod_video_id"] = vod_id
-        if result.get("awaiting_selection"):
+        if result.get("awaiting_scoring"):
+            _update_live_edit_job(
+                job_id,
+                status="awaiting_scoring",
+                progress=100,
+                phase="analysis",
+                task_name="스크립트 분할 및 점수 계산",
+                message="분할과 점수 계산을 완료했습니다. 다음을 눌러 챕터 내 필수 관계를 판별하세요.",
+                result=result,
+            )
+            _cleanup_edit_transient_state(job_id)
+            LIVE_EDIT_CANCEL_REQUESTS.discard(job_id)
+        elif result.get("awaiting_selection"):
             _update_live_edit_job(
                 job_id,
                 status="awaiting_selection",
@@ -480,6 +536,7 @@ async def start_live_edit(
                 status_code=409, detail="다른 작업에 사용 중인 편집 작업 ID입니다."
             )
         if existing.get("status") not in {
+            "awaiting_scoring",
             "awaiting_selection",
             "completed",
             "failed",
@@ -514,10 +571,74 @@ async def start_live_edit(
         "transcription_source": request.transcription_source,
         "owner_id": _user_id(user),
         "request": request.model_dump(),
+        "stop_after_structure": True,
     }
     LIVE_EDIT_ACCESS_TOKENS[job_id] = authorization
     asyncio.create_task(_run_live_edit_job(job_id, request, authorization))
     return LIVE_EDIT_JOBS[job_id]
+
+
+@app.post("/api/youtube/edit/script")
+async def preview_edit_script(
+    request: ScriptPreviewRequest,
+    user=Depends(get_current_user),
+):
+    del user
+    try:
+        segments = await asyncio.to_thread(
+            LiveEditPipeline(get_media_root()).load_script_segments,
+            job_id=request.job_id,
+            vod_url=request.vod_url,
+            transcription_source=request.transcription_source,
+            transcript_language=request.transcript_language,
+        )
+        return {"segments": segments}
+    except LiveEditPipelineError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/youtube/edit/{job_id}/score", status_code=202)
+async def score_live_edit(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+    user=Depends(get_current_user),
+    target_duration_seconds: int | None = None,
+):
+    if not authorization:
+        raise HTTPException(
+            status_code=401, detail="LLM 호출에는 로그인 토큰이 필요합니다."
+        )
+    job = _job_for_user(job_id, user)
+    if job.get("status") != "awaiting_scoring":
+        raise HTTPException(status_code=409, detail="링크를 판별할 점수 결과가 없습니다.")
+    try:
+        request = LiveEditRequest.model_validate(job.get("request"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409, detail="분석 작업 설정을 찾을 수 없습니다."
+        ) from exc
+    if target_duration_seconds is not None:
+        if not 60 <= target_duration_seconds <= 7200:
+            raise HTTPException(
+                status_code=422,
+                detail="목표 길이는 60초에서 7200초 사이여야 합니다.",
+            )
+        request = request.model_copy(
+            update={"target_duration_seconds": target_duration_seconds}
+        )
+        job["request"] = request.model_dump()
+    job.update(
+        status="queued",
+        progress=90,
+        phase="analysis",
+        task_name="챕터 내 필수 관계 판별",
+        message="점수가 높은 섹션부터 챕터 내 필수 관계를 판별하는 중입니다.",
+        stop_after_structure=False,
+        error=None,
+    )
+    LIVE_EDIT_ACCESS_TOKENS[job_id] = authorization or ""
+    asyncio.create_task(_run_live_edit_job(job_id, request, authorization))
+    return job
 
 
 @app.post("/api/youtube/edit/{job_id}/resume", status_code=202)
@@ -553,9 +674,15 @@ async def resume_live_edit(
 async def youtube_metadata(request: YouTubeMetadataRequest):
     """Return the phase-one preview data using yt-dlp only."""
     try:
-        extract_video_id(request.url)
+        video_id = extract_video_id(request.url)
         # 같은 영상의 재작업은 yt-data 원본 정보를 그대로 다시 보여 준다.
-        return await asyncio.to_thread(get_video_metadata, request.url, refresh=False)
+        metadata = await asyncio.to_thread(
+            get_video_metadata, request.url, refresh=False
+        )
+        metadata["default_whisper_cache_available"] = (
+            has_default_whisper_transcript_cache(get_media_root(), video_id)
+        )
+        return metadata
     except LiveYouTubeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -949,6 +1076,28 @@ async def youtube_thumbnail(video_id: str, filename: str):
     return FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
 
 
+@app.get("/api/youtube/metadata/{video_id}/media/source")
+async def youtube_metadata_source_video(video_id: str, user=Depends(get_current_user)):
+    """2단계에서 준비된 원본 영상을 분석 시작 전 미리보기에 제공한다."""
+
+    del user
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        raise HTTPException(status_code=400, detail="잘못된 YouTube 영상 ID입니다.")
+    cached = YouTubeImporter(get_media_root()).find_complete_cached_import(
+        f"https://www.youtube.com/watch?v={video_id}", video_id
+    )
+    if not cached:
+        raise HTTPException(status_code=404, detail="준비된 원본 영상을 찾을 수 없습니다.")
+    path = Path(str(cached["video_path"]))
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="준비된 원본 영상을 찾을 수 없습니다.")
+    return FileResponse(
+        path, media_type="video/mp4", headers={"Cache-Control": "no-store"}
+    )
+
+
 @app.get("/api/youtube/edit/status/{job_id}")
 async def live_edit_status(job_id: str, user=Depends(get_current_user)):
     return _job_for_user(job_id, user)
@@ -974,7 +1123,13 @@ async def live_edit_events(job_id: str, user=Depends(get_current_user)):
             # 선택 대기 상태는 4단계 진입에 필요한 마지막 이벤트다. 스트림을
             # 즉시 닫으면 프록시 버퍼가 이 이벤트를 버릴 수 있으므로 heartbeat를
             # 유지한다. 완료 뒤에는 클라이언트가 연결을 닫는다.
-            if job.get("status") in {"completed", "failed", "cancelled", "paused"}:
+            if job.get("status") in {
+                "completed",
+                "failed",
+                "cancelled",
+                "paused",
+                "awaiting_scoring",
+            }:
                 return
             yield ": keep-alive\n\n"
             await asyncio.sleep(1)
@@ -1073,6 +1228,10 @@ async def cancel_live_edit(
             job["message"] = f"취소를 요청했습니다. 서버 확인을 다시 시도합니다: {exc}"
             if is_live:
                 LIVE_EDIT_JOBS[job_id] = job
+    if is_live:
+        # 실행 중인 작업은 worker가 취소 신호를 확인하고 정리하게 둔다.
+        # 여기서 transient state를 지우면 FFmpeg가 취소를 관찰할 수 없다.
+        return job
     _cleanup_edit_job_state(job_id)
     return {
         "job_id": job_id,
@@ -1126,6 +1285,31 @@ async def _run_segment_selection_job(
     try:
         async with lock:
             previous_result = dict(LIVE_EDIT_JOBS.get(job_id, {}).get("result") or {})
+            # 렌더링 성공 여부와 관계없이 사용자가 확정한 선택은 현재 편집
+            # 상태다. 취소 시 기존 AI 추천 선택으로 돌아가지 않도록 렌더링 전에
+            # 결과 사본에 반영한다.
+            previous_plan = dict(previous_result.get("analysis_plan") or {})
+            requested_ids = [str(value) for value in request.segment_ids]
+            candidates_by_id = {
+                str(item.get("segment_id")): item
+                for item in previous_plan.get("candidates") or []
+                if isinstance(item, dict)
+            }
+            previous_plan.update(
+                {
+                    "selected_segment_ids": requested_ids,
+                    "clips": [
+                        {
+                            key: candidate[key]
+                            for key in ("segment_id", "start", "end", "llm_score")
+                            if key in candidate
+                        }
+                        for segment_id in requested_ids
+                        if (candidate := candidates_by_id.get(segment_id)) is not None
+                    ],
+                }
+            )
+            previous_result["analysis_plan"] = previous_plan
 
             def report_render(progress: int, message: str) -> None:
                 _raise_if_cancel_requested(job_id)
@@ -1153,6 +1337,7 @@ async def _run_segment_selection_job(
                     request.segment_ids,
                     plan=dict(previous_result.get("analysis_plan") or {}),
                     progress_callback=report_render,
+                    cancel_callback=lambda: _raise_if_cancel_requested(job_id),
                 )
                 final_plan = dict(previous_result.get("analysis_plan") or {})
                 selected_ids = result.get("selected_segment_ids") or request.segment_ids
@@ -1226,7 +1411,17 @@ async def _run_segment_selection_job(
                 )
                 _cleanup_edit_transient_state(job_id)
             except LiveEditCancelled:
-                _cleanup_edit_job_state(job_id)
+                _update_live_edit_job(
+                    job_id,
+                    status="awaiting_selection",
+                    progress=100,
+                    phase="selection",
+                    task_name="구간 선택",
+                    message="렌더링을 취소했습니다. 선택 구간을 수정하거나 다시 렌더링할 수 있습니다.",
+                    result=previous_result,
+                    error=None,
+                )
+                _cleanup_edit_transient_state(job_id)
             except LiveEditPipelineError as exc:
                 await _discard_failed_edit_job(job_id, exc)
             except Exception as exc:

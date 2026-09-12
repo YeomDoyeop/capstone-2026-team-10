@@ -3,7 +3,7 @@ import { flushSync } from "react-dom";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import "./WorkflowApp.css";
 
-type Phase = "metadata" | "materials" | "analysis" | "review" | "render";
+type Phase = "metadata" | "materials" | "review" | "render";
 type Job = {
   job_id: string;
   status: string;
@@ -13,8 +13,13 @@ type Job = {
   task_name?: string;
   message: string;
   error?: string;
-  result?: { revision?: number };
+  result?: {
+    revision?: number;
+    script_segments?: ScriptSegment[];
+    chapters?: Chapter[];
+  };
 };
+type ScriptSegment = { id: number; start: number; end: number; text: string };
 type LanguageOption = { value: string; label: string };
 type Metadata = {
   title?: string;
@@ -41,6 +46,7 @@ type Metadata = {
   subtitle_languages?: LanguageOption[];
   caption_languages?: LanguageOption[];
   chat_replay_available?: boolean;
+  default_whisper_cache_available?: boolean;
 };
 type Section = {
   section_id: string;
@@ -48,6 +54,7 @@ type Section = {
   end: number;
   segment_ids: string[];
   text: string;
+  text_segments?: string[];
   final_score?: number;
   llm_score?: number;
   heatmap_score?: number;
@@ -90,6 +97,7 @@ type MaterialDownloadJob = {
   result?: { artifacts?: MaterialArtifact[] };
 };
 type WhisperSuggestion = { stt_hotwords: string };
+type PromptProfile = { id: string; name: string; description: string; criteria: string };
 type WhisperTranscriptJob = {
   job_id: string;
   status:
@@ -114,7 +122,9 @@ const fixedWhisperPrompts: Record<string, string> = {
 const initialSettings = {
   llm_provider: "deepseek" as "gemini" | "deepseek",
   genre: "ai_news" as "ai_news" | "stock" | "game",
+  criteria_prompt: "ai_news",
   target_duration_seconds: 600,
+  chapter_split_mode: "automatic" as "uploader" | "automatic",
   transcription_source: "youtube_caption" as
     "youtube_caption" | "youtube_subtitle" | "whisper_api",
   stt_language: "ko",
@@ -219,10 +229,19 @@ export default function WorkflowApp() {
   const [whisperTranscript, setWhisperTranscript] =
     useState<WhisperTranscriptJob | null>(null);
   const [settings, setSettings] = useState(initialSettings);
+  const [promptProfiles, setPromptProfiles] = useState<PromptProfile[]>([]);
+  const [promptEditor, setPromptEditor] = useState<PromptProfile | null>(null);
+  const [creatingPrompt, setCreatingPrompt] = useState(false);
+  const [targetDurationInput, setTargetDurationInput] = useState(
+    String(initialSettings.target_duration_seconds),
+  );
   const [message, setMessage] = useState("로그인 설정을 불러오는 중입니다.");
   const [busy, setBusy] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [review, setReview] = useState<Review | null>(null);
+  const [scriptSegments, setScriptSegments] = useState<ScriptSegment[]>([]);
+  const [structuredChapters, setStructuredChapters] = useState<Chapter[]>([]);
+  const [scriptLoading, setScriptLoading] = useState(false);
   const [openChapters, setOpenChapters] = useState<Set<string>>(new Set());
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
@@ -235,8 +254,10 @@ export default function WorkflowApp() {
   const displayedMetadataUrlRef = useRef("");
   const previousPhaseRef = useRef<Phase>(phase);
   const restoredJobRef = useRef(false);
+  const restartRequestedRef = useRef(false);
   const phaseTransitionRef = useRef(false);
   const workflowEpochRef = useRef(0);
+  const scriptPreviewRequestRef = useRef(0);
   const whisperRequired = Boolean(
     metadata && !materialSelections.subtitles && !materialSelections.captions,
   );
@@ -255,6 +276,45 @@ export default function WorkflowApp() {
     ],
     [materialSelections.subtitles, materialSelections.captions, whisperActive],
   );
+
+  async function loadPromptProfiles() {
+    if (!token) return;
+    const response = await authenticatedFetch("/api/prompts/user");
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.detail || "판별 기준을 불러오지 못했습니다.");
+    const prompts = (body.prompts || []) as PromptProfile[];
+    setPromptProfiles(prompts);
+    if (prompts.length && !prompts.some((item) => item.id === settings.criteria_prompt))
+      setSettings((current) => ({ ...current, criteria_prompt: prompts[0].id }));
+  }
+
+  async function savePromptProfile() {
+    if (!promptEditor) return;
+    const response = await authenticatedFetch(
+      `/api/prompts/user/${encodeURIComponent(promptEditor.id)}?create=${creatingPrompt}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(promptEditor),
+      },
+    );
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) return setMessage(body.detail || "판별 기준을 저장하지 못했습니다.");
+    await loadPromptProfiles();
+    setSettings((current) => ({ ...current, criteria_prompt: promptEditor.id }));
+    setPromptEditor(null);
+    setMessage("판별 기준을 저장했습니다.");
+  }
+
+  async function deletePromptProfile() {
+    if (!promptEditor || creatingPrompt) return setPromptEditor(null);
+    const response = await authenticatedFetch(`/api/prompts/user/${encodeURIComponent(promptEditor.id)}`, { method: "DELETE" });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) return setMessage(body.detail || "판별 기준을 삭제하지 못했습니다.");
+    setPromptEditor(null);
+    await loadPromptProfiles();
+    setMessage("판별 기준을 삭제했습니다.");
+  }
 
   function transitionToPhase(next: Phase) {
     if (next === phase || phaseTransitionRef.current) return;
@@ -286,7 +346,7 @@ export default function WorkflowApp() {
         const height = nextPanel.scrollHeight;
         nextPanel.style.height = "0px";
         nextPanel.style.opacity = "0";
-        nextPanel.style.transform = "translateY(-16px) scaleY(.98)";
+        nextPanel.style.transform = "translateY(16px) scaleY(.98)";
         nextPanel.style.transition = "none";
         void nextPanel.offsetHeight;
         window.requestAnimationFrame(() => {
@@ -328,6 +388,12 @@ export default function WorkflowApp() {
     setMaterialTab(null);
     setMessage("로그아웃되어 1단계로 돌아왔습니다.");
   }, [token, phase]);
+  useEffect(() => {
+    if (!token) return;
+    void loadPromptProfiles().catch((error) =>
+      setMessage(error instanceof Error ? error.message : "판별 기준을 불러오지 못했습니다."),
+    );
+  }, [token]);
   useEffect(() => {
     if (phase === "metadata" && previousPhaseRef.current !== "metadata")
       setMetadataTab("overview");
@@ -449,6 +515,7 @@ export default function WorkflowApp() {
   }, []);
   useEffect(() => {
     if (job || !token) return;
+    if (restartRequestedRef.current) return;
     if (window.sessionStorage.getItem("ave-cancel-active-on-reload") === "1") {
       window.sessionStorage.removeItem("ave-cancel-active-on-reload");
       return;
@@ -458,6 +525,7 @@ export default function WorkflowApp() {
     })
       .then((response) => (response.ok ? response.json() : { jobs: [] }))
       .then((value) => {
+        if (restartRequestedRef.current) return;
         const active = Array.isArray(value.jobs)
           ? (value.jobs[0] as Job | undefined)
           : undefined;
@@ -470,7 +538,7 @@ export default function WorkflowApp() {
             ? "review"
             : active.phase === "render"
               ? "render"
-              : "analysis",
+              : "review",
         );
         setMessage(active.message || "진행 중인 작업을 다시 연결했습니다.");
       })
@@ -508,6 +576,7 @@ export default function WorkflowApp() {
         "failed",
         "cancelled",
         "paused",
+        "awaiting_scoring",
         "awaiting_selection",
       ].includes(job.status)
     )
@@ -527,6 +596,7 @@ export default function WorkflowApp() {
           "failed",
           "cancelled",
           "paused",
+          "awaiting_scoring",
           "awaiting_selection",
         ].includes(next.status)
       )
@@ -600,7 +670,21 @@ export default function WorkflowApp() {
     };
   }, [job?.job_id, job?.status, token]);
   useEffect(() => {
-    if (job?.status !== "awaiting_selection" || !token) return;
+    if (job?.status !== "awaiting_scoring") return;
+    setScriptSegments(job.result?.script_segments || []);
+    setStructuredChapters(job.result?.chapters || []);
+    setOpenChapters(new Set());
+    setMessage(
+      job.message || "분할과 점수 계산을 완료했습니다. 다음을 눌러 챕터 내 필수 관계를 판별하세요.",
+    );
+  }, [job]);
+  useEffect(() => {
+    if (
+      !job ||
+      !["awaiting_scoring", "awaiting_selection"].includes(job.status) ||
+      !token
+    )
+      return;
     const epoch = workflowEpochRef.current;
     let cancelled = false;
     fetch(`/api/youtube/edit/${job.job_id}/segments`, {
@@ -618,7 +702,6 @@ export default function WorkflowApp() {
         if (cancelled || epoch !== workflowEpochRef.current) return;
         flushSync(() => {
           setReview(value);
-          setOpenChapters(new Set());
         });
         transitionToPhase("review");
       })
@@ -631,9 +714,9 @@ export default function WorkflowApp() {
     };
   }, [job, token]);
   useEffect(() => {
-    if (phase !== "review" || !job || !token) return;
+    if (phase !== "review" || !metadata?.video_id || !token) return;
     let objectUrl = "";
-    void fetch(`/api/youtube/edit/${job.job_id}/media/source`, {
+    void fetch(`/api/youtube/metadata/${metadata.video_id}/media/source`, {
       headers: { Authorization: `Bearer ${token}` },
     })
       .then(async (response) => {
@@ -650,7 +733,7 @@ export default function WorkflowApp() {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
       setSourceMediaUrl("");
     };
-  }, [phase, job?.job_id, token]);
+  }, [phase, metadata?.video_id, token]);
   useEffect(() => {
     if (phase !== "render" || !job || !token) return;
     let objectUrl = "";
@@ -706,7 +789,8 @@ export default function WorkflowApp() {
     );
   }, [whisperRequired]);
   useEffect(() => {
-    if (job?.status === "completed") transitionToPhase("render");
+    if (job?.status === "completed" && !restartRequestedRef.current)
+      transitionToPhase("render");
   }, [job]);
   useEffect(() => {
     const first = scriptSourceOptions[0]?.value;
@@ -718,6 +802,19 @@ export default function WorkflowApp() {
     )
       setSettings((current) => ({ ...current, transcription_source: first }));
   }, [scriptSourceOptions, settings.transcription_source]);
+  useEffect(() => {
+    if (phase !== "review" || !token || !metadata || !workflowJobId) return;
+    if (job || review) return;
+    void loadScriptPreview();
+  }, [
+    phase,
+    token,
+    metadata?.video_id,
+    workflowJobId,
+    settings.transcription_source,
+    subtitleLanguage,
+    captionLanguage,
+  ]);
   useEffect(() => {
     if (phase !== "metadata" || !metadata) return;
     document
@@ -813,9 +910,11 @@ export default function WorkflowApp() {
         "failed",
         "cancelled",
         "paused",
+        "awaiting_scoring",
         "awaiting_selection",
       ].includes(job.status),
     );
+  const selectionEnabled = job?.status === "awaiting_selection";
   const materialActive = materialDownload?.status === "running";
   const whisperProgressActive = Boolean(
     whisperTranscript &&
@@ -823,7 +922,7 @@ export default function WorkflowApp() {
   );
   const jobProgressActive = Boolean(
     job &&
-      !["completed", "failed", "cancelled", "awaiting_selection"].includes(job.status),
+      !["completed", "failed", "cancelled", "awaiting_scoring", "awaiting_selection"].includes(job.status),
   );
   const activeProgress = materialActive
     ? { kind: "materials", status: materialDownload.status, value: materialDownload.progress, label: "추가 메타데이터 다운로드", log: materialDownload.error || materialDownload.message }
@@ -946,7 +1045,11 @@ export default function WorkflowApp() {
         captions: Boolean(body.captions_available),
       });
       const requiresWhisper = !body.subtitles_available && !body.captions_available;
-      setWhisperEnabled(requiresWhisper);
+      const preferWhisper =
+        requiresWhisper || Boolean(body.default_whisper_cache_available);
+      setWhisperEnabled(
+        preferWhisper,
+      );
       setWhisperPromptEnabled(false);
       setWhisperHotwordsEnabled(false);
       setWhisperSuggestion(null);
@@ -954,20 +1057,22 @@ export default function WorkflowApp() {
       setCaptionLanguage(body.caption_languages?.[0]?.value || "");
       setMaterials([]);
       setMaterialTab(null);
+      const initialTargetDuration = Math.min(
+        7200,
+        Math.max(
+          60,
+          Math.round((Number(body.duration_seconds) || 0) / 4 / 30) * 30,
+        ),
+      );
+      setTargetDurationInput(String(initialTargetDuration));
       setSettings((current) => ({
         ...current,
-        target_duration_seconds: Math.min(
-          7200,
-          Math.max(
-            60,
-            Math.round((Number(body.duration_seconds) || 0) / 4 / 30) * 30,
-          ),
-        ),
-        transcription_source: body.subtitles_available
-          ? "youtube_subtitle"
-          : body.captions_available
-            ? "youtube_caption"
-            : "whisper_api",
+        target_duration_seconds: initialTargetDuration,
+        transcription_source: preferWhisper
+          ? "whisper_api"
+          : body.subtitles_available
+            ? "youtube_subtitle"
+            : "youtube_caption",
         stt_initial_prompt: "",
         stt_hotwords: "",
       }));
@@ -1113,6 +1218,7 @@ export default function WorkflowApp() {
   }
   async function downloadMaterials() {
     if (!metadata || !token) return setMessage("Google 로그인이 필요합니다.");
+    restartRequestedRef.current = false;
     shouldAnimateMetadataRef.current = false;
     setBusy(true);
     setMaterialDownload({
@@ -1191,16 +1297,65 @@ export default function WorkflowApp() {
   }
   async function advanceToAnalysis() {
     if (!metadata || !token) return setMessage("Google 로그인이 필요합니다.");
-    if (!whisperActive) return transitionToPhase("analysis");
+    if (!whisperActive) return transitionToPhase("review");
     setBusy(true);
     try {
-      if (await prepareWhisperTranscript()) transitionToPhase("analysis");
+      if (await prepareWhisperTranscript()) transitionToPhase("review");
     } catch (error) {
       setMessage(
         error instanceof Error ? error.message : "Whisper 전사에 실패했습니다.",
       );
     } finally {
       setBusy(false);
+    }
+  }
+  function selectedTranscriptLanguage() {
+    return settings.transcription_source === "youtube_caption"
+      ? captionLanguage
+      : settings.transcription_source === "youtube_subtitle"
+        ? subtitleLanguage
+        : undefined;
+  }
+  async function loadScriptPreview() {
+    if (!token || !metadata || !workflowJobId) return;
+    const requestId = ++scriptPreviewRequestRef.current;
+    const transcriptLanguage = selectedTranscriptLanguage();
+    setScriptLoading(true);
+    setScriptSegments([]);
+    setStructuredChapters([]);
+    setJob(null);
+    setMessage("선택한 스크립트를 문장 단위로 불러오는 중입니다.");
+    try {
+      const response = await authenticatedFetch("/api/youtube/edit/script", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          job_id: workflowJobId,
+          vod_url: url.trim(),
+          transcription_source: settings.transcription_source,
+          ...(transcriptLanguage
+            ? { transcript_language: transcriptLanguage }
+            : {}),
+        }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok)
+        throw new Error(body.detail || "스크립트를 불러오지 못했습니다.");
+      if (requestId === scriptPreviewRequestRef.current) {
+        setScriptSegments(body.segments || []);
+        setMessage(
+          `스크립트 ${Number(body.segments?.length || 0).toLocaleString()}개 문장을 불러왔습니다.`,
+        );
+      }
+    } catch (error) {
+      if (requestId === scriptPreviewRequestRef.current)
+        setMessage(
+          error instanceof Error
+            ? error.message
+            : "스크립트를 불러오지 못했습니다.",
+        );
+    } finally {
+      if (requestId === scriptPreviewRequestRef.current) setScriptLoading(false);
     }
   }
   async function startAnalysis() {
@@ -1213,17 +1368,13 @@ export default function WorkflowApp() {
       : settings.transcription_source;
     if (transcriptionSource === "whisper_api" && !whisperActive)
       return setMessage("2단계에서 Whisper STT를 활성화하세요.");
-    const transcriptLanguage =
-      transcriptionSource === "youtube_caption"
-        ? captionLanguage
-        : transcriptionSource === "youtube_subtitle"
-          ? subtitleLanguage
-          : undefined;
+    const transcriptLanguage = selectedTranscriptLanguage();
     if (transcriptionSource !== "whisper_api" && !transcriptLanguage)
       return setMessage("2단계에서 다운로드한 스크립트 언어를 선택하세요.");
     setBusy(true);
     setReview(null);
-    setMessage("AI 분석 작업을 준비하는 중입니다.");
+    setStructuredChapters([]);
+    setMessage("스크립트 분할 작업을 준비하는 중입니다.");
     try {
       const response = await fetch("/api/youtube/edit/start", {
         method: "POST",
@@ -1260,6 +1411,29 @@ export default function WorkflowApp() {
       setBusy(false);
     }
   }
+  async function scoreAnalysis() {
+    if (!job || !token || job.status !== "awaiting_scoring") return;
+    setBusy(true);
+    setMessage("점수가 높은 섹션부터 챕터 내 필수 관계를 판별하는 중입니다.");
+    try {
+      const response = await authenticatedFetch(
+        `/api/youtube/edit/${job.job_id}/score?target_duration_seconds=${settings.target_duration_seconds}`,
+        { method: "POST" },
+      );
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok)
+        throw new Error(body.detail || "점수 계산을 시작하지 못했습니다.");
+      setJob(body);
+      setStartedAt(Date.now());
+      setMessage(body.message);
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : "점수 계산 시작에 실패했습니다.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
   async function renderSelection() {
     if (!job || !token || !review) return;
     if (["failed", "cancelled"].includes(job.status))
@@ -1272,11 +1446,10 @@ export default function WorkflowApp() {
     setBusy(true);
     setMessage("선택한 구간으로 렌더링을 준비하는 중입니다.");
     try {
-      const response = await fetch(`/api/youtube/edit/${job.job_id}/segments`, {
+      const response = await authenticatedFetch(`/api/youtube/edit/${job.job_id}/segments`, {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({ segment_ids }),
       });
@@ -1366,7 +1539,7 @@ export default function WorkflowApp() {
   async function retryWhisperTranscript() {
     setBusy(true);
     try {
-      if (await prepareWhisperTranscript()) transitionToPhase("analysis");
+      if (await prepareWhisperTranscript()) transitionToPhase("review");
     } catch (error) {
       setMessage(
         error instanceof Error ? error.message : "Whisper 전사 재시도에 실패했습니다.",
@@ -1376,8 +1549,10 @@ export default function WorkflowApp() {
     }
   }
   function restart() {
+    restartRequestedRef.current = true;
     workflowEpochRef.current += 1;
-    transitionToPhase("metadata");
+    phaseTransitionRef.current = false;
+    setPhase("metadata");
     setJob(null);
     setReview(null);
     setWhisperTranscript(null);
@@ -1388,18 +1563,21 @@ export default function WorkflowApp() {
     setMessage("영상 정보를 유지한 채 처음 단계로 돌아왔습니다.");
   }
   function previewSegment(segment: Segment) {
+    previewTimeRange(segment.start, segment.end);
+  }
+  function previewTimeRange(start: number, end: number) {
     const video = sourcePreviewRef.current;
     if (!video) return;
-    setPreviewEnd(segment.end);
+    setPreviewEnd(end);
     const seekAndPlay = () => {
       video.pause();
       const playAfterSeek = () => void video.play();
-      if (Math.abs(video.currentTime - segment.start) < 0.001) {
+      if (Math.abs(video.currentTime - start) < 0.001) {
         playAfterSeek();
         return;
       }
       video.addEventListener("seeked", playAfterSeek, { once: true });
-      video.currentTime = segment.start;
+      video.currentTime = start;
     };
     if (video.readyState >= 1) seekAndPlay();
     else video.addEventListener("loadedmetadata", seekAndPlay, { once: true });
@@ -1410,10 +1588,17 @@ export default function WorkflowApp() {
     Math.max(60, Math.floor(metadata?.duration_seconds || 7200)),
   );
   const setTargetDuration = (value: number) =>
-    setSetting(
-      "target_duration_seconds",
-      Math.min(targetDurationMax, Math.max(60, value)),
+    {
+      const corrected = Math.min(targetDurationMax, Math.max(60, value));
+      setTargetDurationInput(String(corrected));
+      setSetting("target_duration_seconds", corrected);
+    };
+  const commitTargetDurationInput = () => {
+    const parsed = Number(targetDurationInput);
+    setTargetDuration(
+      Number.isFinite(parsed) ? parsed : settings.target_duration_seconds,
     );
+  };
   const resetTargetDuration = () =>
     setTargetDuration(
       Math.round((metadata?.duration_seconds || 0) / 4 / 30) * 30,
@@ -1428,6 +1613,7 @@ export default function WorkflowApp() {
           max={targetDurationMax}
           step={1}
           value={settings.target_duration_seconds}
+          disabled={controlsLocked}
           onChange={(event) => setTargetDuration(Number(event.target.value))}
         />
         <span className="duration-number-input">
@@ -1437,8 +1623,13 @@ export default function WorkflowApp() {
             min={60}
             max={targetDurationMax}
             step={1}
-            value={settings.target_duration_seconds}
-            onChange={(event) => setTargetDuration(Number(event.target.value))}
+            value={targetDurationInput}
+            disabled={controlsLocked}
+            onChange={(event) => setTargetDurationInput(event.target.value)}
+            onBlur={commitTargetDurationInput}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+            }}
           />
           <span>초</span>
         </span>
@@ -1449,6 +1640,7 @@ export default function WorkflowApp() {
             type="button"
             className="ghost duration-reset"
             onClick={resetTargetDuration}
+            disabled={controlsLocked}
           >
             초기화
           </button>
@@ -1785,31 +1977,242 @@ export default function WorkflowApp() {
                 이전
               </button>
               <button onClick={advanceToAnalysis} disabled={busy || !token}>
-                다음: 분석 설정
+                다음: 스크립트 처리
               </button>
             </div>
           </section>
         )}
-        {phase === "analysis" && (
+        {phase === "review" && !review && (
           <section className="panel">
             <Heading
-              index="03"
-              title="영상 분석 및 편집 후보 만들기"
-              text="2단계에서 준비한 스크립트를 재사용해 챕터별 편집 후보를 만듭니다."
+              index="04"
+              title="스크립트 처리 및 구간 검토"
+              text="스크립트 원문부터 챕터·섹션 분할과 점수 부여까지 처리 결과를 순서대로 확인하세요."
             />
-            <div className="settings-grid">
-              <label className="setting-card">
-                <span>스크립트 소스</span>
-                <CustomSelect
-                  ariaLabel="스크립트 소스"
-                  value={settings.transcription_source}
-                  options={scriptSourceOptions}
-                  onChange={(value) =>
-                    setSetting("transcription_source", value)
-                  }
+            {!structuredChapters.length && (
+              <div className="analysis-source-control">
+                <label>
+                  <span>스크립트 소스</span>
+                  <CustomSelect
+                    ariaLabel="스크립트 소스"
+                    value={settings.transcription_source}
+                    options={scriptSourceOptions}
+                    disabled={controlsLocked}
+                    onChange={(value) => {
+                      setJob(null);
+                      setStructuredChapters([]);
+                      setSetting("transcription_source", value);
+                    }}
+                  />
+                </label>
+                <label>
+                  <span>챕터 분할</span>
+                  <CustomSelect
+                    ariaLabel="챕터 분할 방식"
+                    value={settings.chapter_split_mode}
+                    options={[
+                      ...(metadata?.chapters?.length
+                        ? [{ value: "uploader" as const, label: "업로더 기준" }]
+                        : []),
+                      { value: "automatic" as const, label: "자동 분할" },
+                    ]}
+                    disabled={controlsLocked}
+                    onChange={(value) => setSetting("chapter_split_mode", value)}
+                  />
+                </label>
+                <div className="prompt-profile-control">
+                  <span>판별 기준</span>
+                  <div className="prompt-profile-actions">
+                    <CustomSelect
+                      ariaLabel="판별 기준"
+                      className="prompt-profile-select"
+                      value={settings.criteria_prompt}
+                      options={promptProfiles.map((item) => ({ value: item.id, label: item.name }))}
+                      disabled={controlsLocked || !promptProfiles.length}
+                      onChange={(value) => setSetting("criteria_prompt", value)}
+                    />
+                    <button
+                      type="button"
+                      className="ghost compact"
+                      disabled={controlsLocked || !promptProfiles.length}
+                      onClick={() => {
+                        const selected = promptProfiles.find((item) => item.id === settings.criteria_prompt);
+                        if (selected) {
+                          setCreatingPrompt(false);
+                          setPromptEditor({ ...selected });
+                        }
+                      }}
+                    >
+                      수정
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost compact"
+                      disabled={controlsLocked}
+                      onClick={() => {
+                        setCreatingPrompt(true);
+                        setPromptEditor({ id: "", name: "", description: "", criteria: "" });
+                      }}
+                    >
+                      추가
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+            {structuredChapters.length > 0 && (
+              <div className="settings-grid analysis-target-setting">
+                {settingsDuration()}
+              </div>
+            )}
+            <div className="script-workflow-card">
+              <div className="script-workflow-heading">
+                <div>
+                  <strong>
+                    {structuredChapters.length ? "분할 결과" : "스크립트 문장"}
+                  </strong>
+                  <span>
+                    {structuredChapters.length
+                      ? `${structuredChapters.length.toLocaleString()}개 챕터`
+                      : `${scriptSegments.length.toLocaleString()}개 문장`}
+                  </span>
+                </div>
+                {!structuredChapters.length && (
+                  <div className="script-workflow-actions">
+                    <button
+                      onClick={startAnalysis}
+                      disabled={
+                        busy ||
+                        scriptLoading ||
+                        !scriptSegments.length ||
+                        !metadata ||
+                        !token ||
+                        Boolean(
+                          job && !["cancelled", "failed"].includes(job.status),
+                        )
+                      }
+                    >
+                      분할
+                    </button>
+                  </div>
+                )}
+              </div>
+              <div className="review-layout script-review-layout">
+              <div className="preview-card">
+                <h3>원본 구간 미리보기</h3>
+                <video
+                  ref={sourcePreviewRef}
+                  controls
+                  src={sourceMediaUrl || undefined}
+                  onTimeUpdate={(event) => {
+                    if (
+                      previewEnd !== null &&
+                      event.currentTarget.currentTime >= previewEnd
+                    ) {
+                      event.currentTarget.pause();
+                      setPreviewEnd(null);
+                    }
+                  }}
                 />
-              </label>
-              {settingsDuration()}
+              </div>
+              <div>
+              {!structuredChapters.length ? (
+                <div className="script-sentence-list">
+                {scriptLoading ? (
+                  <p className="empty-preview">스크립트를 불러오는 중입니다.</p>
+                ) : scriptSegments.length ? (
+                  scriptSegments.map((segment, segmentIndex) => (
+                    <div className="segment script-sentence" key={segment.id}>
+                      <div className="segment-content">
+                        <b>
+                          문장 {segmentIndex + 1}
+                          <span className="header-separator">·</span>
+                          <DetailedTime value={segment.start} />–
+                          <DetailedTime value={segment.end} />
+                        </b>
+                        <div className="segment-text">{segment.text}</div>
+                      </div>
+                      <button
+                        type="button"
+                        className="ghost compact"
+                        onClick={() => previewTimeRange(segment.start, segment.end)}
+                      >
+                        미리보기
+                      </button>
+                    </div>
+                  ))
+                ) : (
+                  <p className="empty-preview">표시할 스크립트가 없습니다.</p>
+                )}
+                </div>
+              ) : (
+                <div className="structure-preview">
+                {structuredChapters.map((chapter, chapterIndex) => (
+                  <article className="chapter workflow-chapter" key={chapter.chapter_id}>
+                    <div className="chapter-head structure-chapter-head">
+                      <div>
+                        <b>
+                          챕터 {chapterIndex + 1}
+                          <span className="header-separator">·</span>
+                          <DetailedTime value={chapter.start} />–
+                          <DetailedTime value={chapter.end} />
+                          <span className="header-separator">·</span>
+                          섹션 {chapter.sections.length}개
+                        </b>
+                        <p>{chapter.summary}</p>
+                      </div>
+                      <button
+                        className="ghost compact"
+                        onClick={() =>
+                          setOpenChapters((current) => {
+                            const next = new Set(current);
+                            next.has(chapter.chapter_id)
+                              ? next.delete(chapter.chapter_id)
+                              : next.add(chapter.chapter_id);
+                            return next;
+                          })
+                        }
+                      >
+                        {openChapters.has(chapter.chapter_id) ? "접기" : "세부 구간"}
+                      </button>
+                    </div>
+                    {openChapters.has(chapter.chapter_id) && (
+                    <div className="workflow-section-list">
+                      {chapter.sections.map((section, sectionIndex) => (
+                        <div className="segment structure-section" key={section.section_id}>
+                          <div className="segment-content">
+                            <b>
+                              섹션 {sectionIndex + 1}
+                              <span className="header-separator">·</span>
+                              <DetailedTime value={section.start} />–
+                              <DetailedTime value={section.end} />
+                            </b>
+                            <div className="segment-text segment-text-lines">
+                              {(section.text_segments?.length
+                                ? section.text_segments
+                                : [section.text]
+                              ).map((text, textIndex) => (
+                                <span key={textIndex}>{text}</span>
+                              ))}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            className="ghost compact"
+                            onClick={() => previewTimeRange(section.start, section.end)}
+                          >
+                            미리보기
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                    )}
+                  </article>
+                ))}
+                </div>
+              )}
+              </div>
+            </div>
             </div>
             <Status text={message} failed={job?.status === "failed"} />
             <div className="phase-actions">
@@ -1819,12 +2222,6 @@ export default function WorkflowApp() {
               >
                 이전
               </button>
-              <button
-                onClick={startAnalysis}
-                disabled={busy || !metadata || !token}
-              >
-                다음: AI 분석 시작
-              </button>
             </div>
           </section>
         )}
@@ -1833,9 +2230,25 @@ export default function WorkflowApp() {
             <Heading
               index="04"
               title="구간 검토 및 영상 생성"
-              text="챕터 요약을 확인하고 포함할 섹션을 직접 선택하세요."
+              text={
+                selectionEnabled
+                  ? "챕터 요약을 확인하고 포함할 섹션을 직접 선택하세요."
+                  : "분할 결과와 전체 점수를 확인한 뒤 다음을 눌러 필수 관계를 판별하세요."
+              }
             />
-            <div className="review-layout">
+            {job?.status === "awaiting_scoring" && (
+              <div className="settings-grid analysis-target-setting">
+                {settingsDuration()}
+              </div>
+            )}
+            <div className="script-workflow-card scored-workflow-card">
+              <div className="script-workflow-heading">
+                <div>
+                  <strong>점수 결과</strong>
+                  <span>{review.chapters.length.toLocaleString()}개 챕터</span>
+                </div>
+              </div>
+              <div className="review-layout">
               <div className="preview-card">
                 <h3>원본 구간 미리보기</h3>
                 <video
@@ -1862,6 +2275,7 @@ export default function WorkflowApp() {
                   <div>
                     <button
                       className="ghost compact"
+                      disabled={!selectionEnabled}
                       onClick={() =>
                         updateSelection(new Set(review.recommended_segment_ids))
                       }
@@ -1870,6 +2284,7 @@ export default function WorkflowApp() {
                     </button>
                     <button
                       className="ghost compact"
+                      disabled={!selectionEnabled}
                       onClick={() =>
                         updateSelection(
                           new Set(
@@ -1886,6 +2301,7 @@ export default function WorkflowApp() {
                     </button>
                     <button
                       className="ghost compact"
+                      disabled={!selectionEnabled}
                       onClick={() => updateSelection(new Set())}
                     >
                       전체 해제
@@ -1905,6 +2321,7 @@ export default function WorkflowApp() {
                           <input
                             type="checkbox"
                             checked={allSelected}
+                            disabled={!selectionEnabled}
                             onChange={(event) => {
                               const ids = new Set(
                                 selected.map((section) => section.section_id),
@@ -1961,6 +2378,7 @@ export default function WorkflowApp() {
                                 <input
                                   type="checkbox"
                                   checked={section.selected}
+                                  disabled={!selectionEnabled}
                                   onChange={() => {
                                     const ids = new Set(
                                       selected.map((item) => item.section_id),
@@ -2013,7 +2431,14 @@ export default function WorkflowApp() {
                                       </em>
                                     )}
                                   </div>
-                                  <div className="segment-text">{section.text}</div>
+                                  <div className="segment-text segment-text-lines">
+                                    {(section.text_segments?.length
+                                      ? section.text_segments
+                                      : [section.text]
+                                    ).map((text, textIndex) => (
+                                      <span key={textIndex}>{text}</span>
+                                    ))}
+                                  </div>
                                 </div>
                                 <button
                                   type="button"
@@ -2037,12 +2462,13 @@ export default function WorkflowApp() {
                   })}
                 </div>
               </div>
+              </div>
             </div>
             <Status text={message} failed={job?.status === "failed"} />
             <div className="phase-actions">
               <button
                 className="ghost"
-                onClick={() => transitionToPhase("analysis")}
+                onClick={() => transitionToPhase("materials")}
               >
                 이전
               </button>
@@ -2080,6 +2506,54 @@ export default function WorkflowApp() {
           </section>
         )}
       </main>
+      {promptEditor && (
+        <div className="prompt-modal-backdrop" role="presentation">
+          <section className="prompt-modal" role="dialog" aria-modal="true" aria-labelledby="prompt-editor-title">
+            <h3 id="prompt-editor-title">판별 기준 {creatingPrompt ? "추가" : "수정"}</h3>
+            <label>
+              <span>ID</span>
+              <input
+                value={promptEditor.id}
+                disabled={!creatingPrompt}
+                placeholder="영문 소문자 ID"
+                onChange={(event) => setPromptEditor({ ...promptEditor, id: event.target.value })}
+              />
+            </label>
+            {(["name", "description", "criteria"] as const).map((key) => (
+              <label key={key}>
+                <span>{{ name: "이름", description: "설명", criteria: "판별 기준" }[key]}</span>
+                <textarea
+                  className="prompt-auto-textarea"
+                  rows={1}
+                  value={promptEditor[key]}
+                  ref={(element) => {
+                    if (!element) return;
+                    element.style.height = "auto";
+                    element.style.height = `${element.scrollHeight}px`;
+                  }}
+                  onChange={(event) => {
+                    event.currentTarget.style.height = "auto";
+                    event.currentTarget.style.height = `${event.currentTarget.scrollHeight}px`;
+                    setPromptEditor({ ...promptEditor, [key]: event.target.value });
+                  }}
+                />
+              </label>
+            ))}
+            <div className="prompt-modal-actions">
+              <button type="button" className="danger ghost" onClick={deletePromptProfile}>
+                삭제
+              </button>
+              <span />
+              <button type="button" className="ghost" onClick={() => setPromptEditor(null)}>
+                취소
+              </button>
+              <button type="button" onClick={savePromptProfile} disabled={!promptEditor.id.trim() || !promptEditor.name.trim() || !promptEditor.criteria.trim()}>
+                저장
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
       <aside
         className="progress-dock"
         data-state={activeProgress.status}
@@ -2118,9 +2592,13 @@ export default function WorkflowApp() {
             재시도
           </button>
         ) : job &&
-          !["completed", "failed", "cancelled", "awaiting_selection"].includes(
-            job.status,
-          ) ? (
+          ![
+            "completed",
+            "failed",
+            "cancelled",
+            "awaiting_scoring",
+            "awaiting_selection",
+          ].includes(job.status) ? (
             <button
               className="ghost compact cancel-job-button"
               onClick={cancelJob}
@@ -2136,11 +2614,15 @@ export default function WorkflowApp() {
           token={Boolean(token)}
           busy={controlsLocked}
           hasSelection={selected.length > 0}
+          reviewReady={selectionEnabled && Boolean(review)}
+          canScore={
+            job?.status === "awaiting_scoring" && structuredChapters.length > 0
+          }
           hasRenderedResult={Boolean(job?.result?.revision)}
           onPhase={transitionToPhase}
           onDownloadMaterials={downloadMaterials}
           onAdvanceToAnalysis={advanceToAnalysis}
-          onStart={startAnalysis}
+          onScore={scoreAnalysis}
           onRender={renderSelection}
           onRestart={restart}
         />
@@ -2496,11 +2978,13 @@ function FooterActions({
   token,
   busy,
   hasSelection,
+  reviewReady,
+  canScore,
   hasRenderedResult,
   onPhase,
   onDownloadMaterials,
   onAdvanceToAnalysis,
-  onStart,
+  onScore,
   onRender,
   onRestart,
 }: {
@@ -2509,11 +2993,13 @@ function FooterActions({
   token: boolean;
   busy: boolean;
   hasSelection: boolean;
+  reviewReady: boolean;
+  canScore: boolean;
   hasRenderedResult: boolean;
   onPhase: (phase: Phase) => void;
   onDownloadMaterials: () => void;
   onAdvanceToAnalysis: () => void;
-  onStart: () => void;
+  onScore: () => void;
   onRender: () => void;
   onRestart: () => void;
 }) {
@@ -2545,8 +3031,8 @@ function FooterActions({
           이전
         </button>
         <button
-          title="다음: 분석 설정"
-          aria-label="다음: 분석 설정"
+          title="다음: 스크립트 처리 및 구간 검토"
+          aria-label="다음: 스크립트 처리 및 구간 검토"
           onClick={onAdvanceToAnalysis}
           disabled={busy}
         >
@@ -2554,7 +3040,7 @@ function FooterActions({
         </button>
       </div>
     );
-  if (phase === "analysis")
+  if (phase === "review")
     return (
       <div className="footer-actions">
         <button
@@ -2566,36 +3052,26 @@ function FooterActions({
         >
           이전
         </button>
-        <button
-          title="다음: AI 분석 시작"
-          aria-label="다음: AI 분석 시작"
-          onClick={onStart}
-          disabled={busy || !metadataReady || !token}
-        >
-          다음
-        </button>
-      </div>
-    );
-  if (phase === "review")
-    return (
-      <div className="footer-actions">
-        <button
-          className="ghost"
-          title="이전: 분석 설정"
-          aria-label="이전: 분석 설정"
-          onClick={() => changePhase("analysis")}
-          disabled={busy}
-        >
-          이전
-        </button>
-        <button
-          title="다음: 선택 구간 렌더링"
-          aria-label="다음: 선택 구간 렌더링"
-          onClick={onRender}
-          disabled={busy || !hasSelection}
-        >
-          다음
-        </button>
+        {reviewReady && (
+          <button
+            title="다음: 선택 구간 렌더링"
+            aria-label="다음: 선택 구간 렌더링"
+            onClick={onRender}
+            disabled={busy || !hasSelection}
+          >
+            다음
+          </button>
+        )}
+        {!reviewReady && (
+          <button
+            title="다음: 챕터 내 필수 관계 판별"
+            aria-label="다음: 챕터 내 필수 관계 판별"
+            onClick={onScore}
+            disabled={busy || !canScore}
+          >
+            다음
+          </button>
+        )}
       </div>
     );
   return (
