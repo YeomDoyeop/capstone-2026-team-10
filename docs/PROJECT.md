@@ -11,7 +11,7 @@ AVE(Automatic Video Edit)는 영상의 내용을 분석하고 자동 편집을 �
 * ave-client
   * 사용자 PC에서 실행되는 클라이언트 모듈. 로컬 서버와 웹 기반 사용자 인터페이스를 포함하며, `yt-dlp`, FFmpeg 등 로컬 도구를 사용한 영상 수집·분석·렌더링과 사용자 작업 제어를 담당한다.
 * ave-dist
-  * 향후 PyInstaller 기반 Windows 포터블 앱 설정과 배포 산출물을 관리할 모듈. 현재는 패키징을 진행하지 않는다.
+  * PyInstaller 기반 Windows x64 포터블 앱 설정과 배포 산출물을 관리하는 모듈. 클라이언트 실행 파일, FFmpeg·FFprobe 및 yt-dlp 바이너리 업데이터, 외부 정적 UI를 포함한 배포 ZIP을 생성한다.
 * ave-server
   * 중앙 백엔드 서버 모듈. AVE의 API 요청 처리와 결과 반환, 사용자 인증, 외부 서비스 호출, 작업 이력과 분석 데이터 저장을 담당하며, 축적된 데이터를 기반으로 향후 추천·머신러닝 기능을 제공한다. 원격 STT가 필요한 경우 전사용 오디오의 임시 호스팅도 담당한다.
 * ave-whisper-api
@@ -52,4 +52,4 @@ AVE(Automatic Video Edit)는 영상의 내용을 분석하고 자동 편집을 �
 * 새로운 요구사항이 생길 때 필요한 설계와 문서를 추가한다.
 # 현재 기준 안내
 
-전체 시스템 흐름과 저장 대상의 상위 기준은 [SYSTEM_GUIDELINES.md](SYSTEM_GUIDELINES.md)를 따른다. 현재 모듈 책임, 데이터 경계, 임시 오디오 전사 방식과 배포 범위는 [CURRENT_ARCHITECTURE.md](CURRENT_ARCHITECTURE.md)를 우선 기준으로 한다. 특히 `ave-dist`의 PyInstaller 포터블 패키징은 향후 작업이며 현재 진행하지 않는다.
+전체 시스템 흐름과 저장 대상의 상위 기준은 [SYSTEM_GUIDELINES.md](SYSTEM_GUIDELINES.md)를 따른다. 현재 모듈 책임, 데이터 경계, 임시 오디오 전사 방식과 배포 범위는 [CURRENT_ARCHITECTURE.md](CURRENT_ARCHITECTURE.md)를 우선 기준으로 한다. `ave-dist`의 PyInstaller 포터블 패키징은 구현되어 있으며, 실제 배포 전에는 깨끗한 Windows x64 환경에서 클라이언트 기능과 외부 바이너리 라이선스를 별도로 검증한다.
