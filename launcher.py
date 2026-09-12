@@ -50,6 +50,7 @@ def main() -> None:
 
     from fastapi.staticfiles import StaticFiles
     from app import main as client_main
+    from app.services import prompt_store
 
     static_root = application_root / "static"
     ui_root = static_root / "ui"
@@ -57,6 +58,10 @@ def main() -> None:
         raise RuntimeError(f"정적 UI를 찾을 수 없습니다: {ui_root}")
     client_main.STATIC_DIR = static_root
     client_main.REACT_UI_DIR = ui_root
+    prompt_store.PROMPT_ROOT = application_root / "prompts"
+    prompt_store.USER_PROMPT_DIR = prompt_store.PROMPT_ROOT / "user"
+    prompt_store.SYSTEM_PROMPT_DIR = prompt_store.PROMPT_ROOT / "system"
+    prompt_store.SCHEMA_DIR = prompt_store.PROMPT_ROOT / "schemas"
     if (ui_root / "assets").is_dir():
         client_main.app.mount(
             "/ui/assets",

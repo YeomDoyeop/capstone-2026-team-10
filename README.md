@@ -12,12 +12,16 @@ release/
 │  ├─ ave_client.exe
 │  ├─ ave_updater.exe
 │  ├─ readme.txt
+│  ├─ prompts/
+│  │  ├─ user/
+│  │  ├─ system/
+│  │  └─ schemas/
 │  └─ static/
 │     └─ ui/
 └─ AVE-client-<version>-windows-x64.zip
 ```
 
-`ave_client.exe`는 Python 런타임과 빌드 시점의 `.env`를 포함한 단일 파일입니다. 정적 UI는 실행 파일에 포함하지 않고 루트의 `static/ui`에서 읽습니다. 외부 `.env`나 예시 설정 파일은 만들지 않습니다.
+`ave_client.exe`는 Python 런타임과 빌드 시점의 `.env`를 포함한 단일 파일입니다. 정적 UI는 실행 파일에 포함하지 않고 루트의 `static/ui`에서 읽습니다. 외부 `prompts/user`에는 UI에서 관리하는 판별 기준을, `prompts/system`에는 호출별 시스템 프롬프트를, `prompts/schemas`에는 JSON 응답 계약을 둡니다. 외부 `.env`나 예시 설정 파일은 만들지 않습니다.
 
 `ave_updater.exe`는 첫 화면에서 `FFmpeg 및 FFprobe`와 `yt-dlp`를 체크박스로 선택하고 **다음**을 눌러야 설치를 시작합니다. 진행 화면에는 현재 작업과 현재·전체 진행률을 표시하며, **중지**를 누르면 임시 파일 정리를 마친 뒤 창을 닫을 수 있습니다. 별도 업데이트 매니페스트를 사용하지 않고 실행 시 최신 바이너리를 직접 받습니다. yt-dlp 공식 GitHub 최신 릴리스에서 `yt-dlp.exe`를 받고, FFmpeg 공식 다운로드 페이지가 Windows 빌드로 안내하는 gyan.dev의 최신 release essentials ZIP에서 `ffmpeg.exe`와 `ffprobe.exe`를 추출합니다. 제공처의 SHA-256도 함께 받아 검증한 뒤 루트의 `bin`에 교체합니다. `ave_client.exe`는 변경하지 않습니다. 업데이터 UI는 운영체제의 기본 글꼴을 사용합니다.
 

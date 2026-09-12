@@ -143,12 +143,16 @@ Move-Item -LiteralPath (Join-Path $buildRoot 'dist\ave_updater.exe') -Destinatio
 Copy-Item -LiteralPath (Join-Path $distRoot 'readme.txt') -Destination $packageDir
 New-Item -ItemType Directory -Path (Join-Path $packageDir 'static') | Out-Null
 Copy-Item -LiteralPath $staticStage -Destination (Join-Path $packageDir 'static\ui') -Recurse
+Copy-Item -LiteralPath (Join-Path $clientRoot 'prompts') -Destination (Join-Path $packageDir 'prompts') -Recurse
 
 $requiredPackageFiles = @(
     'ave_client.exe',
     'ave_updater.exe',
     'readme.txt',
     'static\ui\index.html'
+    'prompts\user\ai_news.json'
+    'prompts\system\chapter.json'
+    'prompts\schemas\chapter.json'
 )
 foreach ($relativePath in $requiredPackageFiles) {
     $candidate = Join-Path $packageDir $relativePath

@@ -13,7 +13,7 @@ AVE는 영상 분석 및 자동 편집을 지원하는 Windows용 클라이언�
 3. 필요한 구성 요소를 선택하고 [다음]을 눌러 다운로드합니다.
 4. 작업이 완료되면 ave_client.exe를 실행합니다.
 
-ave_client.exe와 ave_updater.exe의 위치를 옮길 때에는 static 폴더도
+ave_client.exe와 ave_updater.exe의 위치를 옮길 때에는 static 및 prompts 폴더도
 같은 위치에 함께 두어야 합니다. ZIP 안의 디렉터리 구조를 유지하십시오.
 
 
@@ -31,6 +31,10 @@ ave_updater.exe
 static\ui
   AVE의 웹 사용자 인터페이스 파일입니다. ave_client.exe가 실행 파일과
   같은 위치의 이 디렉터리를 읽으므로 삭제하거나 분리하지 마십시오.
+
+prompts\user, prompts\system, prompts\schemas
+  영상 판별 기준, LLM 시스템 프롬프트와 응답 스키마 JSON 파일입니다. user 프롬프트는
+  웹 화면에서도 추가, 수정, 삭제할 수 있습니다.
 
 
 로컬 생성 파일
