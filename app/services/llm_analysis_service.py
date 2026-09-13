@@ -205,9 +205,14 @@ class LLMAnalysisService:
                 not isinstance(indexes, list)
                 or any(type(index) is not int for index in indexes)
                 or indexes != sorted(set(indexes))
-                or any(index < 0 or index >= len(rows) - 1 for index in indexes)
+                or any(index < 0 or index >= len(rows) for index in indexes)
             ):
                 raise LLMAnalysisError("자막 분할 경계 인덱스가 올바르지 않습니다.")
+            # 일부 모델은 마지막 자막 조각의 종료 단어도 경계로 덧붙인다.
+            # 마지막 단어 ID는 빈 조각을 만들지 않는 종료 표식이므로 이 값
+            # 하나만 제거한다. 다른 범위·중복·순서 위반은 그대로 거부한다.
+            if indexes and indexes[-1] == len(rows) - 1:
+                indexes = indexes[:-1]
             starts = [0, *(index + 1 for index in indexes)]
             ends = [*indexes, len(rows) - 1]
             return [

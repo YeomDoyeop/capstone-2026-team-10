@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.services.llm_gateway import LLMGateway
+from app.services.llm_gateway import LLMGateway, LLMGatewayError
 import pytest
 
 from app.services.server_job_service import _score, create_job, save_result
@@ -36,6 +36,25 @@ def test_llm_gateway_uses_authenticated_ave_server_api(monkeypatch):
     assert captured["url"] == "https://ave-server.example.test/api/llm/generate"
     assert captured["headers"]["Authorization"] == "Bearer session"
     assert captured["json"]["provider"] == "gemini"
+
+
+def test_llm_gateway_preserves_ave_server_provider_error(monkeypatch):
+    monkeypatch.setenv("AVE_SERVER_URL", "https://ave-server.example.test")
+
+    class ErrorResponse(FakeResponse):
+        status_code = 502
+
+    monkeypatch.setattr(
+        "app.services.llm_gateway.requests.post",
+        lambda *_args, **_kwargs: ErrorResponse(
+            {"detail": "GEMINI API 오류 (HTTP 400): Invalid request"}
+        ),
+    )
+
+    with pytest.raises(LLMGatewayError, match="GEMINI API 오류 \\(HTTP 400\\)"):
+        LLMGateway("gemini", server_access_token="Bearer session").request_json(
+            "system", "prompt"
+        )
 
 
 def test_job_result_sends_only_analysis_data_to_server(monkeypatch):

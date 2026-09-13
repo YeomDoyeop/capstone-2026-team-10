@@ -10,14 +10,14 @@ from app.config import get_ave_server_url
 
 SUPPORTED_LLM_PROVIDERS = ("gemini", "deepseek")
 
-# 공급자별 한도는 공통 분석 계약과 분리한다. 실제 계정 전체의 RPM 제한은
-# AVE Server도 적용해야 하지만, 클라이언트는 한 작업 안에서 이를 넘지 않는다.
+# 공급자별 한도는 공통 분석 계약과 분리한다. Gemini의 프로젝트 전체
+# 4,000 RPM 제한은 AVE Server가 모든 클라이언트 요청을 합산해 적용한다.
 LLM_PROVIDER_EXECUTION_LIMITS = {
     "deepseek": {"max_parallel_requests": 100, "minimum_request_interval_seconds": 0.0},
     "gemini": {
-        "max_parallel_requests": 1,
-        "minimum_request_interval_seconds": 4.0,
-    },  # 15 RPM
+        "max_parallel_requests": 50,
+        "minimum_request_interval_seconds": 0.015,
+    },  # 작업당 최대 4,000 RPM
 }
 
 
@@ -81,15 +81,18 @@ class LLMGateway:
                     },
                     timeout=self.timeout,
                 )
-                if getattr(response, "status_code", None) in {429, 503}:
+                if getattr(response, "status_code", None) in {429, 502, 503}:
                     try:
                         detail = str(
                             response.json().get("detail")
-                            or "LLM API 사용량 제한 또는 일시 장애"
+                            or "AVE 서버 LLM 호출에 실패했습니다."
                         )
-                    except ValueError:
-                        detail = "LLM API 사용량 제한 또는 일시 장애"
-                    raise LLMGatewayError(detail, unavailable=True)
+                    except (ValueError, AttributeError):
+                        detail = "AVE 서버 LLM 호출에 실패했습니다."
+                    raise LLMGatewayError(
+                        detail,
+                        unavailable=response.status_code in {429, 503},
+                    )
                 response.raise_for_status()
                 value = response.json().get("text")
             except LLMGatewayError:

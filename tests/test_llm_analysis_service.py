@@ -152,6 +152,37 @@ def test_subtitle_split_accepts_no_boundary_when_llm_cannot_split(monkeypatch):
     assert result == [{"start_word": 0, "end_word": 2}]
 
 
+def test_subtitle_split_ignores_redundant_final_word_index(monkeypatch):
+    agent = object.__new__(LLMAnalysisService)
+    monkeypatch.setattr(
+        agent,
+        "_request_json",
+        lambda *_args, **kwargs: kwargs["validator"]({"indexes": [1, 3, 5]}),
+    )
+
+    result = agent.split_subtitle_words(
+        [{"word": value} for value in ["가", "나", "다", "라", "마", "바"]]
+    )
+
+    assert result == [
+        {"start_word": 0, "end_word": 1},
+        {"start_word": 2, "end_word": 3},
+        {"start_word": 4, "end_word": 5},
+    ]
+
+
+def test_subtitle_split_still_rejects_out_of_range_indexes(monkeypatch):
+    agent = object.__new__(LLMAnalysisService)
+    monkeypatch.setattr(
+        agent,
+        "_request_json",
+        lambda *_args, **kwargs: kwargs["validator"]({"indexes": [3]}),
+    )
+
+    with pytest.raises(LLMAnalysisError, match="경계 인덱스"):
+        agent.split_subtitle_words([{"word": "가"}, {"word": "나"}, {"word": "다"}])
+
+
 def test_structure_requires_contiguous_ids_and_summaries(monkeypatch):
     agent = object.__new__(LLMAnalysisService)
     responses = iter(

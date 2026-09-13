@@ -1533,7 +1533,7 @@ class LiveEditPipeline:
                 )
         except LLMAnalysisError as exc:
             raise LiveEditPaused(
-                f"LLM 자막 분할이 재시도 한도에 도달했습니다: {exc}"
+                f"LLM 자막 분할 요청에 실패했습니다: {exc}"
             ) from exc
         transcript = {"request": split_request, "segments": segments}
         _write_json_atomic(shared_transcript_path, transcript)
