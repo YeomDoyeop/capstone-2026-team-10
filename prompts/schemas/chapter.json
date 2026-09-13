@@ -18,10 +18,12 @@
         ],
         "properties": {
           "start_id": {
-            "type": "integer"
+            "type": "integer",
+            "description": "챕터에 포함되는 첫 입력 문장 id. 시간(초)이 아니다."
           },
           "end_id": {
-            "type": "integer"
+            "type": "integer",
+            "description": "챕터에 포함되는 마지막 입력 문장 id (양끝 포함). start_id 이상이어야 한다."
           },
           "summary": {
             "type": "string"

@@ -259,6 +259,23 @@ def _clean_vtt_text(text_lines: list[str]) -> str:
     return re.sub(r"\s+", " ", html.unescape(text)).strip()
 
 
+def _vtt_timed_words(text_lines: list[str], start: str, end: str) -> list[dict]:
+    """명시적인 인라인 시각 사이의 텍스트만 보존한다. 단어 시간을 비례 추정하지 않는다."""
+    words = []
+    for line in text_lines:
+        parts = re.split(r"<(\d{2}:\d{2}:\d{2}\.\d{3})>", line)
+        if len(parts) < 3:
+            continue  # 롤링 자막의 이전 줄에는 현재 발화 시각을 부여하지 않는다.
+        current = _vtt_timestamp_seconds(start)
+        for index in range(0, len(parts), 2):
+            boundary = _vtt_timestamp_seconds(parts[index + 1] if index + 1 < len(parts) else end)
+            text = _clean_vtt_text([parts[index]])
+            if text and current < boundary:
+                words.append({"word": text, "start": current, "end": boundary})
+            current = boundary
+    return words
+
+
 def _parse_vtt_rows(content: str, filename: str) -> list[dict]:
     rows: list[dict] = []
     lines = content.replace("\r", "").split("\n")
@@ -286,6 +303,7 @@ def _parse_vtt_rows(content: str, filename: str) -> list[dict]:
                 "duration_seconds": _vtt_timestamp_seconds(end)
                 - _vtt_timestamp_seconds(start),
                 "text": _clean_vtt_text(text_lines),
+                "words": _vtt_timed_words(text_lines, start, end),
             }
         )
     return rows
@@ -325,6 +343,7 @@ def _rolling_caption_rows(rows: list[dict]) -> list[dict]:
                     "end": end,
                     "duration_seconds": _vtt_timestamp_seconds(end)
                     - _vtt_timestamp_seconds(start),
+                    "words": (spoken_cue or {}).get("words", []),
                 }
             )
         source = restored
@@ -981,6 +1000,7 @@ def download_metadata_materials(
                 "start": round(_vtt_timestamp_seconds(str(row["start"])), 3),
                 "end": round(_vtt_timestamp_seconds(str(row["end"])), 3),
                 "text": str(row["text"]),
+                "words": row.get("words", []),
             }
             for row in previews
             if row.get("text")

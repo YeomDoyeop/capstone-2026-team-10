@@ -598,6 +598,63 @@ def test_coherent_selection_preserves_anchor_and_expands_only_required_links():
     assert reviews == []
 
 
+@pytest.mark.parametrize("duration", [0.05, 1.0, 3.0, 4.999, 5.0])
+def test_coherent_selection_accepts_short_sentence_anchors(duration):
+    class Analysis:
+        def required_anchor_links(self, anchor_id, _summary, sections, **_kwargs):
+            assert anchor_id == "short"
+            assert [row["id"] for row in sections] == ["short"]
+            return []
+
+    sections = [{"segment_id": "short", "chapter_id": "c", "start": 0.0,
+                 "end": duration, "final_score": 1.0, "text": "핵심 문장."}]
+    selected, _ = _select_coherent_clips(sections, 10, Analysis())
+    assert selected == sections
+
+
+def test_short_anchor_and_short_required_context_are_both_selectable():
+    class Analysis:
+        def __init__(self):
+            self.calls = []
+
+        def required_anchor_links(self, anchor_id, _summary, sections, **_kwargs):
+            self.calls.append(anchor_id)
+            assert [row["id"] for row in sections] == ["context", "short-high", "long-low"]
+            return ["context"]
+
+    sections = [
+        {"segment_id": "context", "chapter_id": "c", "start": 0.0,
+         "end": 0.25, "final_score": 0.1},
+        {"segment_id": "short-high", "chapter_id": "c", "start": 0.25,
+         "end": 3.25, "final_score": 1.0},
+        {"segment_id": "long-low", "chapter_id": "c", "start": 3.25,
+         "end": 13.25, "final_score": 0.5},
+    ]
+    analysis = Analysis()
+    selected, _ = _select_coherent_clips(sections, 2, analysis)
+    assert [row["segment_id"] for row in selected] == ["context", "short-high"]
+    assert analysis.calls == ["short-high"]
+
+
+@pytest.mark.parametrize("duration", [0.0, -1.0, float("inf"), float("nan")])
+def test_selection_still_excludes_invalid_durations(duration):
+    class Analysis:
+        def required_anchor_links(self, *_args, **_kwargs):
+            pytest.fail("유효하지 않은 구간을 LLM에 보내면 안 됩니다.")
+
+    sections = [{"segment_id": "invalid", "start": 0.0, "end": duration}]
+    assert _select_coherent_clips(sections, 10, Analysis()) == ([], [])
+    assert _select_clips(sections, 10) == []
+
+
+def test_score_only_selection_also_accepts_sub_five_second_sections():
+    sections = [
+        {"segment_id": "short", "start": 0.0, "end": 3.0, "final_score": 1.0},
+        {"segment_id": "long", "start": 3.0, "end": 13.0, "final_score": 0.1},
+    ]
+    assert _select_clips(sections, 3) == [sections[0]]
+
+
 def test_coherent_selection_checks_ranked_anchors_even_in_the_same_chapter():
     class Analysis:
         def __init__(self):

@@ -3,12 +3,14 @@
 from __future__ import annotations
 import json
 import hashlib
+import logging
+import random
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
-from app.services.llm_gateway import LLMGateway, LLMGatewayError
+from app.services.llm_gateway import LLMGateway, LLMGatewayError, safe_error_detail
 from app.services.prompt_store import (
     PromptStoreError,
     response_schema,
@@ -19,6 +21,37 @@ from app.services.prompt_store import (
 
 class LLMAnalysisError(RuntimeError):
     """LLM 응답이 분석 계약을 지키지 않았을 때 발생한다."""
+
+
+JSON_MAX_ATTEMPTS = 3
+TRANSPORT_MAX_ATTEMPTS = 4
+MAX_AUTOMATIC_WAIT_SECONDS = 60
+DEFAULT_PARALLEL_REQUESTS = 20
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    # 완전한 코드펜스 하나만 허용한다. 잘린 JSON을 추측해서 복구하지 않는다.
+    value = text.strip()
+    if value.startswith("```"):
+        match = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n```", value, re.DOTALL | re.IGNORECASE)
+        if match:
+            value = match.group(1)
+
+    def pairs(items):
+        result = {}
+        for key, item in items:
+            if key in result:
+                raise LLMAnalysisError("JSON 객체 키가 중복되었습니다.")
+            result[key] = item
+        return result
+
+    def invalid_constant(_value):
+        raise LLMAnalysisError("JSON에 NaN 또는 Infinity를 사용할 수 없습니다.")
+
+    parsed = json.loads(value, object_pairs_hook=pairs, parse_constant=invalid_constant)
+    if not isinstance(parsed, dict):
+        raise LLMAnalysisError("응답 최상위는 JSON 객체여야 합니다.")
+    return parsed
 
 
 WHISPER_ENTITY_TYPES = frozenset(
@@ -70,6 +103,13 @@ class LLMAnalysisService:
                 cancel_callback()
             self._last_request_started_at = time.monotonic()
 
+    def _retry_pause(self, seconds, cancel_callback):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if cancel_callback:
+                cancel_callback()
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
     def _request_json(
         self,
         system: str,
@@ -79,9 +119,16 @@ class LLMAnalysisService:
         validator: Callable[[Any], Any] | None = None,
         cancel_callback: Callable[[], None] | None = None,
     ) -> Any:
+        system = (
+            "[공통 응답 계약]\n" + system_prompt("json_contract")
+            + "\n\n[작업 지침]\n" + system
+            + "\n\n[출력 스키마]\n"
+            + json.dumps(response_schema or {"type": "object"}, ensure_ascii=False, separators=(",", ":"))
+        )
         cache_key = hashlib.sha256(
             json.dumps(
-                [system, prompt, response_schema],
+                [getattr(self.gateway, "provider", ""), getattr(self.gateway, "model", ""),
+                 system, prompt, response_schema],
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -95,49 +142,71 @@ class LLMAnalysisService:
             with checkpoint_lock:
                 cached = responses.get(cache_key)
         if cached is not None:
-            value = validator(cached) if validator else cached
-            if cancel_callback:
-                cancel_callback()
-            return value
+            try:
+                value = validator(cached) if validator else cached
+            except LLMAnalysisError:
+                with checkpoint_lock:
+                    responses.pop(cache_key, None)
+            else:
+                if cancel_callback:
+                    cancel_callback()
+                return value
         last_error: Exception | None = None
-        for attempt in range(100):
+        invalid_count = 0
+        transport_count = 0
+        while invalid_count < JSON_MAX_ATTEMPTS:
             if cancel_callback:
                 cancel_callback()
             self._wait_for_request_slot(cancel_callback)
             rule = (
                 ""
-                if attempt == 0
+                if last_error is None
                 else (
                     "\n직전 응답 거부 사유: "
-                    + str(last_error)
+                    + safe_error_detail(last_error)
                     + " 설명하지 말고 이 사유를 고쳐 완결된 JSON 객체 하나만 반환하세요."
                 )
             )
             try:
-                raw = json.loads(
+                raw = _parse_json_object(
                     self.gateway.request_json(
                         system + rule, prompt, response_schema=response_schema
                     )
                 )
                 value = validator(raw) if validator else raw
-                if checkpoint_lock is not None:
-                    with checkpoint_lock:
-                        responses[cache_key] = raw
-                        callback = getattr(self, "_checkpoint_callback", None)
-                        if callback:
-                            callback()
-                if cancel_callback:
-                    cancel_callback()
-                return value
             except LLMGatewayError as exc:
-                raise LLMAnalysisError(
-                    f"구조화 JSON 요청에 실패했습니다: {exc}"
-                ) from exc
+                transport_count += 1
+                if not exc.retryable or transport_count >= TRANSPORT_MAX_ATTEMPTS:
+                    raise LLMAnalysisError(
+                        f"LLM 통신/API 오류 (호출 실패 {transport_count}회): {exc}"
+                    ) from exc
+                delay = max(2 ** transport_count + random.uniform(0, 1), exc.retry_after or 0)
+                if delay > MAX_AUTOMATIC_WAIT_SECONDS:
+                    raise LLMAnalysisError(
+                        f"LLM 서버가 {delay:.0f}초 후 재요청을 요구했습니다. 기다린 뒤 재시도하세요: {exc}"
+                    ) from exc
+                logging.getLogger(__name__).warning(
+                    "LLM 일시 오류, %.1f초 후 재시도 (%d/%d): %s",
+                    delay, transport_count, TRANSPORT_MAX_ATTEMPTS, safe_error_detail(exc),
+                )
+                self._retry_pause(delay, cancel_callback)
+                continue
             except (json.JSONDecodeError, LLMAnalysisError) as exc:
                 last_error = exc
+                invalid_count += 1
+                continue
+            if cancel_callback:
+                cancel_callback()
+            if checkpoint_lock is not None:
+                with checkpoint_lock:
+                    responses[cache_key] = raw
+                    callback = getattr(self, "_checkpoint_callback", None)
+                    if callback:
+                        callback()
+            return value
         detail = f": {last_error}" if last_error is not None else ""
         raise LLMAnalysisError(
-            f"LLM이 백 번 연속 JSON 문법 또는 응답 계약을 지키지 않았습니다{detail}"
+            f"LLM JSON/응답 계약 검증이 {JSON_MAX_ATTEMPTS}회 실패했습니다{detail}"
         ) from last_error
 
     @staticmethod
@@ -241,7 +310,7 @@ class LLMAnalysisService:
         expected = ids[0]
         known = set(ids)
         result = []
-        for item in values:
+        for index, item in enumerate(values):
             if not isinstance(item, dict):
                 raise LLMAnalysisError(f"{key} 항목 형식이 올바르지 않습니다.")
             expected_fields = (
@@ -252,17 +321,31 @@ class LLMAnalysisService:
             if set(item) != expected_fields:
                 raise LLMAnalysisError(f"{key} 항목 필드가 응답 계약과 다릅니다.")
             start, end = item.get("start_id"), item.get("end_id")
-            if (
-                type(start) is not int
-                or type(end) is not int
-                or start not in known
-                or end not in known
-                or start > end
-            ):
-                raise LLMAnalysisError(f"{key} ID 범위가 올바르지 않습니다.")
+            # 응답 본문이나 임의 문자열을 오류에 노출하지 않고 ID만 진단한다.
+            def describe_id(value: Any) -> str:
+                if value is None or type(value) in (bool, int, float):
+                    return f"{str(value)[:32]} ({type(value).__name__})"
+                if isinstance(value, str) and re.fullmatch(r"-?\d{1,16}(?:\.\d{1,8})?", value):
+                    return f"{value!r} (str)"
+                return f"<{type(value).__name__}>"
+
+            detail = (
+                f"{key}[{index}]: start_id={describe_id(start)}, "
+                f"end_id={describe_id(end)}; 허용 ID={ids[0]}~{ids[-1]} (정수, 양끝 포함). "
+            )
+            reason = None
+            if type(start) is not int or type(end) is not int:
+                reason = "ID는 문자열·소수·null이 아닌 JSON 정수여야 합니다."
+            elif start not in known or end not in known:
+                reason = "입력에 없는 ID입니다. 시간(초)이 아닌 입력 문장 ID를 사용하세요."
+            elif start > end:
+                reason = "start_id는 end_id 이하여야 합니다."
+            if reason:
+                raise LLMAnalysisError(f"{key} ID 범위가 올바르지 않습니다. {detail}{reason}")
             if start != expected:
                 raise LLMAnalysisError(
-                    f"{key} ID가 순서대로 전체 입력을 덮지 않습니다."
+                    f"{key} ID가 순서대로 전체 입력을 덮지 않습니다. "
+                    f"{detail}이 항목의 start_id는 {expected}여야 합니다."
                 )
             if require_chapter_fields and (
                 not isinstance(item.get("summary"), str)
@@ -275,7 +358,10 @@ class LLMAnalysisService:
             expected = end + 1
             result.append(item)
         if expected != ids[-1] + 1:
-            raise LLMAnalysisError(f"{key}가 입력 마지막 ID까지 덮지 않습니다.")
+            raise LLMAnalysisError(
+                f"{key}가 입력 마지막 ID까지 덮지 않습니다. "
+                f"마지막 end_id={expected - 1}, 필요한 end_id={ids[-1]}."
+            )
         return result
 
     @staticmethod
@@ -299,12 +385,28 @@ class LLMAnalysisService:
         if ids != list(range(ids[0], ids[-1] + 1)):
             raise LLMAnalysisError("입력 스크립트 ID가 연속적이지 않습니다.")
         if chapters is None:
+            # 파일에서 매번 새 객체를 읽어 요청 사이에 ID 제한이 공유되지 않는다.
+            chapter_schema = response_schema("chapter")
+            chapter_array = chapter_schema["properties"]["chapters"]
+            chapter_array.update(minItems=1, maxItems=len(ids))
+            for field in ("start_id", "end_id"):
+                chapter_array["items"]["properties"][field].update(
+                    minimum=ids[0], maximum=ids[-1]
+                )
+            chapter_system = system_prompt("chapter") + (
+                f"\n\n[이번 요청의 ID 계약]\n입력 문장 수={len(ids)}, "
+                f"허용 ID={ids[0]}~{ids[-1]} (양끝 포함). "
+                "ID는 시간(초)이 아니라 입력 JSONL의 정수 id다. "
+                f"첫 start_id={ids[0]}, 마지막 end_id={ids[-1]}. "
+                "각 start_id <= end_id이며 다음 start_id는 앞 end_id+1이다. "
+                "문자열·소수·null 또는 입력에 없는 ID를 반환하지 않는다."
+            )
             if progress_callback:
                 progress_callback(0, 1, "챕터 분할 요청")
             chapters = self._request_json(
-                system_prompt("chapter"),
+                chapter_system,
                 self._jsonl(rows),
-                response_schema=response_schema("chapter"),
+                response_schema=chapter_schema,
                 validator=lambda raw: self._validated_ranges(
                     raw, ids, key="chapters", require_chapter_fields=True
                 ),
@@ -313,48 +415,49 @@ class LLMAnalysisService:
             if progress_callback:
                 progress_callback(1, 1, "챕터 분할 완료")
 
-        def split(
-            index: int, chapter: dict[str, Any]
-        ) -> tuple[int, list[dict[str, Any]]]:
+        # 입력 ID는 파이프라인에서 구두점 기준으로 분리한 한 문장이다.
+        # LLM은 상위 챕터만 결정하며 섹션 경계를 재분할하거나 병합하지 않는다.
+        chapters = self._validated_ranges(
+            {"chapters": chapters}, ids, key="chapters", require_chapter_fields=True
+        )
+        sections = []
+        for index, chapter in enumerate(chapters):
             if cancel_callback:
                 cancel_callback()
-            chapter_rows = [
-                row
-                for row in rows
-                if chapter["start_id"] <= row["id"] <= chapter["end_id"]
-            ]
-            values = self._request_json(
-                system_prompt("section"),
-                self._jsonl(chapter_rows),
-                response_schema=response_schema("section"),
-                validator=lambda raw: self._validated_ranges(
-                    raw,
-                    [row["id"] for row in chapter_rows],
-                    key="sections",
-                    require_chapter_fields=False,
-                ),
-                cancel_callback=cancel_callback,
-            )
-            return index, values
-
-        indexed = []
-        with ThreadPoolExecutor(
-            max_workers=min(getattr(self, "_max_parallel_requests", 100), len(chapters))
-        ) as executor:
-            futures = [
-                executor.submit(split, index, chapter)
-                for index, chapter in enumerate(chapters)
-            ]
-            for completed, future in enumerate(as_completed(futures), 1):
-                if cancel_callback:
-                    cancel_callback()
-                indexed.append(future.result())
-                if progress_callback:
-                    progress_callback(completed, len(futures), "챕터별 섹션 분할")
-        sections = []
-        for index, values in sorted(indexed):
-            sections.extend({"chapter_index": index, **section} for section in values)
+            sections.extend({"chapter_index": index, "start_id": row_id, "end_id": row_id}
+                            for row_id in range(chapter["start_id"], chapter["end_id"] + 1))
+            if progress_callback:
+                progress_callback(index + 1, len(chapters), "마침표 기준 문장 섹션 구성")
         return {"chapters": chapters, "sections": sections}
+
+    def detect_fillers(self, candidates, *, cancel_callback=None, progress_callback=None):
+        """시간값을 LLM에 맡기지 않고 검증된 짧은 후보 ID만 판별한다."""
+        removed = []
+        for offset in range(0, len(candidates), 48):
+            batch = candidates[offset:offset + 48]
+            allowed = {item["id"] for item in batch}
+
+            def validate(raw):
+                if not isinstance(raw, dict) or set(raw) != {"remove_ids"}:
+                    raise LLMAnalysisError("추임새 응답은 remove_ids 배열이어야 합니다.")
+                ids = raw["remove_ids"]
+                if (not isinstance(ids, list) or any(type(i) is not int or i not in allowed for i in ids)
+                        or len(set(ids)) != len(ids)):
+                    raise LLMAnalysisError("추임새 응답에 잘못되거나 중복된 후보 ID가 있습니다.")
+                return ids
+
+            ids = self._request_json(
+                system_prompt("filler_detection"),
+                json.dumps({"candidates": [
+                    {key: item[key] for key in ("id", "text", "before", "after")} for item in batch
+                ]}, ensure_ascii=False),
+                response_schema=response_schema("filler_detection"),
+                validator=validate, cancel_callback=cancel_callback,
+            )
+            removed.extend(item for item in batch if item["id"] in ids)
+            if progress_callback:
+                progress_callback(min(offset + 48, len(candidates)), len(candidates))
+        return removed
 
     def score_sections(
         self,
@@ -365,6 +468,8 @@ class LLMAnalysisService:
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_callback: Callable[[], None] | None = None,
     ) -> list[dict[str, Any]]:
+        if not sections:
+            return []
         groups: dict[str, list[dict[str, Any]]] = {}
         for section in sections:
             groups.setdefault(str(section.get("chapter_id", "")), []).append(section)
@@ -373,82 +478,77 @@ class LLMAnalysisService:
         except PromptStoreError as exc:
             raise LLMAnalysisError(str(exc)) from exc
         system = system_prompt("section_score")
+        limit = getattr(getattr(self, "gateway", None), "max_input_chars", 12000)
+        batches = []
+        for group in groups.values():
+            # 챕터 요약과 동일 기준은 유지하고 응답 항목 수와 요청 길이를 제한한다.
+            overhead = len(system) + len(json.dumps(profile, ensure_ascii=False)) + len(str(group[0].get("chapter_summary", ""))) + 1500
+            budget = max(2000, limit - overhead)
+            batch, size = [], 0
+            for section in group:
+                item_size = len(json.dumps(str(section.get("text", "")), ensure_ascii=False)) + 40
+                if batch and (len(batch) >= 32 or size + item_size > budget):
+                    batches.append(batch)
+                    batch, size = [], 0
+                # 문장이 긴 단일 섹션은 자르거나 누락하지 않고 단독 요청한다.
+                batch.append(section)
+                size += item_size
+            if batch:
+                batches.append(batch)
 
         def score(chapter_sections: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if cancel_callback:
                 cancel_callback()
-            payload = [
-                {
-                    "id": index,
-                    "text": str(section.get("text", "")),
-                }
-                for index, section in enumerate(chapter_sections)
-            ]
+            payload = [{"id": index, "text": str(section.get("text", ""))}
+                       for index, section in enumerate(chapter_sections)]
+            expected = list(range(len(payload)))
+
+            def validate(raw):
+                if not isinstance(raw, dict) or set(raw) != {"items"}:
+                    raise LLMAnalysisError("섹션 중요도 응답 객체 형식이 올바르지 않습니다.")
+                items = raw["items"]
+                if not isinstance(items, list) or len(items) != len(payload):
+                    raise LLMAnalysisError(f"섹션 중요도 응답 개수가 입력 {len(payload)}개와 일치하지 않습니다.")
+                if any(not isinstance(item, dict) or set(item) != {"id", "score"} for item in items):
+                    raise LLMAnalysisError("섹션 중요도 항목 필드가 응답 계약과 다릅니다.")
+                if any(type(item["id"]) is not int for item in items) or [item["id"] for item in items] != expected:
+                    raise LLMAnalysisError("섹션 중요도 ID·순서가 입력과 일치하지 않습니다.")
+                if any(type(item["score"]) is not int or not 0 <= item["score"] <= 1000 for item in items):
+                    raise LLMAnalysisError("섹션 중요도 점수는 0~1000 정수여야 합니다.")
+                return raw
+
+            schema = response_schema("score")
+            schema["properties"]["items"].update(minItems=len(payload), maxItems=len(payload))
+            schema["properties"]["items"]["items"]["properties"]["id"]["enum"] = expected
             raw = self._request_json(
                 system,
-                json.dumps(
-                    {
-                        "criteria_profile": profile,
-                        "chapter_summary": str(
-                            chapter_sections[0].get("chapter_summary", "")
-                        ),
-                        "sections": payload,
-                    },
-                    ensure_ascii=False,
-                ),
-                response_schema=response_schema("score"),
+                json.dumps({
+                    "criteria_profile": profile,
+                    "chapter_summary": str(chapter_sections[0].get("chapter_summary", "")),
+                    "sections": payload,
+                }, ensure_ascii=False, separators=(",", ":")),
+                response_schema=schema,
+                validator=validate,
                 cancel_callback=cancel_callback,
             )
-            if not isinstance(raw, dict) or set(raw) != {"items"}:
-                raise LLMAnalysisError(
-                    "섹션 중요도 응답 객체 형식이 올바르지 않습니다."
-                )
-            items = raw.get("items")
-            if not isinstance(items, list) or len(items) != len(chapter_sections):
-                raise LLMAnalysisError("섹션 중요도 응답이 입력과 일치하지 않습니다.")
-            if any(
-                not isinstance(item, dict) or set(item) != {"id", "score"}
-                for item in items
-            ):
-                raise LLMAnalysisError("섹션 중요도 항목 필드가 응답 계약과 다릅니다.")
-            scores = {
-                item.get("id"): item.get("score")
-                for item in items
-                if isinstance(item, dict)
-            }
-            expected = [item["id"] for item in payload]
-            if len(scores) != len(expected) or set(scores) != set(expected):
-                raise LLMAnalysisError("섹션 중요도 ID가 입력과 일치하지 않습니다.")
-            if any(
-                type(scores[item_id]) is not int or not 0 <= scores[item_id] <= 1000
-                for item_id in expected
-            ):
-                raise LLMAnalysisError("섹션 중요도 점수 형식이 올바르지 않습니다.")
-            return [
-                {**section, "llm_score": round(float(scores[item["id"]]) / 1000, 3)}
-                for section, item in zip(chapter_sections, payload)
-            ]
+            validate(raw)
+            return [{**section, "llm_score": round(item["score"] / 1000, 3)}
+                    for section, item in zip(chapter_sections, raw["items"])]
 
         result = []
         with ThreadPoolExecutor(
-            max_workers=min(getattr(self, "_max_parallel_requests", 100), len(groups))
+            max_workers=min(getattr(self, "_max_parallel_requests", DEFAULT_PARALLEL_REQUESTS), len(batches))
         ) as executor:
-            futures = [executor.submit(score, group) for group in groups.values()]
+            futures = [executor.submit(score, batch) for batch in batches]
             for completed, future in enumerate(as_completed(futures), 1):
                 if cancel_callback:
                     cancel_callback()
                 result.extend(future.result())
                 if progress_callback:
-                    progress_callback(
-                        completed, len(futures), "챕터별 섹션 중요도 평가"
-                    )
-        return sorted(
-            result,
-            key=lambda item: (
-                str(item.get("chapter_id", "")),
-                float(item.get("start", 0)),
-            ),
-        )
+                    progress_callback(completed, len(futures), "섹션 중요도 묶음 평가")
+        return sorted(result, key=lambda item: (
+            str(item.get("chapter_id", "")), float(item.get("start", 0))
+        ))
 
     def score_timestamp_comments(
         self,

@@ -55,6 +55,7 @@ type Section = {
   segment_ids: string[];
   text: string;
   text_segments?: string[];
+  timing_estimated?: boolean;
   final_score?: number;
   llm_score?: number;
   heatmap_score?: number;
@@ -2187,6 +2188,9 @@ export default function WorkflowApp() {
                               <DetailedTime value={section.start} />–
                               <DetailedTime value={section.end} />
                             </b>
+                            {section.timing_estimated && (
+                              <small title="문장 경계에 대응하는 단어 시간이 없어 문자 비율로 계산했습니다. 미리보기로 싱크를 확인하세요.">시간 추정 · 미리보기 확인 필요</small>
+                            )}
                             <div className="segment-text segment-text-lines">
                               {(section.text_segments?.length
                                 ? section.text_segments
@@ -2431,6 +2435,9 @@ export default function WorkflowApp() {
                                       </em>
                                     )}
                                   </div>
+                                  {section.timing_estimated && (
+                                    <small title="문장 경계에 대응하는 단어 시간이 없어 문자 비율로 계산했습니다. 미리보기로 싱크를 확인하세요.">시간 추정 · 미리보기 확인 필요</small>
+                                  )}
                                   <div className="segment-text segment-text-lines">
                                     {(section.text_segments?.length
                                       ? section.text_segments

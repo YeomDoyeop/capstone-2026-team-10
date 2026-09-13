@@ -16,7 +16,7 @@ def test_provider_execution_limits_distinguish_deepseek_and_gemini(monkeypatch):
     deepseek = LLMGateway("deepseek", api_key="test-key")
     gemini = LLMGateway("gemini", api_key="test-key")
 
-    assert deepseek.max_parallel_requests == 100
-    assert deepseek.minimum_request_interval_seconds == 0
+    assert deepseek.max_parallel_requests == 20
+    assert deepseek.minimum_request_interval_seconds == 0.05
     assert gemini.max_parallel_requests == 50
     assert gemini.minimum_request_interval_seconds == 0.015

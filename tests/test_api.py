@@ -619,13 +619,20 @@ def test_selection_render_persists_clips_and_sends_them_to_server(
             plan,
             progress_callback,
             cancel_callback,
+            server_access_token,
         ):
+            assert server_access_token == "Bearer session"
             cancel_callback()
             progress_callback(100, "렌더링 완료")
             return {
                 "selected_segment_ids": list(segment_ids),
-                "selected_duration_seconds": 22.0,
+                "selected_duration_seconds": 21.8,
                 "rendered_filename": "edited.mp4",
+                "clips": [
+                    {"segment_id": "section-a", "start": 10.0, "end": 15.0, "llm_score": 0.75},
+                    {"segment_id": "section-a", "start": 15.2, "end": 20.0, "llm_score": 0.75},
+                    {"segment_id": "section-b", "start": 30.0, "end": 42.0, "llm_score": 0.92},
+                ],
             }
 
     synced: list[dict] = []
@@ -655,8 +662,9 @@ def test_selection_render_persists_clips_and_sends_them_to_server(
     )
 
     expected = [
+        {"segment_id": "section-a", "start": 10.0, "end": 15.0, "llm_score": 0.75},
+        {"segment_id": "section-a", "start": 15.2, "end": 20.0, "llm_score": 0.75},
         {"segment_id": "section-b", "start": 30.0, "end": 42.0, "llm_score": 0.92},
-        {"segment_id": "section-a", "start": 10.0, "end": 20.0, "llm_score": 0.75},
     ]
     assert LIVE_EDIT_JOBS[job_id]["result"]["analysis_plan"]["clips"] == expected
     stored = LocalJobStore(tmp_path / "db").get_completed(job_id)

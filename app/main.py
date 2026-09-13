@@ -1336,6 +1336,7 @@ async def _run_segment_selection_job(
                     job_id,
                     request.segment_ids,
                     plan=dict(previous_result.get("analysis_plan") or {}),
+                    server_access_token=server_access_token,
                     progress_callback=report_render,
                     cancel_callback=lambda: _raise_if_cancel_requested(job_id),
                 )
@@ -1362,6 +1363,12 @@ async def _run_segment_selection_job(
                         "rendered_filename": result.get("rendered_filename"),
                     }
                 )
+                # 실제 렌더링한 미세 컷을 원래 섹션 범위로 되돌리지 않는다.
+                if "clips" in result:
+                    final_plan["clips"] = result["clips"]
+                for key in ("filler_summary", "filler_cuts", "filler_missing_timing"):
+                    if key in result:
+                        final_plan[key] = result[key]
                 merged_result = {
                     **previous_result,
                     **result,

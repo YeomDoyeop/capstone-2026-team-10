@@ -21,6 +21,8 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from app.config import get_media_root
+from app.services.filler_edit import apply_filler_cuts, filler_candidates
+from app.services.sentence_boundaries import split_timed_sentences
 from app.services.toolchain import ToolchainError, ffmpeg as get_ffmpeg
 from app.services.server_media_service import (
     AccessTokenSource,
@@ -42,7 +44,7 @@ WHISPER_SPLIT_MIN_CHARACTERS = 30
 WHISPER_PRIORITY_GAP_SECONDS = 0.5
 WHISPER_ENGINE = "whisperx-aligned-word-v1"
 WHISPER_ALIGNMENT = "ctc-forced-alignment-with-words"
-WHISPER_SPLIT_CONTRACT = "autonomous-subtitle-word-boundary-v5"
+WHISPER_SPLIT_CONTRACT = "autonomous-subtitle-word-boundary-v6-preserve-words"
 CHAT_REACTION_OFFSET_SECONDS = 3.0
 
 SECTION_SCORE_WEIGHTS = {
@@ -567,6 +569,7 @@ def _split_whisper_segment(
                 "start": float(segment["start"]),
                 "end": float(segment["end"]),
                 "text": text,
+                "words": words,
             }
         ]
     if any(
@@ -581,6 +584,7 @@ def _split_whisper_segment(
                 "start": float(segment["start"]),
                 "end": float(segment["end"]),
                 "text": text,
+                "words": words,
             }
         ]
     text_spans = _word_text_spans(text, words)
@@ -590,6 +594,7 @@ def _split_whisper_segment(
                 "start": float(segment["start"]),
                 "end": float(segment["end"]),
                 "text": text,
+                "words": words,
             }
         ]
 
@@ -664,7 +669,8 @@ def _split_whisper_segment(
             raise LLMAnalysisError(
                 "Whisper 단어 범위에서 자막 문장을 만들 수 없습니다."
             )
-        result.append({"start": start, "end": end, "text": part_text})
+        result.append({"start": start, "end": end, "text": part_text,
+                       "words": words[start_word:end_word + 1]})
     return result
 
 
@@ -727,7 +733,10 @@ def _select_clips(
 ) -> list[dict[str, Any]]:
     """섹션 총점과 정확한 섹션 경계로 목표 길이의 요약본을 선택한다."""
 
-    candidates = [item for item in sections if item["end"] - item["start"] >= 5.0]
+    candidates = [
+        item for item in sections
+        if 0 < float(item["end"]) - float(item["start"]) < math.inf
+    ]
     unit = 2
     target = target_seconds * unit
     upper = (target_seconds + 30) * unit
@@ -790,8 +799,9 @@ def _select_coherent_clips(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """고득점 앵커를 보존하면서 최소 필수 관계만 확장한다."""
 
+    # 문장 단위 섹션에는 최소 길이를 두지 않는다. 유효하지 않은 시간만 제외한다.
     ordered = sorted(
-        (item for item in sections if float(item["end"]) - float(item["start"]) >= 5.0),
+        (item for item in sections if 0 < float(item["end"]) - float(item["start"]) < math.inf),
         key=lambda item: float(item["start"]),
     )
     if not ordered:
@@ -979,7 +989,7 @@ def _write_json_atomic(path: Path, value: Any) -> None:
     """Write JSON beside its destination and atomically publish it."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    pending = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    pending = path.with_name(f".json-{uuid4().hex}.tmp")
     with _ATOMIC_WRITE_LOCKS_GUARD:
         lock = _ATOMIC_WRITE_LOCKS.setdefault(path.resolve(), threading.Lock())
     try:
@@ -1003,9 +1013,12 @@ def _write_json_atomic(path: Path, value: Any) -> None:
 def _copy_file_atomic(source: Path, destination: Path) -> None:
     """Copy a completed render beside its destination, then publish it atomically."""
 
-    pending = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
-    shutil.copyfile(source, pending)
-    os.replace(pending, destination)
+    pending = destination.with_name(f".copy-{uuid4().hex}.tmp")
+    try:
+        shutil.copyfile(source, pending)
+        os.replace(pending, destination)
+    finally:
+        pending.unlink(missing_ok=True)
 
 
 def _ffmpeg_binary() -> str:
@@ -1128,9 +1141,10 @@ def render_final(
 ) -> str:
     candidates = _render_encoder_candidates()
     for index, encoder in enumerate(candidates):
-        attempt_name = re.sub(r"[^A-Za-z0-9_-]+", "-", encoder or "libx264")
+        # 출력 stem에는 이미 작업 ID와 UUID가 있다. 이를 다시 붙이면
+        # Windows의 경로 길이 제한을 넘으므로 시도별 독립 이름을 사용한다.
         attempt_output = output.with_name(
-            f"{output.stem}.{attempt_name}.{uuid4().hex}.attempt{output.suffix}"
+            f"render-{uuid4().hex}{output.suffix}"
         )
         if status_callback:
             if encoder:
@@ -1168,6 +1182,46 @@ def render_final(
     raise LiveEditPipelineError("렌더링 인코더를 선택하지 못했습니다.")
 
 
+def _render_filler_edit(source, clips, output, subtitles, *, encoder,
+                        progress_callback, cancel_callback):
+    """짧은 컷에서 오디오 프레임 반올림이 누적되지 않도록 샘플 단위 trim을 사용한다."""
+    intervals = sorted((float(c["start"]), float(c["end"])) for c in clips)
+
+    def balanced_sum(parts):
+        while len(parts) > 1:
+            parts = [f"({parts[i]}+{parts[i + 1]})" if i + 1 < len(parts) else parts[i]
+                     for i in range(0, len(parts), 2)]
+        return parts[0] if parts else "0"
+
+    selection = balanced_sum([f"gte(t,{start:.6f})*lt(t,{end:.6f})" for start, end in intervals])
+    gaps = balanced_sum([
+        f"{start - intervals[i - 1][1]:.6f}*gte(PTS*TB,{start:.6f})"
+        for i, (start, _) in enumerate(intervals) if i
+    ])
+    video_label = "cutv" if subtitles and subtitles.is_file() and subtitles.stat().st_size else "v"
+    filters = [f"[0:v]select='{selection}',setpts='(PTS*TB-{intervals[0][0]:.6f}-({gaps}))/TB'[{video_label}]"]
+    filters.append(f"[0:a]asplit={len(intervals)}" + "".join(f"[srca{i}]" for i in range(len(intervals))))
+    for i, (start, end) in enumerate(intervals):
+        filters.append(f"[srca{i}]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[a{i}]")
+    filters.append("".join(f"[a{i}]" for i in range(len(intervals))) + f"concat=n={len(intervals)}:v=0:a=1[a]")
+    if video_label == "cutv":
+        filters.append(f"[cutv]{_subtitle_filter(subtitles)}[v]")
+    # 수백 개의 미세 컷도 Windows 명령줄 길이 제한에 걸리지 않도록 파일로 전달한다.
+    script = output.parent / f"{uuid4().hex}.filters.txt"
+    try:
+        script.write_text(";".join(filters), encoding="utf-8")
+        _run_ffmpeg([
+            _ffmpeg_binary(), "-y", *_hardware_decoding_args(encoder),
+            "-t", f"{intervals[-1][1]:.6f}", "-i", str(source),
+            "-/filter_complex", str(script), "-map", "[v]", "-map", "[a]",
+            *_video_encoding_args(encoder), "-fps_mode", "vfr", "-c:a", "aac",
+            "-b:a", "160k", "-movflags", "+faststart", str(output),
+        ], progress_callback=progress_callback,
+           duration_seconds=sum(end - start for start, end in intervals), cancel_callback=cancel_callback)
+    finally:
+        script.unlink(missing_ok=True)
+
+
 def _render_final(
     source: Path,
     clips: list[dict[str, Any]],
@@ -1177,6 +1231,12 @@ def _render_final(
     cancel_callback: Callable[[], None] | None = None,
     encoder: str | None = None,
 ) -> None:
+    if any(clip.get("filler_edited") for clip in clips):
+        _render_filler_edit(source, clips, output, subtitles, encoder=encoder,
+                            progress_callback=progress_callback, cancel_callback=cancel_callback)
+        if progress_callback:
+            progress_callback(1.0)
+        return
     ffmpeg = _ffmpeg_binary()
     # 같은 입력 패드를 여러 trim 필터에서 재사용하면 많은 구간에서 프레임이
     # 각 소비자로 분산되어 영상 스트림만 조기에 끝날 수 있다. 원본은 한 번만
@@ -1262,6 +1322,45 @@ def _render_final(
 class LiveEditPipeline:
     def __init__(self, media_root: Path | None = None):
         self.media_root = (media_root or get_media_root()).resolve()
+
+    def _prepare_filler_render(self, job_id, segments, clips, criteria_prompt, provider,
+                               server_access_token, report, cancel_callback):
+        cuts, missing = [], 0
+        if criteria_prompt == "ai_news":
+            candidates, missing = filler_candidates(segments)
+            # 긴 방송 전체가 아닌 실제로 렌더링할 구간만 LLM에 보낸다.
+            candidates = [candidate for candidate in candidates if any(
+                float(clip["start"]) <= candidate["start"] < candidate["end"] <= float(clip["end"])
+                for clip in clips
+            )]
+            report(0, f"선택 영상의 추임새 후보 {len(candidates)}개를 확인합니다. "
+                   f"단어 시간 부족 자막 {missing}개는 내부 컷을 생략합니다.")
+            if candidates:
+                checkpoint_path = self.media_root / "yt-edit" / job_id / f"{job_id}.llm-checkpoint.json"
+                try:
+                    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8")) if checkpoint_path.is_file() else {}
+                except (OSError, json.JSONDecodeError):
+                    checkpoint = {}
+                if not isinstance(checkpoint, dict):
+                    checkpoint = {}
+                agent = LLMAnalysisService(
+                    provider=provider, server_access_token=server_access_token,
+                    checkpoint=checkpoint,
+                    checkpoint_callback=lambda: _write_json_atomic(checkpoint_path, checkpoint),
+                )
+                try:
+                    cuts = agent.detect_fillers(
+                        candidates, cancel_callback=cancel_callback,
+                        progress_callback=lambda done, total: report(0, f"추임새 판별 중 ({done}/{total})"),
+                    )
+                except LLMAnalysisError as exc:
+                    raise LiveEditPipelineError(f"추임새 판별을 완료하지 못했습니다: {exc}") from exc
+        edited, cleaned, summary = apply_filler_cuts(segments, clips, cuts)
+        if summary["guard_triggered"]:
+            report(0, "추임새 제거량이 선택 영상의 20%를 넘어 원본 선택 구간을 보존합니다.")
+        elif criteria_prompt == "ai_news":
+            report(0, f"추임새 {summary['removed_count']}개 ({summary['removed_seconds']:.2f}초)를 영상·자막에서 제외합니다.")
+        return edited, cleaned, {"filler_cuts": cuts, "filler_missing_timing": missing, "filler_summary": summary}
 
     def load_script_segments(
         self,
@@ -1514,6 +1613,7 @@ class LiveEditPipeline:
                         "start": float(segment["start"]),
                         "end": float(segment["end"]),
                         "text": str(segment["text"]).strip(),
+                        "words": segment.get("words"),
                     }
                     for segment in whisper_segments
                 ]
@@ -1627,6 +1727,7 @@ class LiveEditPipeline:
                         "start": _time_seconds(row["start"]),
                         "end": _time_seconds(row["end"]),
                         "text": row["text"],
+                        "words": row.get("words"),
                     }
                     for row in parsed_rows
                     if isinstance(row, dict) and row.get("text")
@@ -1650,6 +1751,7 @@ class LiveEditPipeline:
                         "start": float(item["start"]),
                         "end": float(item["end"]),
                         "text": str(item["text"]),
+                        "words": item.get("words"),
                     }
                     for item in payload["segments"]
                     if isinstance(item, dict) and item.get("text")
@@ -1732,14 +1834,16 @@ class LiveEditPipeline:
                 "자막 파일은 있지만 시간표시 문장을 읽지 못했습니다."
             )
 
-        raw_segments = [
-            {**segment, "id": index} for index, segment in enumerate(raw_segments)
-        ]
+        try:
+            raw_segments = split_timed_sentences(raw_segments)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise LiveEditPipelineError(f"마침표 기준 문장 분할에 실패했습니다: {exc}") from exc
         _write_json_atomic(
             output_dir / f"{job_id}.analysis-transcript.json",
             {"segments": raw_segments},
         )
-        report(22, f"자막 {len(raw_segments):,}개 구간을 확인했습니다.")
+        estimated_count = sum(bool(row.get("timing_estimated")) for row in raw_segments)
+        report(22, f"마침표 기준 {len(raw_segments):,}문장으로 분리했습니다. 시간 추정 {estimated_count:,}문장.")
         checkpoint_path = output_dir / f"{job_id}.llm-checkpoint.json"
         try:
             checkpoint = (
@@ -1812,7 +1916,7 @@ class LiveEditPipeline:
             )
         except LLMAnalysisError as exc:
             raise LiveEditPaused(
-                f"LLM 챕터·섹션 분할이 재시도 한도에 도달했습니다: {exc}"
+                f"LLM 챕터·섹션 분할을 완료하지 못했습니다: {exc}"
             ) from exc
         subtitle_by_id = {int(item["id"]): item for item in raw_segments}
         candidates: list[dict[str, Any]] = []
@@ -1846,6 +1950,7 @@ class LiveEditPipeline:
                         "segment_ids": [section_id],
                         "text": text,
                         "text_segments": section_text_segments,
+                        "timing_estimated": bool(section_first.get("timing_estimated")),
                     }
                 )
                 candidates.append(
@@ -1855,6 +1960,7 @@ class LiveEditPipeline:
                         "end": float(section_last["end"]),
                         "text": text,
                         "text_segments": section_text_segments,
+                        "timing_estimated": bool(section_first.get("timing_estimated")),
                         "chapter_id": chapter_id,
                         "section_id": section_id,
                         "chapter_summary": chapter["summary"],
@@ -1871,7 +1977,7 @@ class LiveEditPipeline:
                     "sections": chapter_sections,
                 }
             )
-        report(55, "LLM이 전체 스크립트를 챕터와 섹션으로 분할했습니다.")
+        report(55, "LLM 챕터 구성과 마침표 기준 문장 섹션 구성을 완료했습니다.")
         try:
             scored = analysis_service.score_sections(
                 candidates,
@@ -1884,7 +1990,7 @@ class LiveEditPipeline:
             )
         except LLMAnalysisError as exc:
             raise LiveEditPaused(
-                f"LLM 섹션 중요도 평가가 재시도 한도에 도달했습니다: {exc}"
+                f"LLM 섹션 중요도 평가를 완료하지 못했습니다: {exc}"
             ) from exc
         report(76, f"LLM이 섹션 {len(scored):,}개의 중요도를 평가했습니다.")
         metadata_path = Path(str(imported.get("metadata_path") or ""))
@@ -1982,7 +2088,7 @@ class LiveEditPipeline:
                 )
             except LLMAnalysisError as exc:
                 raise LiveEditPaused(
-                    f"LLM 타임스탬프 댓글 평가가 재시도 한도에 도달했습니다: {exc}"
+                    f"LLM 타임스탬프 댓글 평가를 완료하지 못했습니다: {exc}"
                 ) from exc
             _apply_timestamp_comment_scores(scored, timestamp_comments, comment_scores)
             report(
@@ -2038,12 +2144,19 @@ class LiveEditPipeline:
             )
         except LLMAnalysisError as exc:
             raise LiveEditPaused(
-                f"LLM 요약 구간 관계 분석이 재시도 한도에 도달했습니다: {exc}"
+                f"LLM 요약 구간 관계 분석을 완료하지 못했습니다: {exc}"
             ) from exc
         recommended_segment_ids = [str(item["segment_id"]) for item in selected]
         clips = selected
         if not clips:
             raise LiveEditPipelineError("편집할 하이라이트 구간을 선택하지 못했습니다.")
+        render_segments = raw_segments
+        filler_metadata = {}
+        if not defer_render:
+            clips, render_segments, filler_metadata = self._prepare_filler_render(
+                job_id, raw_segments, clips, criteria_prompt, llm_provider, server_access_token,
+                lambda _, message: report(94, message), cancel_callback,
+            )
 
         report(94, f"최종 하이라이트 {len(clips):,}개 구간을 선택했습니다.")
         plan = {
@@ -2064,6 +2177,7 @@ class LiveEditPipeline:
             "selected_segment_ids": recommended_segment_ids,
             "clips": clips,
             "selection_reviews": selection_reviews,
+            **filler_metadata,
         }
         _write_json_atomic(
             output_dir / f"{job_id}.analysis-plan.json",
@@ -2100,7 +2214,7 @@ class LiveEditPipeline:
         render_id = uuid4().hex
         pending_output = output_dir / f"{job_id}.edited.{render_id}.pending.mp4"
         subtitles = output_dir / f"{job_id}.render-input.{render_id}.srt"
-        subtitle_count = write_selected_subtitles(raw_segments, clips, subtitles)
+        subtitle_count = write_selected_subtitles(render_segments, clips, subtitles)
         rendering_backend = render_final(
             source,
             clips,
@@ -2182,6 +2296,7 @@ class LiveEditPipeline:
         segment_ids: list[str],
         *,
         plan: dict[str, Any],
+        server_access_token: str | None = None,
         progress_callback: Callable[[int, str], None] | None = None,
         cancel_callback: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
@@ -2232,6 +2347,11 @@ class LiveEditPipeline:
         if not isinstance(raw_segments, list):
             raise LiveEditPipelineError("메모리의 원본 스크립트를 찾을 수 없습니다.")
 
+        clips, render_segments, filler_metadata = self._prepare_filler_render(
+            job_id, raw_segments, clips, plan.get("criteria_prompt"),
+            plan.get("llm_provider", "deepseek"), server_access_token, report, cancel_callback,
+        )
+
         report(0, "선택한 구간에 맞춰 자막 시간축을 다시 만드는 중입니다.")
         revision = int(plan.get("revision") or 0) + 1
         output = output_dir / f"{job_id}.edited.mp4"
@@ -2250,7 +2370,7 @@ class LiveEditPipeline:
 
         pending_subtitles = output_dir / f"{job_id}.render-input.{render_id}.srt"
         subtitle_count = write_selected_subtitles(
-            raw_segments, clips, pending_subtitles
+            render_segments, clips, pending_subtitles
         )
         rendering_backend = render_final(
             source,
@@ -2269,6 +2389,7 @@ class LiveEditPipeline:
                 "clips": clips,
                 "selected_segment_ids": canonical_ids,
                 "subtitle_count": subtitle_count,
+                **filler_metadata,
                 "revision": revision,
                 "rendered_filename": output.name,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -2284,4 +2405,6 @@ class LiveEditPipeline:
             "rendered_video_path": str(output.resolve()),
             "rendered_filename": output.name,
             "message": "선택한 구간으로 영상을 다시 생성했습니다.",
+            "clips": clips,
+            **filler_metadata,
         }

@@ -19,10 +19,10 @@ def test_prompts_define_summary_and_precise_score_contract():
     assert "Gemini" not in prompt and "DeepSeek" not in prompt
     assert "summary" in CHAPTER_SYSTEM and "title" not in CHAPTER_SYSTEM
     assert "summary" not in SECTION_SYSTEM and "reason" not in SECTION_SYSTEM
-    assert "균등 분할" in CHAPTER_SYSTEM and "문장마다 기계적으로" in SECTION_SYSTEM
+    assert "균등 분할" in CHAPTER_SYSTEM and "문장 완결성" in SECTION_SYSTEM
     assert "애매하면 나누지 않고 큰 챕터" in CHAPTER_SYSTEM
     assert "가능한 한 작은 의미 단위" in SECTION_SYSTEM
-    assert "질문과 답변" in CHAPTER_SYSTEM and "질문과 답변" in SECTION_SYSTEM
+    assert "질문과 답변" in CHAPTER_SYSTEM and "질문·답변" in SECTION_SYSTEM
 
 
 def test_whisper_settings_uses_strict_json_and_keeps_proper_nouns_as_hotwords(
@@ -204,7 +204,10 @@ def test_structure_requires_contiguous_ids_and_summaries(monkeypatch):
         [{"id": 0, "text": "가"}, {"id": 1, "text": "나"}]
     )
     assert result["chapters"][0]["summary"] == "주제 요약"
-    assert result["sections"][0] == {"chapter_index": 0, "start_id": 0, "end_id": 1}
+    assert result["sections"] == [
+        {"chapter_index": 0, "start_id": 0, "end_id": 0},
+        {"chapter_index": 0, "start_id": 1, "end_id": 1},
+    ]
 
 
 def test_score_sends_one_section_id_text_array_and_chapter_summary_per_chapter(
@@ -344,7 +347,7 @@ def test_request_json_retries_after_range_error():
     assert result[0]["start_id"] == 0 and agent.gateway.calls == 2
 
 
-def test_request_json_stops_after_one_hundred_invalid_responses():
+def test_request_json_stops_after_three_invalid_responses():
     class Gateway:
         def __init__(self):
             self.calls = 0
@@ -358,10 +361,10 @@ def test_request_json_stops_after_one_hundred_invalid_responses():
     try:
         agent._request_json("계약", "입력")
     except LLMAnalysisError as exc:
-        assert "백 번" in str(exc)
+        assert "3회" in str(exc)
     else:
         raise AssertionError("ten invalid responses must fail")
-    assert agent.gateway.calls == 100
+    assert agent.gateway.calls == 3
 
 
 def test_request_json_returns_last_contract_failure_reason():
@@ -521,7 +524,7 @@ def test_request_json_discards_a_completed_request_when_it_was_cancelled(monkeyp
         raise AssertionError("completed response must be discarded after cancellation")
 
 
-def test_parallel_section_work_never_requests_more_than_ten_workers(monkeypatch):
+def test_parallel_section_work_never_requests_more_than_twenty_workers(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor as RealExecutor
     import app.services.llm_analysis_service as service_module
 
@@ -549,10 +552,10 @@ def test_parallel_section_work_never_requests_more_than_ten_workers(monkeypatch)
         ]
     )
 
-    assert requested_workers == [100]
+    assert requested_workers == [20]
 
 
-def test_parallel_chapter_splitting_never_requests_more_than_ten_workers(monkeypatch):
+def test_sentence_sections_do_not_launch_llm_workers(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor as RealExecutor
     import app.services.llm_analysis_service as service_module
 
@@ -569,7 +572,7 @@ def test_parallel_chapter_splitting_never_requests_more_than_ten_workers(monkeyp
     monkeypatch.setattr(service_module, "ThreadPoolExecutor", RecordingExecutor)
 
     def request(system, _prompt, **kwargs):
-        if system == service_module.system_prompt("chapter"):
+        if system.startswith(service_module.system_prompt("chapter")):
             raw = {
                 "chapters": [
                     {
@@ -592,4 +595,4 @@ def test_parallel_chapter_splitting_never_requests_more_than_ten_workers(monkeyp
         [{"id": index, "text": str(index)} for index in range(101)]
     )
 
-    assert requested_workers == [100]
+    assert requested_workers == []
