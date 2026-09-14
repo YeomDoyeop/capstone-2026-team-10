@@ -370,6 +370,64 @@ class LLMAnalysisService:
             json.dumps(row, ensure_ascii=False, separators=(",", ":")) for row in rows
         )
 
+    def split_unpunctuated_sentences(
+        self, text: str, *, cancel_callback: Callable[[], None] | None = None
+    ) -> list[int]:
+        """원문 단어 ID로 문장 끝만 판별하고 문자 위치로 돌려준다."""
+        words = list(re.finditer(r"\S+", text))
+        if not words:
+            return []
+        if len(words) == 1:
+            return [words[0].end()]
+        cursor, window_size = 0, 240
+        result = []
+        while cursor < len(words):
+            if cancel_callback:
+                cancel_callback()
+            stop = min(cursor + window_size, len(words))
+            final = stop == len(words)
+            # 비최종 창의 마지막 단어는 경계로 확정하지 않는다.
+            maximum = stop - 1 if final else stop - 2
+            schema = response_schema("sentence_boundary")
+            array = schema["properties"]["end_ids"]
+            array.update(minItems=1 if final else 0, maxItems=stop - cursor)
+            array["items"].update(minimum=cursor, maximum=maximum)
+
+            def validate(raw):
+                if not isinstance(raw, dict) or set(raw) != {"end_ids"}:
+                    raise LLMAnalysisError("문장 경계 응답은 end_ids 배열만 포함해야 합니다.")
+                ends = raw["end_ids"]
+                if (not isinstance(ends, list)
+                        or any(type(i) is not int or not cursor <= i <= maximum for i in ends)
+                        or ends != sorted(set(ends))):
+                    raise LLMAnalysisError(
+                        f"문장 end_ids는 {cursor}~{maximum} 범위의 중복 없는 오름차순 정수여야 합니다."
+                    )
+                if final and (not ends or ends[-1] != stop - 1):
+                    raise LLMAnalysisError(f"마지막 문장 end_ids에 최종 단어 ID {stop - 1}을 포함하세요.")
+                return ends
+
+            ends = self._request_json(
+                system_prompt("sentence_boundary"),
+                json.dumps({
+                    "is_final": final,
+                    "words": [{"id": i, "text": words[i].group()} for i in range(cursor, stop)],
+                }, ensure_ascii=False, separators=(",", ":")),
+                response_schema=schema, validator=validate, cancel_callback=cancel_callback,
+            )
+            if not ends:
+                if window_size >= 960:
+                    raise LLMAnalysisError(
+                        "구두점 없는 구간에서 문장 경계를 찾지 못했습니다. "
+                        "원본 자막을 확인하세요. 임의 길이로 자르지는 않았습니다."
+                    )
+                window_size *= 2
+                continue
+            result.extend(words[i].end() for i in ends)
+            cursor = ends[-1] + 1
+            window_size = 240
+        return result
+
     def structure_transcript(
         self,
         segments: list[dict[str, Any]],
@@ -394,6 +452,8 @@ class LLMAnalysisService:
                     minimum=ids[0], maximum=ids[-1]
                 )
             chapter_system = system_prompt("chapter") + (
+                "\n입력 문장은 구두점 기준 분할과 구두점이 부족한 구간의 의미 기반 분할을 "
+                "이미 마친 고정 단위다. 마침표가 없어도 완결된 문장일 수 있으며 다시 합치거나 쪼개지 않는다."
                 f"\n\n[이번 요청의 ID 계약]\n입력 문장 수={len(ids)}, "
                 f"허용 ID={ids[0]}~{ids[-1]} (양끝 포함). "
                 "ID는 시간(초)이 아니라 입력 JSONL의 정수 id다. "
@@ -415,7 +475,7 @@ class LLMAnalysisService:
             if progress_callback:
                 progress_callback(1, 1, "챕터 분할 완료")
 
-        # 입력 ID는 파이프라인에서 구두점 기준으로 분리한 한 문장이다.
+        # 입력 ID는 파이프라인에서 구두점·의미 기준으로 분리한 한 문장이다.
         # LLM은 상위 챕터만 결정하며 섹션 경계를 재분할하거나 병합하지 않는다.
         chapters = self._validated_ranges(
             {"chapters": chapters}, ids, key="chapters", require_chapter_fields=True
@@ -427,7 +487,7 @@ class LLMAnalysisService:
             sections.extend({"chapter_index": index, "start_id": row_id, "end_id": row_id}
                             for row_id in range(chapter["start_id"], chapter["end_id"] + 1))
             if progress_callback:
-                progress_callback(index + 1, len(chapters), "마침표 기준 문장 섹션 구성")
+                progress_callback(index + 1, len(chapters), "문장 기준 섹션 구성")
         return {"chapters": chapters, "sections": sections}
 
     def detect_fillers(self, candidates, *, cancel_callback=None, progress_callback=None):

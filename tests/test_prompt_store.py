@@ -88,3 +88,13 @@ def test_section_score_prompt_requires_relative_calibration():
     assert "반사실적으로" in value
     assert "상대 비교" in value
     assert "900점 이상" in value
+
+
+def test_cooking_profile_explains_four_stages_and_preserves_source_constraints():
+    profile = prompt_store.user_prompt("cooking_food")
+    criteria = profile["criteria"]
+    stages = ["1. 재료 설명", "2. 재료 손질 과정", "3. 조리 과정", "4. 완성된 음식 결과 보여주기"]
+    assert [criteria.index(stage) for stage in stages] == sorted(criteria.index(stage) for stage in stages)
+    assert "원본에 없는" in criteria
+    assert "영상 프레임을 제공받지 않았다면" in criteria
+    assert "채팅 반응이 적거나 발화가 짧다는 이유만으로 낮추지" in criteria

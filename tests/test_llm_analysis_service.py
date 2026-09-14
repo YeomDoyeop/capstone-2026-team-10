@@ -14,6 +14,26 @@ GENRE_GUIDES = {
 }
 
 
+def test_cooking_profile_is_sent_to_section_scoring(monkeypatch):
+    from app.services.prompt_store import user_prompt
+
+    agent = object.__new__(LLMAnalysisService)
+    received = []
+
+    def request(_system, prompt, **kwargs):
+        received.append(json.loads(prompt))
+        return kwargs["validator"]({"items": [{"id": 0, "score": 925}]})
+
+    monkeypatch.setattr(agent, "_request_json", request)
+    result = agent.score_sections(
+        [{"chapter_id": "cooking", "text": "양파를 썰어 주세요"}],
+        criteria_prompt="cooking_food",
+    )
+    assert received[0]["criteria_profile"] == user_prompt("cooking_food")
+    assert "4. 완성된 음식 결과 보여주기" in received[0]["criteria_profile"]["criteria"]
+    assert result[0]["llm_score"] == 0.925
+
+
 def test_prompts_define_summary_and_precise_score_contract():
     prompt = f"{CHAPTER_SYSTEM}\n{SECTION_SYSTEM}\n" + "\n".join(GENRE_GUIDES.values())
     assert "Gemini" not in prompt and "DeepSeek" not in prompt

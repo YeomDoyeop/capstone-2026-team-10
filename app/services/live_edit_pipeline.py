@@ -1834,16 +1834,6 @@ class LiveEditPipeline:
                 "자막 파일은 있지만 시간표시 문장을 읽지 못했습니다."
             )
 
-        try:
-            raw_segments = split_timed_sentences(raw_segments)
-        except (ValueError, KeyError, TypeError) as exc:
-            raise LiveEditPipelineError(f"마침표 기준 문장 분할에 실패했습니다: {exc}") from exc
-        _write_json_atomic(
-            output_dir / f"{job_id}.analysis-transcript.json",
-            {"segments": raw_segments},
-        )
-        estimated_count = sum(bool(row.get("timing_estimated")) for row in raw_segments)
-        report(22, f"마침표 기준 {len(raw_segments):,}문장으로 분리했습니다. 시간 추정 {estimated_count:,}문장.")
         checkpoint_path = output_dir / f"{job_id}.llm-checkpoint.json"
         try:
             checkpoint = (
@@ -1855,7 +1845,6 @@ class LiveEditPipeline:
             checkpoint = {}
         if not isinstance(checkpoint, dict):
             checkpoint = {}
-        checkpoint["transcript_ids"] = [item["id"] for item in raw_segments]
         checkpoint["transcription_source"] = transcription_source
 
         def save_checkpoint() -> None:
@@ -1867,6 +1856,26 @@ class LiveEditPipeline:
             checkpoint=checkpoint,
             checkpoint_callback=save_checkpoint,
         )
+        report(22, "구두점·의미 기준으로 문장을 분리하는 중입니다.")
+        try:
+            raw_segments = split_timed_sentences(
+                raw_segments,
+                semantic_splitter=lambda text: analysis_service.split_unpunctuated_sentences(
+                    text, cancel_callback=cancel_callback
+                ),
+            )
+        except LLMAnalysisError as exc:
+            raise LiveEditPaused(f"LLM 의미 기반 문장 분할을 완료하지 못했습니다: {exc}") from exc
+        except (ValueError, KeyError, TypeError) as exc:
+            raise LiveEditPipelineError(f"문장 분할에 실패했습니다: {exc}") from exc
+        checkpoint["transcript_ids"] = [item["id"] for item in raw_segments]
+        save_checkpoint()
+        _write_json_atomic(
+            output_dir / f"{job_id}.analysis-transcript.json",
+            {"segments": raw_segments},
+        )
+        estimated_count = sum(bool(row.get("timing_estimated")) for row in raw_segments)
+        report(22, f"구두점·의미 기준 {len(raw_segments):,}문장으로 분리했습니다. 시간 추정 {estimated_count:,}문장.")
         try:
             uploader_chapters = None
             if chapter_split_mode == "uploader":

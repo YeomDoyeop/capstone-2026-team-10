@@ -1,10 +1,10 @@
-"""구두점 기준 문장 분리와 원본 자막 시간 매핑. LLM으로 경계를 추정하지 않는다."""
+"""구두점·의미 기준 문장 분리와 원본 자막 시간 매핑."""
 
 from __future__ import annotations
 
 import math
 import re
-from typing import Any
+from typing import Any, Callable
 
 from app.services.filler_edit import timed_units
 
@@ -47,7 +47,11 @@ def _cut_time(cue: dict[str, Any], position: int) -> tuple[float, bool]:
     return cue["start"] + ratio * (cue["end"] - cue["start"]), True
 
 
-def split_timed_sentences(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def split_timed_sentences(
+    segments: list[dict[str, Any]],
+    *,
+    semantic_splitter: Callable[[str], list[int]] | None = None,
+) -> list[dict[str, Any]]:
     """자막 ID·줄 경계를 넘어 문장을 연결하고, 한 문장마다 새 ID를 부여한다."""
     cues = []
     chunks = []
@@ -68,9 +72,27 @@ def split_timed_sentences(segments: list[dict[str, Any]]) -> list[dict[str, Any]
         chunks.append(text)
         offset += len(text)
     combined = " ".join(chunks)
+    spans = []
+    for begin, finish in sentence_spans(combined):
+        text = combined[begin:finish]
+        # 구두점이 없는 잔여 구간과 구두점이 드문 긴 구간을 보완한다.
+        terminal = re.search(r"[.!?。！？][\"'”’)\]}]*$", text)
+        if semantic_splitter and (not terminal or len(text) > 120) and len(text.split()) > 1:
+            ends = semantic_splitter(text)
+            word_ends = {match.end() for match in re.finditer(r"\S+", text)}
+            if (not ends or any(type(end) is not int or end not in word_ends for end in ends)
+                    or ends != sorted(set(ends)) or ends[-1] != len(text)):
+                raise ValueError("의미 기반 문장 경계가 원본 단어 범위를 완전히 덮지 않습니다.")
+            cursor = 0
+            for end in ends:
+                left = cursor + len(text[cursor:end]) - len(text[cursor:end].lstrip())
+                spans.append((begin + left, begin + end))
+                cursor = end
+        else:
+            spans.append((begin, finish))
     result = []
     cue_index = 0
-    for begin, finish in sentence_spans(combined):
+    for begin, finish in spans:
         while cue_index < len(cues) and cues[cue_index]["offset"] + len(cues[cue_index]["text"]) <= begin:
             cue_index += 1
         parts = []
