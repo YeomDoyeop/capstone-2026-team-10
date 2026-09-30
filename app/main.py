@@ -248,12 +248,21 @@ async def generate_llm_response(
             request.prompt,
             model=request.model,
             response_schema=request.response_schema,
+            **({"image": request.image.model_dump()} if request.image is not None else {}),
         )
     except LLMGatewayError as exc:
+        headers = {
+            "X-AVE-LLM-Retryable": "true" if exc.retryable else "false",
+            "X-AVE-LLM-Error-Code": exc.code,
+        }
+        if exc.upstream_status is not None:
+            headers["X-AVE-LLM-Upstream-Status"] = str(exc.upstream_status)
+        if exc.retry_after is not None:
+            headers["Retry-After"] = str(exc.retry_after)
         raise HTTPException(
-            status_code=503 if exc.unavailable else 502, detail=str(exc)
+            status_code=exc.status_code, detail=str(exc), headers=headers
         ) from exc
-    return {"text": text}
+    return {"text": text, "image_used": request.image is not None}
 
 
 def _temporary_audio_path(file_id: str) -> Path:

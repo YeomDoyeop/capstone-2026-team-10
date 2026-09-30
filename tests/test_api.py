@@ -12,6 +12,33 @@ from app.main import (
     get_current_user,
 )
 from app.services.whisper_api_service import WhisperAPIError
+from app.services.llm_gateway import LLMGatewayError
+
+
+@pytest.mark.parametrize("status,code,retryable,upstream", [
+    (502, "invalid_schema", False, 400),
+    (429, "daily_quota", False, 429),
+    (429, "rate_limit", True, 429),
+    (504, "provider_timeout", True, None),
+])
+def test_llm_route_preserves_error_contract(monkeypatch, status, code, retryable, upstream):
+    app.dependency_overrides[get_current_user] = lambda: {"id": "user-001"}
+    def fail(*args, **kwargs):
+        raise LLMGatewayError("안내", code=code, status_code=status, retryable=retryable,
+                              upstream_status=upstream, retry_after=59)
+    monkeypatch.setattr("app.main.generate_json", fail)
+    try:
+        with TestClient(app) as client:
+            response = client.post("/api/llm/generate", json={"system": "role", "prompt": "input"})
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code == status
+    assert response.json() == {"detail": f"[{code}] 안내"}
+    assert response.headers["X-AVE-LLM-Retryable"] == str(retryable).lower()
+    assert response.headers["X-AVE-LLM-Error-Code"] == code
+    assert response.headers["Retry-After"] == "59"
+    if upstream is not None:
+        assert response.headers["X-AVE-LLM-Upstream-Status"] == str(upstream)
 
 
 def _mock_transcription_store(monkeypatch):
