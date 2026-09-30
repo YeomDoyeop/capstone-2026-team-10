@@ -61,12 +61,13 @@ def test_dynamic_schema_is_request_specific_and_preserves_sentence_sections():
         return kwargs["validator"]({"chapters": [chapter(first, last)]})
 
     agent._request_json = request
-    for ids in ([10, 11, 12], [0]):
+    for ids in ([10, 11, 12], [0], list(range(2339))):
         result = agent.structure_transcript([{"id": i, "text": "문장."} for i in ids])
         assert [(s["start_id"], s["end_id"]) for s in result["sections"]] == [(i, i) for i in ids]
-    for schema, first, last, count in zip(schemas, [10, 0], [12, 0], [3, 1]):
+    for schema, first, last in zip(schemas, [10, 0, 0], [12, 0, 2338]):
         array = schema["properties"]["chapters"]
-        assert (array["minItems"], array["maxItems"]) == (1, count)
+        assert array["minItems"] == 1
+        assert "maxItems" not in array
         for field in ("start_id", "end_id"):
             prop = array["items"]["properties"][field]
             assert prop["type"] == "integer"

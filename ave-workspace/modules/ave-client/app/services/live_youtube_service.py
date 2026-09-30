@@ -745,19 +745,21 @@ def download_metadata_materials(
         )
         if selections.get(key)
     ]
-    completed_count = 0
+    material_weights = {"댓글": 15, "채팅": 15, "자막": 5, "캡션": 5}
+    completed_weight = 0
+    highest_progress = 0
 
     def begin_material(label: str) -> None:
         report(
-            10 + round(completed_count * 85 / max(1, len(selected_labels))),
+            10 + completed_weight,
             f"{label} 자료를 확인하는 중입니다.",
         )
 
     def complete_material(label: str) -> None:
-        nonlocal completed_count
-        completed_count += 1
+        nonlocal completed_weight
+        completed_weight += material_weights[label]
         report(
-            10 + round(completed_count * 85 / max(1, len(selected_labels))),
+            10 + completed_weight,
             f"{label} 자료를 준비했습니다.",
         )
 
@@ -1027,11 +1029,26 @@ def download_metadata_materials(
 
     # 분석 단계는 원격 수집을 하지 않는다. 선택한 추가 자료가 없거나
     # Whisper만 사용하는 경우에도 2단계에서 원본 영상을 확보한다.
+    video_start = 10 + completed_weight
+    report(video_start, "분석용 원본 영상을 준비하는 중입니다.")
+
+    def video_progress(percent: int) -> None:
+        nonlocal highest_progress
+        value = video_start + round(max(0, min(100, percent)) * (98 - video_start) / 100)
+        if value > highest_progress:
+            highest_progress = value
+            report(
+                value,
+                "원본 영상 준비를 완료했습니다."
+                if percent >= 100 else f"원본 영상 다운로드 중 ({percent}%)",
+            )
+
     try:
         YouTubeImporter(get_media_root()).prepare_source_video(
             url,
             job_id=video_id,
             include_subtitles=False,
+            progress_callback=video_progress,
         )
     except (YouTubeImportError, OSError) as exc:
         raise LiveYouTubeError(

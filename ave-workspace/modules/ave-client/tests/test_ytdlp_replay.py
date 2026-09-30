@@ -302,8 +302,13 @@ def test_material_step_prepares_video_without_subtitles_when_nothing_is_selected
     )
     calls = []
 
-    def prepare_source(_self, url, job_id=None, *, include_subtitles=True):
+    def prepare_source(
+        _self, url, job_id=None, *, include_subtitles=True, progress_callback=None
+    ):
         calls.append((url, job_id, include_subtitles))
+        if progress_callback:
+            progress_callback(50)
+            progress_callback(100)
         return {}
 
     monkeypatch.setattr(
@@ -311,15 +316,19 @@ def test_material_step_prepares_video_without_subtitles_when_nothing_is_selected
         prepare_source,
     )
 
+    progress = []
     result = download_metadata_materials(
         f"https://www.youtube.com/watch?v={video_id}",
         {"comments": False, "chat": False, "subtitles": False, "captions": False},
+        lambda value, _message: progress.append(value),
     )
 
     assert result["artifacts"] == []
     assert calls == [
         (f"https://www.youtube.com/watch?v={video_id}", video_id, False),
     ]
+    assert progress == sorted(progress)
+    assert any(10 < value < 98 for value in progress)
 
 
 def test_legacy_metadata_cache_is_refreshed_with_korean_preference(

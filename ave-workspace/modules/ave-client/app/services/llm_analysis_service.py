@@ -449,7 +449,8 @@ class LLMAnalysisService:
             # 파일에서 매번 새 객체를 읽어 요청 사이에 ID 제한이 공유되지 않는다.
             chapter_schema = response_schema("chapter")
             chapter_array = chapter_schema["properties"]["chapters"]
-            chapter_array.update(minItems=1, maxItems=len(ids))
+            # Gemini는 큰 maxItems를 거부할 수 있다. 범위와 전체 문장 포함 여부는 로컬에서 검증한다.
+            chapter_array["minItems"] = 1
             for field in ("start_id", "end_id"):
                 chapter_array["items"]["properties"][field].update(
                     minimum=ids[0], maximum=ids[-1]

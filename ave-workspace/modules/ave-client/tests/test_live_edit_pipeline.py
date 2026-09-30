@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -209,6 +210,53 @@ def test_whisper_reuses_matching_video_level_source_cache(tmp_path, monkeypatch)
     assert json.loads(job_source.read_text(encoding="utf-8"))["segments"][0][
         "text"
     ] == "재사용 문장"
+
+
+def test_whisper_reports_local_steps_after_backend_completion(tmp_path, monkeypatch):
+    audio = tmp_path / "source.mp3"
+    audio.write_bytes(b"audio")
+    monkeypatch.setattr(
+        live_edit_pipeline.YouTubeImporter,
+        "prepare_best_audio",
+        lambda *_args, **kwargs: (
+            kwargs["progress_callback"](99), audio
+        )[1],
+    )
+    monkeypatch.setattr(
+        live_edit_pipeline, "prepare_whisper_audio", lambda *_args: audio
+    )
+    monkeypatch.setattr(
+        live_edit_pipeline, "upload_audio_for_transcription",
+        lambda *_args: SimpleNamespace(file_id="uploaded"),
+    )
+
+    def transcribe(*_args, **kwargs):
+        kwargs["progress_callback"](100, "Whisper 전사가 완료되었습니다.")
+        return {
+            "engine": live_edit_pipeline.WHISPER_ENGINE,
+            "alignment": live_edit_pipeline.WHISPER_ALIGNMENT,
+            "segments": [{"start": 0.0, "end": 1.0, "text": "짧은 문장"}],
+        }
+
+    monkeypatch.setattr(live_edit_pipeline, "transcribe_uploaded_audio", transcribe)
+    progress = []
+    backend = []
+    result = LiveEditPipeline(tmp_path).prepare_whisper_transcript(
+        job_id="progress-job",
+        vod_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        llm_provider="deepseek",
+        stt_language="ko",
+        stt_initial_prompt="",
+        stt_hotwords="",
+        stt_speed=1.0,
+        server_access_token="Bearer session",
+        progress_callback=lambda value, message: progress.append((value, message)),
+        backend_progress_callback=backend.append,
+    )
+    assert result["segment_count"] == 1
+    assert backend == [100]
+    assert any(value == 80 and "문장 분할" in message for value, message in progress)
+    assert progress[-1][0] == 100
 
 
 def test_whisper_reuses_video_level_sentence_split_cache(tmp_path, monkeypatch):

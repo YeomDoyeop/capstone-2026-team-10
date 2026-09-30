@@ -153,6 +153,7 @@ $requiredPackageFiles = @(
     'prompts\user\ai_news.json'
     'prompts\system\chapter.json'
     'prompts\schemas\chapter.json'
+    'prompts\schemas\whisper_settings.json'
 )
 foreach ($relativePath in $requiredPackageFiles) {
     $candidate = Join-Path $packageDir $relativePath

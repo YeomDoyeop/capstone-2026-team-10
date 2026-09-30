@@ -290,6 +290,8 @@ async def remove_user_prompt(prompt_id: str, user=Depends(get_current_user)):
 def _update_live_edit_job(job_id: str, **values) -> None:
     job = LIVE_EDIT_JOBS.get(job_id)
     if job is not None:
+        if "progress" in values and values.get("phase", job.get("phase")) == job.get("phase"):
+            values["progress"] = max(job.get("progress", 0), values["progress"])
         job.update(values)
 
 
@@ -631,6 +633,7 @@ async def score_live_edit(
         status="queued",
         progress=90,
         phase="analysis",
+        progress_stage="scoring",
         task_name="챕터 내 필수 관계 판별",
         message="점수가 높은 섹션부터 챕터 내 필수 관계를 판별하는 중입니다.",
         stop_after_structure=False,
@@ -761,10 +764,15 @@ async def _run_whisper_transcript_job(
 
     def progress(value: int, message: str) -> None:
         cancelled()
-        job.update({"progress": max(0, min(100, value)), "message": message})
+        job.update({"progress": max(job.get("progress", 0), min(100, max(0, value))), "message": message})
 
     def started(remote_job_id: str) -> None:
         job["remote_job_id"] = remote_job_id
+
+    def backend_progress(value: int) -> None:
+        job["backend_progress"] = max(
+            job.get("backend_progress", 0), min(100, max(0, value))
+        )
 
     try:
         result = await asyncio.to_thread(
@@ -778,6 +786,7 @@ async def _run_whisper_transcript_job(
             stt_speed=request.stt_speed,
             server_access_token=lambda: str(job.get("access_token") or ""),
             progress_callback=progress,
+            backend_progress_callback=backend_progress,
             cancel_callback=cancelled,
             whisper_job_started_callback=started,
         )
@@ -865,6 +874,7 @@ async def start_whisper_transcript(
         "source_url": request.url,
         "status": "running",
         "progress": 0,
+        "backend_progress": 0,
         "message": "Whisper 전사를 준비하는 중입니다.",
         "access_token": authorization,
         "client_job_id": job_id,
@@ -957,7 +967,7 @@ async def _run_metadata_material_job(
     job = METADATA_MATERIAL_JOBS[job_id]
 
     def update(progress: int, message: str) -> None:
-        job.update({"progress": max(0, min(100, progress)), "message": message})
+        job.update({"progress": max(job.get("progress", 0), min(100, max(0, progress))), "message": message})
 
     try:
         selections = {

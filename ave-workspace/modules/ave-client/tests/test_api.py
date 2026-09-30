@@ -86,9 +86,24 @@ def test_scoring_can_only_start_from_completed_structure(monkeypatch):
     )
 
     assert result["status"] == "queued"
+    assert result["progress_stage"] == "scoring"
     assert result["stop_after_structure"] is False
     assert result["request"]["target_duration_seconds"] == 300
     LIVE_EDIT_JOBS.pop(job_id, None)
+
+
+def test_edit_progress_only_resets_when_the_phase_changes():
+    from app.main import _update_live_edit_job
+
+    job_id = "progress-phase-test"
+    LIVE_EDIT_JOBS[job_id] = {"phase": "analysis", "progress": 52}
+    try:
+        _update_live_edit_job(job_id, phase="analysis", progress=23)
+        assert LIVE_EDIT_JOBS[job_id]["progress"] == 52
+        _update_live_edit_job(job_id, phase="render", progress=0)
+        assert LIVE_EDIT_JOBS[job_id]["progress"] == 0
+    finally:
+        LIVE_EDIT_JOBS.pop(job_id, None)
 
 
 def test_whisper_auto_language_is_represented_by_an_omitted_language_hint():
@@ -247,7 +262,7 @@ def test_workflow_uses_current_endpoints_and_restored_options():
         and "materialSelections.captions" in options
     )
     assert '"현재 작업을 중단하고 로그아웃하시겠습니까?"' in source
-    assert "disabled={busy || !metadataReady || !token}" in source
+    assert "disabled={busy || !metadataReady || (!token && !loginReady && loginLoading)}" in source
     assert 'if (token || phase === "metadata") return;' in source
     assert (
         'id="youtube-url"' in source

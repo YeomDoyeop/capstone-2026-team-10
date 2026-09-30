@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import logging
 import math
 import os
@@ -167,8 +168,14 @@ def _generate_json(provider: str, system: str, prompt: str, *, model: str | None
             "responseMimeType": "application/json",
         }
         if response_schema:
-            # 클라이언트는 JSON Schema를 전달한다(숫자 enum, additionalProperties 포함).
-            config["responseJsonSchema"] = response_schema
+            # 긴 전사의 챕터 수를 maxItems로 제한하면 Gemini가 400을 반환한다.
+            # 기존 클라이언트의 스키마도 수용하되 원본 객체는 변경하지 않는다.
+            schema_for_provider = response_schema
+            chapters = response_schema.get("properties", {}).get("chapters")
+            if isinstance(chapters, dict) and chapters.get("type") == "array" and "maxItems" in chapters:
+                schema_for_provider = copy.deepcopy(response_schema)
+                del schema_for_provider["properties"]["chapters"]["maxItems"]
+            config["responseJsonSchema"] = schema_for_provider
         response = _post(
             provider,
             f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:generateContent",

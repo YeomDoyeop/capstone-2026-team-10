@@ -56,6 +56,28 @@ def test_gemini_sends_json_schema_with_supported_response_field(monkeypatch):
     assert "responseSchema" not in config
 
 
+def test_gemini_omits_large_chapter_max_items_without_mutating_input(monkeypatch):
+    sent = {}
+    schema = {
+        "type": "object",
+        "properties": {"chapters": {"type": "array", "minItems": 1, "maxItems": 2339,
+                                     "items": {"type": "object"}}},
+    }
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        llm_gateway.requests, "post", lambda *args, **kwargs: sent.update(kwargs) or _Response()
+    )
+
+    llm_gateway.generate_json(
+        "gemini", "system", "prompt", model=None, response_schema=schema
+    )
+
+    sent_chapters = sent["json"]["generationConfig"]["responseJsonSchema"]["properties"]["chapters"]
+    assert sent_chapters["minItems"] == 1
+    assert "maxItems" not in sent_chapters
+    assert schema["properties"]["chapters"]["maxItems"] == 2339
+
+
 def test_gemini_request_slots_enforce_four_thousand_rpm(monkeypatch):
     clock = [100.0]
     sleeps = []

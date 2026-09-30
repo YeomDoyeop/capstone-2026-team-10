@@ -2,7 +2,7 @@
 
 AVE(Automatic Video Edit)는 YouTube 영상의 스크립트를 분석해 편집 구간 선정을 돕는 시스템입니다. 채팅, 댓글 타임스탬프, 히트맵, 음량을 결합한 점수와 기승전결 탐색은 지원 예정입니다.
 
-이 저장소는 여러 독립 Git 저장소를 한곳에서 개발하기 위한 루트 워크스페이스입니다. 실제 애플리케이션 코드와 실행·배포 설정은 `modules/` 아래 각 모듈에서 관리합니다.
+이 저장소는 AVE의 모든 모듈을 하나의 Git 저장소에서 관리합니다. 실제 애플리케이션 코드와 실행·배포 설정은 `modules/` 아래 각 모듈에 있습니다.
 
 ## 구성
 
@@ -19,16 +19,7 @@ AVE(Automatic Video Edit)는 YouTube 영상의 스크립트를 분석해 편집 
 
 ### 1. 워크스페이스 준비
 
-Windows에서 Git을 설치한 뒤 루트의 `setup.bat`를 실행합니다. 스크립트는 다음 모듈을 `modules/` 아래에 내려받으며, 이미 존재하는 디렉터리는 그대로 둡니다.
-
-```text
-ave-client
-ave-dist
-ave-server
-ave-whisper-api
-```
-
-기존에 모듈 저장소를 내려받은 상태라면 이 단계는 건너뛰어도 됩니다.
+루트 저장소를 복제하면 `ave-client`, `ave-dist`, `ave-server`, `ave-whisper-api`가 `modules/` 아래에 함께 포함됩니다. 별도로 모듈 저장소를 복제할 필요가 없습니다.
 
 ### 2. 클라이언트 개발 실행
 
@@ -89,8 +80,7 @@ ave-workspace/
 │  ├─ ave-server/         # 중앙 API 서버
 │  ├─ ave-whisper-api/    # 원격 STT API
 │  └─ ave-dist/           # Windows 포터블 앱 패키징·업데이터·배포 산출물
-├─ AGENTS.md              # 워크스페이스 작업 원칙
-└─ setup.bat              # 모듈 저장소 준비 스크립트
+└─ AGENTS.md              # 워크스페이스 작업 원칙
 ```
 
-각 `modules/<모듈>`은 독립된 Git 저장소입니다. 모듈별 변경은 해당 저장소에서 관리하고, 여러 모듈에 공통으로 영향을 주는 문서만 루트 `docs/`에 기록합니다.
+각 `modules/<모듈>`의 소스 코드와 문서는 루트 Git 저장소에서 함께 추적하고 커밋합니다. 여러 모듈에 공통으로 영향을 주는 문서는 루트 `docs/`에 기록합니다.

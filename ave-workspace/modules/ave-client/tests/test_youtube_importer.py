@@ -56,6 +56,28 @@ def test_best_audio_uses_highest_quality_and_is_stored_in_yt_data(
     assert calls[0]["audioquality"] == "0"
 
 
+def test_source_download_defaults_to_480p_and_reports_byte_progress(tmp_path, monkeypatch):
+    monkeypatch.delenv("YTDLP_FORMAT", raising=False)
+    importer = YouTubeImporter(tmp_path)
+    options = importer._build_ydl_options(
+        tmp_path, include_subtitles=False, write_info_json=False,
+        prefer_merged_formats=False,
+    )
+    assert options["format"].startswith("best[height<=480][ext=mp4]")
+
+    values = []
+    hook = importer._progress_hook(values.append)
+    hook({"status": "downloading", "downloaded_bytes": 250, "total_bytes": 1000})
+    hook({"status": "finished"})
+    assert values == [25, 99]
+
+    monkeypatch.setenv("YTDLP_FORMAT", "best[height<=720]")
+    assert importer._build_ydl_options(
+        tmp_path, include_subtitles=False, write_info_json=False,
+        prefer_merged_formats=False,
+    )["format"] == "best[height<=720]"
+
+
 def test_import_reuses_existing_video_and_vtt_without_invoking_ytdlp(
     tmp_path, monkeypatch
 ):
@@ -260,7 +282,7 @@ def test_import_uses_single_file_format_when_ffmpeg_is_missing(tmp_path, monkeyp
 
     result = importer.prepare_source_video("https://www.youtube.com/watch?v=abc123")
 
-    assert SingleFileYoutubeDL.calls[0]["format"] == "best[ext=mp4]/best"
+    assert SingleFileYoutubeDL.calls[0]["format"] == youtube_importer.DEFAULT_VIDEO_FORMAT
     assert "lang" not in SingleFileYoutubeDL.calls[0].get("extractor_args", {}).get(
         "youtube", {}
     )
@@ -283,7 +305,7 @@ class SeparateStreamsFallbackYoutubeDL(SingleFileYoutubeDL):
 
     def extract_info(self, url, download=True):
         self.__class__.calls.append(self.options)
-        if self.options["format"] == "best[ext=mp4]/best":
+        if self.options["format"] == youtube_importer.DEFAULT_VIDEO_FORMAT:
             raise RuntimeError("ERROR: Requested format is not available")
         video_path = self.job_dir / "merged-video.mp4"
         video_path.write_bytes(b"fake video")
@@ -308,8 +330,8 @@ def test_import_retries_with_separate_streams_when_combined_format_is_unavailabl
     result = importer.prepare_source_video("https://www.youtube.com/watch?v=abc123")
 
     assert [call["format"] for call in SeparateStreamsFallbackYoutubeDL.calls] == [
-        "best[ext=mp4]/best",
-        "bestvideo*+bestaudio/best",
+        youtube_importer.DEFAULT_VIDEO_FORMAT,
+        "bestvideo[height<=480]+bestaudio/bestvideo*+bestaudio/best",
     ]
     assert result["title"] == "Merged video"
     assert any("separate video and audio" in warning for warning in result["warnings"])

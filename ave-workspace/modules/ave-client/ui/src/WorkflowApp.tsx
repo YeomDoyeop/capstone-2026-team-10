@@ -8,6 +8,7 @@ type Job = {
   job_id: string;
   status: string;
   progress: number;
+  progress_stage?: "scoring";
   transcription_progress?: number;
   phase?: string;
   task_name?: string;
@@ -238,6 +239,8 @@ export default function WorkflowApp() {
     String(initialSettings.target_duration_seconds),
   );
   const [message, setMessage] = useState("로그인 설정을 불러오는 중입니다.");
+  const [authConfigError, setAuthConfigError] = useState("");
+  const [authConfigLoading, setAuthConfigLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [review, setReview] = useState<Review | null>(null);
@@ -259,6 +262,10 @@ export default function WorkflowApp() {
   const restartRequestedRef = useRef(false);
   const phaseTransitionRef = useRef(false);
   const workflowEpochRef = useRef(0);
+  const authSubscriptionRef = useRef<(() => void) | null>(null);
+  const displayedProgressRef = useRef<{
+    jobId: string; stageKey: string; value: number; startedAt: number | null;
+  }>({ jobId: "", stageKey: "", value: 0, startedAt: null });
   const scriptPreviewRequestRef = useRef(0);
   const whisperRequired = Boolean(
     metadata && !materialSelections.subtitles && !materialSelections.captions,
@@ -397,6 +404,16 @@ export default function WorkflowApp() {
     );
   }, [token]);
   useEffect(() => {
+    if (
+      token &&
+      phase === "metadata" &&
+      metadata &&
+      message === "영상 정보를 확인했습니다. 다음 단계는 Google 로그인 후 진행할 수 있습니다."
+    ) {
+      setMessage("영상 정보를 확인했습니다. 추가 자료를 선택하거나 다음으로 진행하세요.");
+    }
+  }, [token, phase, metadata, message]);
+  useEffect(() => {
     if (phase === "metadata" && previousPhaseRef.current !== "metadata")
       setMetadataTab("overview");
     previousPhaseRef.current = phase;
@@ -480,40 +497,48 @@ export default function WorkflowApp() {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [startedAt]);
+  async function initializeAuth() {
+    setAuthConfigLoading(true);
+    setAuthConfigError("");
+    try {
+      const response = await fetch("/api/config");
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(
+          String(body.detail || `로그인 설정 요청 실패 (HTTP ${response.status})`),
+        );
+      }
+      const config = await response.json();
+      const next = createClient(config.supabase_url, config.supabase_anon_key);
+      authSubscriptionRef.current?.();
+      const {
+        data: { subscription },
+      } = next.auth.onAuthStateChange((_event, session) => {
+        setToken(session?.access_token || "");
+        setAccountEmail(session?.user.email || "");
+      });
+      authSubscriptionRef.current = () => subscription.unsubscribe();
+      setClient(next);
+      const { data, error } = await next.auth.getSession();
+      if (error) throw error;
+      setToken(data.session?.access_token || "");
+      setAccountEmail(data.session?.user.email || "");
+      setMessage(
+        data.session
+          ? "로그인되었습니다. 영상 URL을 확인하세요."
+          : "Google 로그인이 필요합니다.",
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "알 수 없는 오류";
+      setAuthConfigError(detail);
+      setMessage(`로그인 설정을 불러오지 못했습니다: ${detail}`);
+    } finally {
+      setAuthConfigLoading(false);
+    }
+  }
   useEffect(() => {
-    let unsubscribe: (() => void) | undefined;
-    fetch("/api/config")
-      .then(async (response) => {
-        if (!response.ok)
-          throw new Error("AVE 서버에서 로그인 설정을 불러오지 못했습니다.");
-        return response.json();
-      })
-      .then((config) => {
-        const next = createClient(
-          config.supabase_url,
-          config.supabase_anon_key,
-        );
-        setClient(next);
-        const {
-          data: { subscription },
-        } = next.auth.onAuthStateChange((_event, session) => {
-          setToken(session?.access_token || "");
-          setAccountEmail(session?.user.email || "");
-        });
-        unsubscribe = () => subscription.unsubscribe();
-        return next.auth.getSession();
-      })
-      .then(({ data }) => {
-        setToken(data.session?.access_token || "");
-        setAccountEmail(data.session?.user.email || "");
-        setMessage(
-          data.session
-            ? "로그인되었습니다. 영상 URL을 확인하세요."
-            : "Google 로그인이 필요합니다.",
-        );
-      })
-      .catch((error) => setMessage(error.message));
-    return () => unsubscribe?.();
+    void initializeAuth();
+    return () => authSubscriptionRef.current?.();
   }, []);
   useEffect(() => {
     if (job || !token) return;
@@ -771,17 +796,6 @@ export default function WorkflowApp() {
     });
   }, [phase, review]);
   useEffect(() => {
-    if (phase !== "review") return;
-    document
-      .querySelectorAll<HTMLButtonElement>(".chapter-head button.ghost.compact")
-      .forEach((button) => {
-        const opened = button.textContent?.trim() === "접기";
-        button.textContent = opened ? "▲" : "▼";
-        button.setAttribute("aria-label", opened ? "접기" : "세부 구간 보기");
-        button.title = opened ? "접기" : "세부 구간 보기";
-      });
-  }, [phase, openChapters]);
-  useEffect(() => {
     if (!whisperRequired) return;
     setWhisperEnabled(true);
     setSettings((current) =>
@@ -897,7 +911,6 @@ export default function WorkflowApp() {
       ),
     [selected],
   );
-  const elapsed = startedAt ? Math.floor((now - startedAt) / 1000) : 0;
   const whisperTranscribing = Boolean(
     whisperTranscript &&
     ["running", "cancel_requested"].includes(whisperTranscript.status),
@@ -943,7 +956,37 @@ export default function WorkflowApp() {
           : materialDownload
             ? { kind: "materials", status: materialDownload.status, value: materialDownload.progress, label: "추가 메타데이터 다운로드", log: materialDownload.error || materialDownload.message }
             : { kind: "idle", status: "idle", value: 0, label: "대기 중", log: message };
-  const progressValue = Math.max(0, Math.min(100, Math.round(Number(activeProgress.value) || 0)));
+  const progressJobId = workflowJobId || job?.job_id || whisperTranscript?.job_id || materialDownload?.job_id || "";
+  const stageKey = activeProgress.kind === "edit"
+    ? job?.phase === "render"
+      ? "render"
+      : job?.phase === "transcription"
+        ? "transcription"
+        : job?.progress_stage === "scoring"
+          ? "scoring"
+          : "analysis"
+    : activeProgress.kind === "idle" ? "" : activeProgress.kind;
+  const reportedProgress = Math.max(0, Math.min(100, Number(activeProgress.value) || 0));
+  // The scoring pass reuses the analysis pipeline's 90–100 range.
+  const stageProgress = stageKey === "scoring"
+    ? Math.max(0, Math.min(100, (reportedProgress - 90) * 10))
+    : reportedProgress;
+  if (displayedProgressRef.current.jobId !== progressJobId) {
+    displayedProgressRef.current = { jobId: progressJobId, stageKey: "", value: 0, startedAt: null };
+  }
+  if (stageKey && displayedProgressRef.current.stageKey !== stageKey) {
+    displayedProgressRef.current = { jobId: progressJobId, stageKey, value: 0, startedAt: Date.now() };
+  }
+  if (stageKey) {
+    displayedProgressRef.current.value = Math.max(
+      displayedProgressRef.current.value,
+      Math.round(stageProgress),
+    );
+  }
+  const progressValue = displayedProgressRef.current.value;
+  const stageElapsed = startedAt && displayedProgressRef.current.startedAt
+    ? Math.max(0, Math.floor((now - displayedProgressRef.current.startedAt) / 1000))
+    : 0;
   const isShortForm = ["game", "variety"].includes(settings.criteria_prompt);
   function selectCriteriaPrompt(value: string) {
     const shortForm = ["game", "variety"].includes(value);
@@ -1091,7 +1134,9 @@ export default function WorkflowApp() {
       displayedMetadataUrlRef.current = requestedUrl;
       setMetadata(body);
       setMessage(
-        "영상 정보를 확인했습니다. 추가 자료를 선택하거나 다음으로 진행하세요.",
+        token
+          ? "영상 정보를 확인했습니다. 추가 자료를 선택하거나 다음으로 진행하세요."
+          : "영상 정보를 확인했습니다. 다음 단계는 Google 로그인 후 진행할 수 있습니다.",
       );
     } catch (error) {
       setMessage(
@@ -1233,6 +1278,7 @@ export default function WorkflowApp() {
     restartRequestedRef.current = false;
     shouldAnimateMetadataRef.current = false;
     setBusy(true);
+    setStartedAt(Date.now());
     setMaterialDownload({
       job_id: "",
       status: "running",
@@ -1304,6 +1350,7 @@ export default function WorkflowApp() {
       );
     } finally {
       setMaterialDownload(null);
+      setStartedAt(null);
       setBusy(false);
     }
   }
@@ -1468,6 +1515,9 @@ export default function WorkflowApp() {
       const body = await response.json().catch(() => ({}));
       if (!response.ok)
         throw new Error(body.detail || "렌더링을 시작하지 못했습니다.");
+      if (job.status === "completed") {
+        displayedProgressRef.current = { jobId: progressJobId, stageKey: "render", value: 0, startedAt: Date.now() };
+      }
       setJob(body);
       setStartedAt(Date.now());
       setMessage(body.message);
@@ -1563,6 +1613,7 @@ export default function WorkflowApp() {
   function restart() {
     restartRequestedRef.current = true;
     workflowEpochRef.current += 1;
+    displayedProgressRef.current = { jobId: "", stageKey: "", value: 0, startedAt: null };
     phaseTransitionRef.current = false;
     setPhase("metadata");
     setJob(null);
@@ -1886,15 +1937,26 @@ export default function WorkflowApp() {
           <span className="status-pill">
             {token
               ? `${accountEmail || "Google"} 로그인됨`
-              : "Google 로그인 필요"}
+              : authConfigError
+                ? "로그인 설정 오류"
+                : "Google 로그인 필요"}
           </span>
+          {authConfigError && !token && (
+            <span className="auth-config-error" role="alert">
+              {authConfigError}
+            </span>
+          )}
           {token ? (
             <button className="ghost" onClick={logout}>
               로그아웃
             </button>
           ) : (
-            <button onClick={login} disabled={!client || busy}>
-              Google 로그인
+            <button
+              onClick={client ? login : initializeAuth}
+              disabled={client ? busy && phase !== "metadata" : authConfigLoading}
+              title={authConfigError || undefined}
+            >
+              {client ? "Google 로그인" : authConfigLoading ? "로그인 설정 확인 중" : "로그인 설정 재시도"}
             </button>
           )}
           <button
@@ -2197,6 +2259,9 @@ export default function WorkflowApp() {
                       </div>
                       <button
                         className="ghost compact"
+                        aria-label={openChapters.has(chapter.chapter_id) ? "접기" : "세부 구간 보기"}
+                        aria-expanded={openChapters.has(chapter.chapter_id)}
+                        title={openChapters.has(chapter.chapter_id) ? "접기" : "세부 구간 보기"}
                         onClick={() =>
                           setOpenChapters((current) => {
                             const next = new Set(current);
@@ -2207,7 +2272,7 @@ export default function WorkflowApp() {
                           })
                         }
                       >
-                        {openChapters.has(chapter.chapter_id) ? "접기" : "세부 구간"}
+                        {openChapters.has(chapter.chapter_id) ? "▲" : "▼"}
                       </button>
                     </div>
                     {openChapters.has(chapter.chapter_id) && (
@@ -2388,6 +2453,9 @@ export default function WorkflowApp() {
                           </div>
                           <button
                             className="ghost compact"
+                            aria-label={opened ? "접기" : "세부 구간 보기"}
+                            aria-expanded={opened}
+                            title={opened ? "접기" : "세부 구간 보기"}
                             onClick={() =>
                               setOpenChapters((current) => {
                                 const next = new Set(current);
@@ -2398,7 +2466,7 @@ export default function WorkflowApp() {
                               })
                             }
                           >
-                            {opened ? "접기" : "세부 구간"}
+                            {opened ? "▲" : "▼"}
                           </button>
                         </div>
                         {opened && (
@@ -2614,7 +2682,7 @@ export default function WorkflowApp() {
           </div>
         </div>
         <strong>{progressValue}%</strong>
-        <time>{startedAt ? formatTime(elapsed) : ""}</time>
+        <time>{startedAt ? formatTime(stageElapsed) : ""}</time>
         {whisperTranscript?.status === "paused" ? (
           <button
             className="ghost compact cancel-job-button"
@@ -2660,7 +2728,10 @@ export default function WorkflowApp() {
           phase={phase}
           metadataReady={Boolean(metadata)}
           token={Boolean(token)}
-          busy={controlsLocked}
+          loginReady={Boolean(client)}
+          loginLoading={authConfigLoading}
+          loginError={Boolean(authConfigError)}
+          busy={phase === "metadata" ? busy : controlsLocked}
           hasSelection={selected.length > 0}
           reviewReady={selectionEnabled && Boolean(review)}
           canScore={
@@ -2669,6 +2740,7 @@ export default function WorkflowApp() {
           hasRenderedResult={Boolean(job?.result?.revision)}
           onPhase={transitionToPhase}
           onDownloadMaterials={downloadMaterials}
+          onLogin={client ? login : initializeAuth}
           onAdvanceToAnalysis={advanceToAnalysis}
           onScore={scoreAnalysis}
           onRender={renderSelection}
@@ -3024,6 +3096,9 @@ function FooterActions({
   phase,
   metadataReady,
   token,
+  loginReady,
+  loginLoading,
+  loginError,
   busy,
   hasSelection,
   reviewReady,
@@ -3031,6 +3106,7 @@ function FooterActions({
   hasRenderedResult,
   onPhase,
   onDownloadMaterials,
+  onLogin,
   onAdvanceToAnalysis,
   onScore,
   onRender,
@@ -3039,6 +3115,9 @@ function FooterActions({
   phase: Phase;
   metadataReady: boolean;
   token: boolean;
+  loginReady: boolean;
+  loginLoading: boolean;
+  loginError: boolean;
   busy: boolean;
   hasSelection: boolean;
   reviewReady: boolean;
@@ -3046,6 +3125,7 @@ function FooterActions({
   hasRenderedResult: boolean;
   onPhase: (phase: Phase) => void;
   onDownloadMaterials: () => void;
+  onLogin: () => void;
   onAdvanceToAnalysis: () => void;
   onScore: () => void;
   onRender: () => void;
@@ -3057,12 +3137,12 @@ function FooterActions({
     return (
       <div className="footer-actions">
         <button
-          title="다음: 추가 자료 다운로드"
-          aria-label="다음: 추가 자료 다운로드"
-          onClick={onDownloadMaterials}
-          disabled={busy || !metadataReady || !token}
+          title={token ? "다음: 추가 자료 다운로드" : loginReady ? "Google 로그인 후 다음 단계 진행" : "로그인 설정 재시도"}
+          aria-label={token ? "다음: 추가 자료 다운로드" : loginReady ? "Google 로그인 후 다음 단계 진행" : "로그인 설정 재시도"}
+          onClick={token ? onDownloadMaterials : onLogin}
+          disabled={busy || !metadataReady || (!token && !loginReady && loginLoading)}
         >
-          다음
+          {token ? "다음" : loginReady ? "Google 로그인 후 다음" : loginError ? "로그인 설정 재시도" : "로그인 설정 확인 중"}
         </button>
       </div>
     );

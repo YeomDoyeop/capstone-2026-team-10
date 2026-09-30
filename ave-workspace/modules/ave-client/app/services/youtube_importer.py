@@ -6,6 +6,7 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
@@ -16,6 +17,7 @@ from app.services.ytdlp_binary import YoutubeDL
 YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
 SUBTITLE_EXTENSIONS = {".vtt", ".srt", ".json3"}
+DEFAULT_VIDEO_FORMAT = "best[height<=480][ext=mp4]/best[height<=480]/best[ext=mp4]/best"
 
 SUBTITLE_RATE_LIMIT_WARNING = (
     "Subtitle download was rate-limited by YouTube. "
@@ -140,6 +142,7 @@ class YouTubeImporter:
         job_id: str | None = None,
         *,
         include_subtitles: bool = True,
+        progress_callback: Callable[[int], None] | None = None,
     ) -> dict:
         """원본 영상을 준비하거나 이미 확보한 ``yt-data`` 자료를 재사용한다."""
         if not is_youtube_url(url):
@@ -147,6 +150,8 @@ class YouTubeImporter:
         job_id = job_id or uuid4().hex
         cached = self.find_complete_cached_import(url, job_id)
         if cached is not None:
+            if progress_callback:
+                progress_callback(100)
             return cached
         video_id = self._video_id_from_url(url)
         # A video ID is stable across edit jobs. Keeping newly imported assets
@@ -171,6 +176,7 @@ class YouTubeImporter:
             write_info_json=not self._has_cached_info(job_dir),
             prefer_merged_formats=prefer_merged_formats,
             warnings=warnings,
+            progress_callback=progress_callback,
         )
 
         subtitle_files = self._find_files(job_dir, SUBTITLE_EXTENSIONS, recursive=True)
@@ -185,6 +191,8 @@ class YouTubeImporter:
             warnings,
         )
 
+        if progress_callback:
+            progress_callback(100)
         return {
             "job_id": job_id,
             "source_url": url,
@@ -196,7 +204,10 @@ class YouTubeImporter:
             "warnings": warnings,
         }
 
-    def prepare_best_audio(self, url: str, video_id: str) -> Path:
+    def prepare_best_audio(
+        self, url: str, video_id: str,
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> Path:
         """Download the best available audio and publish one reusable MP3."""
 
         if not is_youtube_url(url):
@@ -207,6 +218,8 @@ class YouTubeImporter:
         data_dir.mkdir(parents=True, exist_ok=True)
         destination = data_dir / f"{video_id}.mp3"
         if destination.is_file() and destination.stat().st_size > 0:
+            if progress_callback:
+                progress_callback(100)
             return destination
 
         pending_stem = f".{video_id}.{uuid4().hex}.audio"
@@ -229,12 +242,16 @@ class YouTubeImporter:
                     "ffmpeg_location": str(ffmpeg()),
                 }
             )
+            if progress_callback:
+                options["progress_hooks"] = [self._progress_hook(progress_callback)]
             try:
                 self._download(url, options)
                 pending = data_dir / f"{pending_stem}.mp3"
                 if not pending.is_file() or pending.stat().st_size <= 0:
                     raise YouTubeImportError("최고 품질 MP3를 생성하지 못했습니다.")
                 pending.replace(destination)
+                if progress_callback:
+                    progress_callback(100)
                 return destination
             except Exception as exc:
                 last_error = exc
@@ -353,12 +370,12 @@ class YouTubeImporter:
         player_client: str | None = None,
         use_cookies: bool = True,
     ) -> dict:
-        format_selector = os.getenv("YTDLP_FORMAT", "best[ext=mp4]/best").strip()
+        format_selector = os.getenv("YTDLP_FORMAT", DEFAULT_VIDEO_FORMAT).strip()
         options = {
             # Prefer a progressive MP4 stream. YouTube may expose separate
             # DASH streams whose URLs require a PO token and then return 403.
             # Users can opt back into a higher-quality selector via env.
-            "format": format_selector or "best[ext=mp4]/best",
+            "format": format_selector or DEFAULT_VIDEO_FORMAT,
             "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
             "writeautomaticsub": include_subtitles,
             "writesubtitles": include_subtitles,
@@ -420,6 +437,7 @@ class YouTubeImporter:
         write_info_json: bool,
         prefer_merged_formats: bool,
         warnings: list[str],
+        progress_callback: Callable[[int], None] | None = None,
     ) -> dict:
         last_error: Exception | None = None
         clients = self._player_clients()
@@ -433,6 +451,8 @@ class YouTubeImporter:
                 player_client=client,
                 use_cookies=not cookies_disabled,
             )
+            if progress_callback:
+                options["progress_hooks"] = [self._progress_hook(progress_callback)]
             try:
                 return self._download(url, options)
             except Exception as exc:  # yt-dlp exposes several custom errors.
@@ -446,7 +466,12 @@ class YouTubeImporter:
                         player_client=client,
                         use_cookies=not cookies_disabled,
                     )
-                    fallback_options["format"] = "bestvideo*+bestaudio/best"
+                    fallback_options["format"] = (
+                        "bestvideo[height<=480]+bestaudio/"
+                        "bestvideo*+bestaudio/best"
+                    )
+                    if progress_callback:
+                        fallback_options["progress_hooks"] = [self._progress_hook(progress_callback)]
                     try:
                         result = self._download(url, fallback_options)
                         warnings.append(YTDLP_SEPARATE_STREAMS_WARNING)
@@ -476,6 +501,8 @@ class YouTubeImporter:
                         player_client=client,
                         use_cookies=not cookies_disabled,
                     )
+                    if progress_callback:
+                        fallback_options["progress_hooks"] = [self._progress_hook(progress_callback)]
                     try:
                         return self._download(url, fallback_options)
                     except Exception as fallback_exc:
@@ -496,6 +523,17 @@ class YouTubeImporter:
     def _download(self, url: str, ydl_options: dict) -> dict:
         with YoutubeDL(ydl_options) as downloader:
             return downloader.extract_info(url, download=True)
+
+    @staticmethod
+    def _progress_hook(callback: Callable[[int], None]) -> Callable[[dict], None]:
+        def hook(event: dict) -> None:
+            if event.get("status") == "finished":
+                callback(99)
+            elif event.get("status") == "downloading":
+                total = event.get("total_bytes") or event.get("total_bytes_estimate")
+                if total:
+                    callback(max(0, min(99, int(event.get("downloaded_bytes", 0) * 100 / total))))
+        return hook
 
     def _has_ffmpeg(self) -> bool:
         try:

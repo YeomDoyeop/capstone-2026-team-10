@@ -49,19 +49,22 @@ def main() -> None:
     load_dotenv(_bundled_root() / ".env", override=True)
 
     from fastapi.staticfiles import StaticFiles
-    from app import main as client_main
     from app.services import prompt_store
 
     static_root = application_root / "static"
     ui_root = static_root / "ui"
     if not (ui_root / "index.html").is_file():
         raise RuntimeError(f"정적 UI를 찾을 수 없습니다: {ui_root}")
-    client_main.STATIC_DIR = static_root
-    client_main.REACT_UI_DIR = ui_root
     prompt_store.PROMPT_ROOT = application_root / "prompts"
     prompt_store.USER_PROMPT_DIR = prompt_store.PROMPT_ROOT / "user"
     prompt_store.SYSTEM_PROMPT_DIR = prompt_store.PROMPT_ROOT / "system"
     prompt_store.SCHEMA_DIR = prompt_store.PROMPT_ROOT / "schemas"
+
+    # 앱 모듈은 import 도중에도 응답 스키마를 읽으므로 프롬프트 경로를 먼저 설정한다.
+    from app import main as client_main
+
+    client_main.STATIC_DIR = static_root
+    client_main.REACT_UI_DIR = ui_root
     if (ui_root / "assets").is_dir():
         client_main.app.mount(
             "/ui/assets",

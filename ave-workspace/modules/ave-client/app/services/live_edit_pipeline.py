@@ -1497,6 +1497,7 @@ class LiveEditPipeline:
         stt_speed: float,
         server_access_token: AccessTokenSource,
         progress_callback: Callable[[int, str], None] | None = None,
+        backend_progress_callback: Callable[[int], None] | None = None,
         cancel_callback: Callable[[], None] | None = None,
         whisper_job_started_callback: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
@@ -1512,8 +1513,17 @@ class LiveEditPipeline:
         stt_initial_prompt = (
             fixed_whisper_initial_prompt(stt_language) if stt_initial_prompt else ""
         )
+        def report_audio_download(percent: int) -> None:
+            if progress_callback:
+                progress_callback(
+                    round(max(0, min(100, percent)) * 15 / 100),
+                    "음원 다운로드를 마치고 MP3를 변환하는 중입니다."
+                    if percent >= 99 else f"Whisper 음원 다운로드 중 ({percent}%)",
+                )
+
         source_audio_path = YouTubeImporter(self.media_root).prepare_best_audio(
-            vod_url, video_id
+            vod_url, video_id,
+            progress_callback=report_audio_download if progress_callback else None,
         )
         source_audio_stat = source_audio_path.stat()
         request_fingerprint = {
@@ -1550,12 +1560,15 @@ class LiveEditPipeline:
         if saved_source is not None:
             _write_json_atomic(source_path, saved_source)
         if not whisper_segments:
+            if progress_callback:
+                progress_callback(15, "다운로드한 음원을 Whisper 입력 형식으로 변환하는 중입니다.")
             whisper_audio_path = prepare_whisper_audio(
                 source_audio_path, prepared_metadata_paths(video_id)["whisper_audio"]
             )
             check_cancelled()
             if progress_callback:
                 progress_callback(20, "Whisper 전사용 오디오를 준비했습니다.")
+                progress_callback(20, "전사용 오디오를 AVE 서버에 업로드하는 중입니다.")
             uploaded = upload_audio_for_transcription(
                 whisper_audio_path, server_access_token
             )
@@ -1570,6 +1583,16 @@ class LiveEditPipeline:
                 if whisper_job_started_callback:
                     whisper_job_started_callback(value)
 
+            def report_backend(progress: int, message: str) -> None:
+                check_cancelled()
+                if backend_progress_callback:
+                    backend_progress_callback(max(0, min(100, progress)))
+                if progress_callback:
+                    progress_callback(
+                        25 + round(max(0, min(100, progress)) * 55 / 100),
+                        message,
+                    )
+
             result = transcribe_uploaded_audio(
                 uploaded.file_id,
                 server_access_token,
@@ -1579,10 +1602,7 @@ class LiveEditPipeline:
                 initial_prompt=stt_initial_prompt,
                 hotwords=stt_hotwords,
                 speed=stt_speed,
-                progress_callback=lambda progress, message: (
-                    check_cancelled(),
-                    progress_callback and progress_callback(min(80, progress), message),
-                ),
+                progress_callback=report_backend,
                 job_started_callback=started,
             )
             check_cancelled()
@@ -1596,6 +1616,8 @@ class LiveEditPipeline:
             whisper_segments = result.get("segments", [])
             if not whisper_segments:
                 raise LiveEditPipelineError("Whisper 전사 결과에 세그먼트가 없습니다.")
+            if progress_callback:
+                progress_callback(80, "서버 전사가 완료되어 결과를 저장하는 중입니다.")
             saved_source = {
                 "request": request_fingerprint,
                 "language": result.get("language"),
@@ -1615,6 +1637,8 @@ class LiveEditPipeline:
         shared_transcript_path, split_request = _shared_whisper_transcript_path(
             self.media_root, video_id, request_fingerprint, llm_provider
         )
+        if progress_callback:
+            progress_callback(80, "서버 전사 결과를 확인하고 문장 분할을 준비하는 중입니다.")
         for candidate_path in (transcript_path, shared_transcript_path):
             try:
                 candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
@@ -1679,6 +1703,8 @@ class LiveEditPipeline:
                     for segment in whisper_segments
                 ]
             else:
+                if progress_callback:
+                    progress_callback(80, "긴 Whisper 문장을 LLM으로 분할하는 중입니다.")
                 segments = _split_whisper_segments_parallel(
                     whisper_segments,
                     analysis_service,
@@ -1731,9 +1757,13 @@ class LiveEditPipeline:
         server_access_token: str | None = None,
         server_job_id: str | None = None,
     ) -> dict[str, Any]:
+        highest_progress = 0
+
         def report(progress: int, message: str) -> None:
+            nonlocal highest_progress
+            highest_progress = max(highest_progress, max(0, min(100, progress)))
             if progress_callback:
-                progress_callback(progress, message)
+                progress_callback(highest_progress, message)
 
         if target_seconds < 60 or target_seconds > 7200:
             raise LiveEditPipelineError(
@@ -2411,9 +2441,13 @@ class LiveEditPipeline:
     ) -> dict[str, Any]:
         """Render an existing analysis again from user-selected candidates."""
 
+        highest_progress = 0
+
         def report(progress: int, message: str) -> None:
+            nonlocal highest_progress
+            highest_progress = max(highest_progress, max(0, min(100, progress)))
             if progress_callback:
-                progress_callback(progress, message)
+                progress_callback(highest_progress, message)
 
         if not job_id or Path(job_id).name != job_id:
             raise LiveEditPipelineError("잘못된 편집 작업 ID입니다.")
