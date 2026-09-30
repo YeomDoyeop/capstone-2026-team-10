@@ -23,6 +23,12 @@ from uuid import uuid4
 from app.config import get_media_root
 from app.services.filler_edit import apply_filler_cuts, filler_candidates
 from app.services.sentence_boundaries import split_timed_sentences
+from app.services.recipe_summary import summarize_recipes, save_recipe_files
+from app.services.recipe_thumbnail import describe_recipe_thumbnail
+from app.services.edit_policy import (
+    SHORT_FORM_PROFILES, SHORT_FORM_MAX_SECONDS, SHORT_FORM_SCORE_WEIGHTS,
+    category_target_seconds,
+)
 from app.services.toolchain import ToolchainError, ffmpeg as get_ffmpeg
 from app.services.server_media_service import (
     AccessTokenSource,
@@ -516,13 +522,14 @@ def _apply_point_scores(
             section[field] = score
 
 
-def _apply_final_scores(sections: list[dict[str, Any]]) -> None:
+def _apply_final_scores(sections: list[dict[str, Any]], criteria_prompt: str = "") -> None:
     """사용 가능한 점수의 가중치만 재정규화해 섹션 총점을 계산한다."""
 
+    weights = SHORT_FORM_SCORE_WEIGHTS if criteria_prompt in SHORT_FORM_PROFILES else SECTION_SCORE_WEIGHTS
     for section in sections:
         weighted_sum = 0.0
         available_weight = 0.0
-        for field, weight in SECTION_SCORE_WEIGHTS.items():
+        for field, weight in weights.items():
             value = section.get(field)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 weighted_sum += min(1.0, max(0.0, float(value))) * weight
@@ -794,6 +801,7 @@ def _select_coherent_clips(
     target_seconds: int,
     analysis_service: LLMAnalysisService,
     *,
+    criteria_prompt: str = "",
     cancel_callback: Callable[[], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -806,6 +814,12 @@ def _select_coherent_clips(
     )
     if not ordered:
         return [], []
+    if criteria_prompt in SHORT_FORM_PROFILES:
+        return _select_short_form_clips(
+            ordered, category_target_seconds(criteria_prompt, target_seconds), analysis_service,
+            criteria_prompt=criteria_prompt, cancel_callback=cancel_callback,
+            progress_callback=progress_callback,
+        ), []
     by_id = {str(item["segment_id"]): item for item in ordered}
     chapter_sections: dict[str, list[dict[str, Any]]] = {}
     for item in ordered:
@@ -868,6 +882,53 @@ def _select_coherent_clips(
                 ], []
         processed_anchors += len(batch)
     return [item for item in ordered if str(item["segment_id"]) in selected_ids], []
+
+
+def _select_short_form_clips(
+    ordered, target_seconds, analysis_service, *, criteria_prompt,
+    cancel_callback=None, progress_callback=None,
+):
+    """인기 앵커의 도입~결말을 연속 묶음으로 보존하고 3분 내에서 선택한다."""
+    positions = {str(item["segment_id"]): i for i, item in enumerate(ordered)}
+    ranked = sorted(ordered, key=lambda item: (-float(item.get("final_score", 0)), float(item["start"])))
+    selected: set[int] = set()
+    for done, anchor in enumerate(ranked, 1):
+        if cancel_callback:
+            cancel_callback()
+        index = positions[str(anchor["segment_id"])]
+        if index in selected:
+            continue
+        # 3분짜리 단일 문장도 자르지 않는다. 들어갈 수 없는 앵커는 API 호출 전에 제외한다.
+        if float(anchor["end"]) - float(anchor["start"]) > SHORT_FORM_MAX_SECONDS:
+            continue
+        peers = [item for item in ordered
+                 if float(item["end"]) >= float(anchor["start"]) - 90
+                 and float(item["start"]) <= float(anchor["end"]) + 90]
+        required = analysis_service.required_anchor_links(
+            str(anchor["segment_id"]), str(anchor.get("chapter_summary") or ""),
+            [{"id": str(item["segment_id"]), "text": str(item.get("text") or ""),
+              "start": float(item["start"]), "end": float(item["end"])} for item in peers],
+            criteria_prompt=criteria_prompt, cancel_callback=cancel_callback,
+        )
+        nearby_ids = {str(item["segment_id"]) for item in peers}
+        if any(value not in nearby_ids for value in required):
+            raise LLMAnalysisError("숏폼 연결 구간이 제공된 주변 후보 범위를 벗어났습니다.")
+        bundle = {index, *(positions[value] for value in required)}
+        # 챕터 경계여도 바로 이어지는 앞뒤 문장을 최소 문맥으로 보존한다.
+        if index > 0 and float(anchor["start"]) - float(ordered[index - 1]["end"]) <= 2:
+            bundle.add(index - 1)
+        if index + 1 < len(ordered) and float(ordered[index + 1]["start"]) - float(anchor["end"]) <= 2:
+            bundle.add(index + 1)
+        bundle = set(range(min(bundle), max(bundle) + 1))
+        proposed = selected | bundle
+        duration = sum(float(ordered[i]["end"]) - float(ordered[i]["start"]) for i in proposed)
+        if duration <= SHORT_FORM_MAX_SECONDS:
+            selected = proposed
+        if progress_callback:
+            progress_callback(done, len(ranked))
+        if selected and duration <= SHORT_FORM_MAX_SECONDS and duration >= target_seconds:
+            break
+    return [item for i, item in enumerate(ordered) if i in selected]
 
 
 def _srt_timestamp(seconds: float) -> str:
@@ -1678,6 +1739,7 @@ class LiveEditPipeline:
             raise LiveEditPipelineError(
                 "target_seconds는 60초에서 7200초 사이여야 합니다."
             )
+        target_seconds = category_target_seconds(criteria_prompt, target_seconds)
         if genre not in EDIT_GENRES:
             raise LiveEditPipelineError(
                 "genre는 ai_news, stock 또는 game이어야 합니다."
@@ -1869,6 +1931,38 @@ class LiveEditPipeline:
         except (ValueError, KeyError, TypeError) as exc:
             raise LiveEditPipelineError(f"문장 분할에 실패했습니다: {exc}") from exc
         checkpoint["transcript_ids"] = [item["id"] for item in raw_segments]
+        if criteria_prompt == "cooking_food":
+            try:
+                report(23, "제목·썸네일·전체 자막 흐름으로 주 요리를 먼저 판별합니다.")
+                metadata_file = Path(str(imported.get("metadata_path") or ""))
+                try:
+                    recipe_metadata = json.loads(metadata_file.read_text(encoding="utf-8")) if metadata_file.is_file() else {}
+                except (OSError, ValueError):
+                    recipe_metadata = {}
+                if not isinstance(recipe_metadata, dict):
+                    recipe_metadata = {}
+                thumbnail = describe_recipe_thumbnail(
+                    analysis_service, self.media_root / "yt-data" / video_id / "thumbnails",
+                    cancel_callback=cancel_callback,
+                )
+                if thumbnail["status"] != "analyzed":
+                    report(23, "썸네일 분석을 사용할 수 없어 제목·전체 자막으로 주 요리를 판별합니다.")
+                recipe_context = {
+                    "title": str(recipe_metadata.get("title") or imported.get("title") or ""),
+                    "description": str(recipe_metadata.get("description") or "")[:2000],
+                    "thumbnail": thumbnail,
+                }
+                recipes = summarize_recipes(
+                    analysis_service, raw_segments, video_context=recipe_context, cancel_callback=cancel_callback,
+                    progress_callback=lambda done, total: report(
+                        23, f"메뉴별 레시피와 조리 순서를 정리하는 중입니다. ({done}/{total})"
+                    ),
+                )
+                if cancel_callback:
+                    cancel_callback()
+                save_recipe_files(output_dir, recipes)
+            except LLMAnalysisError as exc:
+                raise LiveEditPaused(f"메뉴별 레시피 정리를 완료하지 못했습니다: {exc}") from exc
         save_checkpoint()
         _write_json_atomic(
             output_dir / f"{job_id}.analysis-transcript.json",
@@ -2104,7 +2198,9 @@ class LiveEditPipeline:
                 89,
                 f"LLM이 타임스탬프 댓글 {len(timestamp_comments):,}개의 목적을 평가했습니다.",
             )
-        _apply_final_scores(scored)
+        _apply_final_scores(scored, criteria_prompt)
+        if criteria_prompt in SHORT_FORM_PROFILES and not heatmap:
+            report(90, "히트맵이 없어 나머지 점수를 재정규화해 숏폼 후보를 선택합니다.")
         # Keep the completed request checkpoint with the job. Cancelled and
         # failed job files are preserved locally even though they are not
         # restored automatically.
@@ -2145,6 +2241,7 @@ class LiveEditPipeline:
                 scored,
                 target_seconds,
                 analysis_service,
+                criteria_prompt=criteria_prompt,
                 cancel_callback=cancel_callback,
                 progress_callback=lambda done, total: report(
                     90 + int(8 * done / max(1, total)),
@@ -2158,6 +2255,8 @@ class LiveEditPipeline:
         recommended_segment_ids = [str(item["segment_id"]) for item in selected]
         clips = selected
         if not clips:
+            if criteria_prompt in SHORT_FORM_PROFILES:
+                raise LiveEditPipelineError("앞뒤 문맥을 보존하면서 3분 안에 넣을 수 있는 장면이 없습니다. 구간을 검토해 주세요.")
             raise LiveEditPipelineError("편집할 하이라이트 구간을 선택하지 못했습니다.")
         render_segments = raw_segments
         filler_metadata = {}
@@ -2194,6 +2293,7 @@ class LiveEditPipeline:
         )
 
         base_result = {
+            "recipe_available": criteria_prompt == "cooking_food",
             "job_id": job_id,
             "vod_url": vod_url,
             "vod_video_id": imported.get("job_id"),
@@ -2346,6 +2446,10 @@ class LiveEditPipeline:
             key=lambda item: float(item["start"]),
         )
         canonical_ids = [str(item["segment_id"]) for item in selected]
+        if plan.get("criteria_prompt") in SHORT_FORM_PROFILES and sum(
+            float(item["end"]) - float(item["start"]) for item in selected
+        ) > SHORT_FORM_MAX_SECONDS:
+            raise LiveEditPipelineError("예능·게임은 최대 3분입니다. 선택 구간을 180초 이하로 줄여 주세요.")
         clips = selected
         if not clips:
             raise LiveEditPipelineError(
@@ -2412,6 +2516,7 @@ class LiveEditPipeline:
         return {
             **self.get_segment_review(job_id, plan),
             "rendered_video_path": str(output.resolve()),
+            "recipe_available": plan.get("criteria_prompt") == "cooking_food" and (output_dir / "recipes.json").is_file(),
             "rendered_filename": output.name,
             "message": "선택한 구간으로 영상을 다시 생성했습니다.",
             "clips": clips,

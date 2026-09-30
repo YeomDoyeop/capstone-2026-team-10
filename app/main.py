@@ -623,9 +623,9 @@ async def score_live_edit(
                 status_code=422,
                 detail="목표 길이는 60초에서 7200초 사이여야 합니다.",
             )
-        request = request.model_copy(
-            update={"target_duration_seconds": target_duration_seconds}
-        )
+        request = LiveEditRequest.model_validate({
+            **request.model_dump(), "target_duration_seconds": target_duration_seconds
+        })
         job["request"] = request.model_dump()
     job.update(
         status="queued",
@@ -1542,6 +1542,18 @@ async def get_edit_media(job_id: str, kind: str, user=Depends(get_current_user))
     output_dir = _edit_output_dir(job_id)
     active = LIVE_EDIT_JOBS.get(job_id, {})
     result = active.get("result") or (_completed_job(job_id) or {}).get("result") or {}
+    recipe_files = {
+        "recipes-json": ("recipes.json", "application/json"),
+        "recipes-markdown": ("recipes.md", "text/markdown; charset=utf-8"),
+        "recipes-zip": ("recipes.zip", "application/zip"),
+    }
+    if kind in recipe_files:
+        filename, media_type = recipe_files[kind]
+        recipe_path = output_dir / filename
+        if not recipe_path.is_file():
+            raise HTTPException(status_code=404, detail="레시피 요약본이 없습니다. 요리 카테고리로 다시 분석하세요.")
+        return FileResponse(recipe_path, media_type=media_type, filename=filename,
+                            headers={"Cache-Control": "no-store"})
     if kind == "source":
         source = Path(
             str(

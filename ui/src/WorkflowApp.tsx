@@ -14,6 +14,7 @@ type Job = {
   message: string;
   error?: string;
   result?: {
+    recipe_available?: boolean;
     revision?: number;
     script_segments?: ScriptSegment[];
     chapters?: Chapter[];
@@ -286,7 +287,7 @@ export default function WorkflowApp() {
     const prompts = (body.prompts || []) as PromptProfile[];
     setPromptProfiles(prompts);
     if (prompts.length && !prompts.some((item) => item.id === settings.criteria_prompt))
-      setSettings((current) => ({ ...current, criteria_prompt: prompts[0].id }));
+      selectCriteriaPrompt(prompts[0].id);
   }
 
   async function savePromptProfile() {
@@ -302,7 +303,7 @@ export default function WorkflowApp() {
     const body = await response.json().catch(() => ({}));
     if (!response.ok) return setMessage(body.detail || "판별 기준을 저장하지 못했습니다.");
     await loadPromptProfiles();
-    setSettings((current) => ({ ...current, criteria_prompt: promptEditor.id }));
+    selectCriteriaPrompt(promptEditor.id);
     setPromptEditor(null);
     setMessage("판별 기준을 저장했습니다.");
   }
@@ -943,6 +944,16 @@ export default function WorkflowApp() {
             ? { kind: "materials", status: materialDownload.status, value: materialDownload.progress, label: "추가 메타데이터 다운로드", log: materialDownload.error || materialDownload.message }
             : { kind: "idle", status: "idle", value: 0, label: "대기 중", log: message };
   const progressValue = Math.max(0, Math.min(100, Math.round(Number(activeProgress.value) || 0)));
+  const isShortForm = ["game", "variety"].includes(settings.criteria_prompt);
+  function selectCriteriaPrompt(value: string) {
+    const shortForm = ["game", "variety"].includes(value);
+    const seconds = shortForm
+      ? Math.min(120, Math.max(60, Math.floor(metadata?.duration_seconds || 120)))
+      : settings.target_duration_seconds;
+    setSettings((current) => ({ ...current, criteria_prompt: value, target_duration_seconds: seconds }));
+    setTargetDurationInput(String(seconds));
+  }
+
   const setSetting = <K extends keyof typeof initialSettings>(
     key: K,
     value: (typeof initialSettings)[K],
@@ -1058,7 +1069,7 @@ export default function WorkflowApp() {
       setCaptionLanguage(body.caption_languages?.[0]?.value || "");
       setMaterials([]);
       setMaterialTab(null);
-      const initialTargetDuration = Math.min(
+      const initialTargetDuration = isShortForm ? Math.min(120, Math.max(60, Math.floor(Number(body.duration_seconds) || 120))) : Math.min(
         7200,
         Math.max(
           60,
@@ -1566,6 +1577,27 @@ export default function WorkflowApp() {
   function previewSegment(segment: Segment) {
     previewTimeRange(segment.start, segment.end);
   }
+  async function downloadRecipes(kind: "json" | "markdown" | "zip") {
+    if (!job) return;
+    try {
+      const response = await authenticatedFetch(`/api/youtube/edit/${job.job_id}/media/recipes-${kind}`);
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || "레시피 요약본을 내려받지 못했습니다.");
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `recipes.${kind === "markdown" ? "md" : kind}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "레시피 다운로드 실패");
+    }
+  }
+
   function previewTimeRange(start: number, end: number) {
     const video = sourcePreviewRef.current;
     if (!video) return;
@@ -1585,7 +1617,7 @@ export default function WorkflowApp() {
   }
 
   const targetDurationMax = Math.min(
-    7200,
+    isShortForm ? 180 : 7200,
     Math.max(60, Math.floor(metadata?.duration_seconds || 7200)),
   );
   const setTargetDuration = (value: number) =>
@@ -1602,11 +1634,12 @@ export default function WorkflowApp() {
   };
   const resetTargetDuration = () =>
     setTargetDuration(
-      Math.round((metadata?.duration_seconds || 0) / 4 / 30) * 30,
+      isShortForm ? 120 : Math.round((metadata?.duration_seconds || 0) / 4 / 30) * 30,
     );
   const settingsDuration = () => (
     <label className="setting-card">
       <span>목표 길이</span>
+      {isShortForm && <small>예능·게임: 기본 2분, 1~3분 · 히트맵 중심 + 앞뒤 문맥 보존</small>}
       <div className="range-input duration-input">
         <input
           type="range"
@@ -2030,7 +2063,7 @@ export default function WorkflowApp() {
                       value={settings.criteria_prompt}
                       options={promptProfiles.map((item) => ({ value: item.id, label: item.name }))}
                       disabled={controlsLocked || !promptProfiles.length}
-                      onChange={(value) => setSetting("criteria_prompt", value)}
+                      onChange={selectCriteriaPrompt}
                     />
                     <button
                       type="button"
@@ -2497,6 +2530,14 @@ export default function WorkflowApp() {
             />
             <div className="preview-card">
               <h3>최종 편집 결과</h3>
+              {(job.result?.recipe_available || settings.criteria_prompt === "cooking_food") && (
+                <div>
+                  <p>메뉴별 레시피 · 조리 순서 인덱스 (원본 자막 기준)</p>
+                  <button onClick={() => void downloadRecipes("markdown")}>레시피 요약 저장</button>
+                  <button onClick={() => void downloadRecipes("json")}>인덱스 JSON 저장</button>
+                  <button onClick={() => void downloadRecipes("zip")}>메뉴별 파일 ZIP 저장</button>
+                </div>
+              )}
               <video controls src={renderedMediaUrl || undefined} />
               {renderedMediaUrl && (
                 <a href={renderedMediaUrl} download="ave-edited.mp4">

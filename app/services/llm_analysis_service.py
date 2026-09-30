@@ -10,6 +10,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
+from app.services.edit_policy import SHORT_FORM_PROFILES
 from app.services.llm_gateway import LLMGateway, LLMGatewayError, safe_error_detail
 from app.services.prompt_store import (
     PromptStoreError,
@@ -116,6 +117,7 @@ class LLMAnalysisService:
         prompt: str,
         *,
         response_schema: dict[str, Any] | None = None,
+        image: dict[str, str] | None = None,
         validator: Callable[[Any], Any] | None = None,
         cancel_callback: Callable[[], None] | None = None,
     ) -> Any:
@@ -128,7 +130,7 @@ class LLMAnalysisService:
         cache_key = hashlib.sha256(
             json.dumps(
                 [getattr(self.gateway, "provider", ""), getattr(self.gateway, "model", ""),
-                 system, prompt, response_schema],
+                 system, prompt, response_schema] + ([image] if image is not None else []),
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
@@ -170,7 +172,8 @@ class LLMAnalysisService:
             try:
                 raw = _parse_json_object(
                     self.gateway.request_json(
-                        system + rule, prompt, response_schema=response_schema
+                        system + rule, prompt, response_schema=response_schema,
+                        **({"image": image} if image is not None else {}),
                     )
                 )
                 value = validator(raw) if validator else raw
@@ -670,6 +673,7 @@ class LLMAnalysisService:
         chapter_summary: str,
         sections: list[dict[str, Any]],
         *,
+        criteria_prompt: str = "",
         cancel_callback: Callable[[], None] | None = None,
     ) -> list[str]:
         ids = [str(item["id"]) for item in sections]
@@ -705,8 +709,16 @@ class LLMAnalysisService:
                 for item in sections
             ],
         }
+        link_system = system_prompt("anchor_link")
+        if criteria_prompt in SHORT_FORM_PROFILES:
+            link_system += "\n\n" + system_prompt("short_form_context")
+            payload["criteria_profile"] = user_prompt(criteria_prompt)
+            for row, original in zip(payload["sections"], sections):
+                for key in ("start", "end"):
+                    if key in original:
+                        row[key] = original[key]
         return self._request_json(
-            system_prompt("anchor_link"),
+            link_system,
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             response_schema=response_schema("anchor_link"),
             validator=validate,

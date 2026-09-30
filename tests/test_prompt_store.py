@@ -51,35 +51,18 @@ def test_response_schema_is_read_from_json_file(tmp_path, monkeypatch):
     assert prompt_store.response_schema("score")["required"] == ["items"]
 
 
-def test_bundled_streaming_profiles_cover_major_content_types():
+def test_bundled_streaming_profiles_include_only_supported_categories():
     profiles = {item["id"]: item for item in prompt_store.list_user_prompts()}
     expected = {
         "ai_news",
         "stock",
         "game",
-        "news_current_affairs",
-        "sports",
         "music_performance",
         "education_course",
-        "podcast_interview",
-        "shopping_product",
-        "fashion_beauty",
-        "film_entertainment",
-        "vlog_irl",
-        "conference_event",
-        "science_technology",
         "cooking_food",
-        "creative_art",
-        "asmr_ambient",
-        "religion_spirituality",
-        "community_talk",
-        "health_fitness",
-        "pets_animals",
-        "automotive_mobility",
-        "business_webinar",
-        "general_stream",
+        "variety",
     }
-    assert expected <= profiles.keys()
+    assert expected == profiles.keys()
     assert all(len(profiles[prompt_id]["criteria"]) >= 100 for prompt_id in expected)
 
 

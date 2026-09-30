@@ -89,6 +89,7 @@ class LocalJobStore:
                 if key
                 in {
                     "rendered_filename",
+                    "recipe_available",
                     "rendered_video_path",
                     "vod_video_id",
                     "selected_segment_ids",

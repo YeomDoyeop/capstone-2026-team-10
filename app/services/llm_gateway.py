@@ -92,7 +92,8 @@ class LLMGateway:
         )
 
     def request_json(
-        self, system: str, prompt: str, *, response_schema: dict[str, Any] | None = None
+        self, system: str, prompt: str, *, response_schema: dict[str, Any] | None = None,
+        image: dict[str, str] | None = None,
     ) -> str:
         if self.server_url.startswith("https://"):
             if not self.server_access_token:
@@ -110,6 +111,7 @@ class LLMGateway:
                         "system": system,
                         "prompt": prompt,
                         "response_schema": response_schema,
+                        **({"image": image} if image is not None else {}),
                     },
                     timeout=self.timeout,
                 )
@@ -140,6 +142,8 @@ class LLMGateway:
                         retry_after=_retry_after_seconds(getattr(response, "headers", {}).get("Retry-After")),
                     )
                 response.raise_for_status()
+                if image is not None and response.json().get("image_used") is not True:
+                    raise LLMGatewayError("원격 AVE 서버가 이미지 분석을 지원하지 않습니다. 서버 재배포가 필요합니다.")
                 value = response.json().get("text")
             except LLMGatewayError:
                 raise

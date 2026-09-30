@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from app.services.edit_policy import category_target_seconds, SHORT_FORM_DEFAULT_SECONDS, SHORT_FORM_PROFILES
 
 
 class AuthUserResponse(BaseModel):
@@ -69,6 +71,14 @@ class LiveEditRequest(BaseModel):
     stt_hotwords: str | None = Field(default=None, max_length=1_000)
     stt_speed: Literal[1.0, 1.5, 2.0] = 1.0
 
+    @model_validator(mode="after")
+    def apply_category_duration(self):
+        seconds = self.target_duration_seconds
+        if self.criteria_prompt in SHORT_FORM_PROFILES and "target_duration_seconds" not in self.model_fields_set:
+            seconds = SHORT_FORM_DEFAULT_SECONDS
+        self.target_duration_seconds = category_target_seconds(self.criteria_prompt, seconds)
+        return self
+
 
 class ScriptPreviewRequest(BaseModel):
     job_id: str = Field(..., min_length=1, max_length=200)
@@ -80,4 +90,4 @@ class ScriptPreviewRequest(BaseModel):
 
 
 class SegmentSelectionRequest(BaseModel):
-    segment_ids: list[str] = Field(..., min_length=1, max_length=500)
+    segment_ids: list[str] = Field(..., min_length=1)
