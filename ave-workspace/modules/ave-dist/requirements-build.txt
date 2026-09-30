@@ -1,0 +1,2 @@
+# 빌드 결과의 재현성을 위해 PyInstaller 계열만 고정한다.
+pyinstaller==6.16.0
