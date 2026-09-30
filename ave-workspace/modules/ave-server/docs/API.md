@@ -1,0 +1,99 @@
+# 분석 작업 API 계약
+
+모든 `/api` 요청은 Supabase 사용자 액세스 토큰을 `Authorization: Bearer <token>` 헤더로 전달한다. 서버는 토큰의 사용자와 작업 소유자가 일치할 때만 데이터를 읽거나 수정한다.
+
+## 작업 생성
+
+`POST /api/analysis-jobs`는 렌더링 완료 뒤에만 클라이언트 로컬 작업에 대응하는 서버 이력을 만든다. 서버는 항상 `status: "completed"`, `progress: 100`으로 기록한다.
+
+```json
+{
+  "client_job_id": "local-job-001",
+  "source_id": "YouTube-영상-ID",
+  "source_url": "https://www.youtube.com/watch?v=...",
+  "title": "영상 제목",
+  "duration_ms": 3600000
+}
+```
+
+영상 파일이나 로컬 경로는 포함하지 않는다.
+
+## 분석 결과 저장
+
+`PUT /api/analysis-jobs/{job_id}/result`는 완료 이력에 추천 기준 개선용 편집 판단 데이터를 저장한다. 진행·실패·취소 상태를 생성하거나 기록하는 API는 제공하지 않는다.
+
+```json
+{
+  "script": "선택 사항인 전체 스크립트",
+  "segments": [
+    {
+      "segment_index": 0,
+      "start_ms": 0,
+      "end_ms": 30000,
+      "text": "구간 스크립트",
+      "script_importance": 0.82,
+      "chat_density": 1.4,
+      "comment_timestamp_count": 5,
+      "heatmap_score": 0.73,
+      "average_volume_dbfs": -18.2,
+      "final_score": 0.79,
+      "recommended": true
+    }
+  ],
+  "heatmap": [],
+  "recommendation": {},
+  "selection": {}
+}
+```
+
+`recommendation`에는 모델·규칙 버전과 추천 구간을, `selection`에는 사용자 선택·제외·수정·피드백 이력을 저장한다. 원본 영상, 렌더링 결과, 로컬 절대 경로는 저장하지 않는다.
+
+## 서버 LLM 호출
+
+`POST /api/llm/generate`는 클라이언트가 직접 공급자 API 키를 보관하지 않도록 Gemini 3.5 Flash-Lite와 DeepSeek-V4-Flash 호출을 서버에서 수행한다. `provider`를 생략하면 기본값은 DeepSeek-V4-Flash다.
+
+```json
+{
+  "provider": "deepseek",
+  "model": "선택 모델명",
+  "system": "시스템 지시문",
+  "prompt": "분석 요청",
+  "response_schema": {}
+}
+```
+
+서버 `.env`의 `GEMINI_API_KEY` 또는 `DEEPSEEK_API_KEY`가 필요하다.
+
+Gemini 3.5 Flash-Lite 요청은 결제 프로젝트의 4,000 RPM 한도에 맞춰 이 서버 프로세스에서 요청 시작 간격을 최소 0.015초로 제한한다. 여러 클라이언트의 요청도 합산한다. 다른 서버 프로세스나 API 사용자, TPM·일일 요청량·지출 한도까지 제어하는 것은 아니다.
+
+성공 응답은 `{"text":"JSON 문자열"}`이다. Gemini에는 클라이언트의 JSON Schema를 `generationConfig.responseJsonSchema`로 전달한다. 텍스트 part가 여러 개이면 최종 답변만 합치고, thought part는 제외한다. 공급자가 출력 길이 제한이나 차단을 보고한 응답은 성공으로 반환하지 않는다. 최종 JSON 구조·ID 검증은 클라이언트가 담당한다.
+
+실패 응답은 `{"detail":"[오류 코드] 원인 및 조치 안내"}` 형식을 유지한다. 공급자의 오류 원문은 키·입력 텍스트 노출을 방지하기 위해 전달하지 않는다.
+
+* HTTP 429: 공급자 요청/토큰 한도. `daily_quota`는 짧은 재시도로 해결되지 않는다.
+* HTTP 503: 공급자 일시 장애 또는 연결 실패.
+* HTTP 504: 공급자 응답 시간 초과.
+* HTTP 502: 그 밖의 공급자 실패. `provider_auth`, `model_not_found`, `invalid_request`, `invalid_schema`, `input_too_large`, `output_limit`, `content_blocked`, `invalid_response`, `empty_response` 등으로 원인을 구분한다. 요청 거절의 세부 분류는 공급자 상태와 오류 메시지에 근거하므로, 모든 거절 원인을 확정하는 진단은 아니다.
+
+응답 헤더 `X-AVE-LLM-Error-Code`는 오류 코드, `X-AVE-LLM-Retryable`은 동일 요청의 자동 재시도 가능 여부(`true`/`false`), `X-AVE-LLM-Upstream-Status`는 공급자 HTTP 상태(응답이 있을 때)를 전달한다. 유효한 공급자 `Retry-After` 또는 Gemini `RetryInfo.retryDelay`는 초 단위 `Retry-After`로 전달한다. 한도·인증·입출력 크기 문제를 해결하지 않은 반복 호출을 방지하기 위해 클라이언트는 `false`이면 즉시 중단하고, 일시 오류만 제한적으로 재시도한다(현재 호출 실패 최대 4회, 60초 초과 대기는 사용자에게 안내).
+
+서버 로그에는 오류 코드, 공급자 HTTP 상태, 재시도 가능 여부, 입력 문자 수만 남긴다. API 키, 로그인 토큰, 프롬프트·응답 원문은 기록하지 않는다. 이 변경은 **ave-server 재배포** 후 적용된다. 클라이언트만 재시작하면 배포 서버의 기존 일반 502 응답은 바뀌지 않는다.
+
+응답 필드 참고: [Gemini GenerateContent](https://ai.google.dev/api/generate-content), [DeepSeek Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion/).
+
+## 원격 Whisper 전사
+
+클라이언트는 `POST /api/stt-files`의 multipart `file` 필드에 FFmpeg로 추출한 MP3를 보낸다. 응답의 `file_id`를 `POST /api/stt/transcriptions`에 전달하면 서버가 RunPod의 `ave-whisper-api`를 호출한다. 진행도 조회를 사용하는 클라이언트는 `track_progress: true`와 로컬 작업 ID인 `client_job_id`, 서버 분석 이력 ID인 `server_job_id`를 포함한다. 서버는 이 ID 연결, RunPod 작업 ID, 임시 파일 ID, heartbeat/lease를 `transcription_jobs`에 실행 제어용으로만 보관하고, 종료 뒤 삭제한다. 이는 완료 이력이 아니다.
+
+`GET /api/stt/transcriptions/{job_id}/events`는 `text/event-stream`으로 RunPod worker가 보고한 `progress`(0~100)와 상태 메시지를 `status` 이벤트로 전달한다. AVE Server는 이 스트림을 생성하는 동안 RunPod에는 REST 상태 조회를 사용한다. `GET /api/stt/transcriptions/{job_id}`는 진단·호환용 REST 상태 조회로 유지한다. 로컬 클라이언트는 `POST /api/stt/transcriptions/{job_id}/heartbeat`를 10초마다 호출해 lease를 연장한다. 서버는 `TRANSCRIPTION_LEASE_SECONDS`(기본 60초) 동안 heartbeat가 없으면 RunPod 작업을 취소하고 임시 MP3를 삭제한다. 만료 후 도착한 상태 조회·heartbeat는 lease를 다시 연장하지 않고 즉시 취소 정리를 시작하며, 별도 sweep도 `TRANSCRIPTION_LEASE_SWEEP_SECONDS`마다 같은 정리를 수행한다.
+
+`POST /api/stt/transcriptions/{job_id}/cancel`은 소유자가 RunPod 작업 ID를 받은 뒤 명시적으로 작업을 취소하는 API다. 취소 요청은 RunPod `/cancel`로 전파된다. RunPod 작업 ID 전에는 `POST /api/stt/transcriptions/client/{client_job_id}/cancel`을 사용한다. 이 API는 10분 TTL의 취소 의도를 기록하며 서버는 RunPod 호출 전·후 이를 확인해 호출을 생략하거나 즉시 취소한다. 전사 결과 `result`는 완료를 처음 감지한 `GET /api/stt/transcriptions/{job_id}` 응답에 포함된다.
+
+전사 작업 상태는 `queued → in_progress → completed|failed|cancelled`로 전이한다. 취소 요청 중 RunPod 응답을 기다리는 상태는 `cancel_requested`이며, 서버 재시작 뒤에도 `transcription_jobs`에서 이어서 정리한다. terminal 상태는 응답 직후 삭제되고, heartbeat가 사라진 작업은 lease sweep이 취소·삭제한다. 시작되지 않은 취소 의도도 TTL 만료 뒤 삭제된다.
+
+전사 요청 성공·실패와 무관하게 서버는 해당 임시 MP3를 삭제한다. `/files/` URL은 RunPod worker의 일시적 다운로드 용도이며, 클라이언트가 직접 SFTP로 접근하지 않는다.
+
+완료 결과에는 WhisperX 전사와 CTC 강제 정렬에서 얻은 `segments`, `engine=whisperx-aligned-word-v1`, `alignment=ctc-forced-alignment-with-words`가 포함된다. 각 `segments[]`는 세그먼트의 `start`, `end`, `text`와 정렬된 `words[]`의 `start`, `end`, `word`를 가진다. 서버는 두 단계의 시간값과 텍스트를 검증한 뒤 클라이언트에 중계한다. 문자 정렬 상세값은 외부 계약에 노출하지 않는다.
+# 요리 썸네일 이미지 입력
+
+`POST /api/llm/generate`는 기존 텍스트 필드 외에 선택적 `image: {mime_type: "image/jpeg", data: "<base64>"}`를 받는다. 인증은 기존과 동일하며 `provider="gemini"`일 때만 허용한다. 디코딩 후 2,000,000바이트 이하 JPEG 시그니처를 검증하고 외부 URL은 가져오지 않는다. Gemini의 `inlineData`로 전달하며 서버 DB·로그에는 이미지를 저장하지 않는다. 성공 응답에 `image_used: true`를 반환하여 클라이언트가 구버전 서버의 이미지 필드 무시를 감지할 수 있게 한다. 텍스트 전용 요청은 `image_used: false`다. 이 기능을 사용하려면 서버를 재배포해야 한다.
