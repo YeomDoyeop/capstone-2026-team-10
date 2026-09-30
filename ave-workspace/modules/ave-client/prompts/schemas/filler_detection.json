@@ -1,0 +1,6 @@
+{
+  "type": "object",
+  "properties": {"remove_ids": {"type": "array", "items": {"type": "integer"}}},
+  "required": ["remove_ids"],
+  "additionalProperties": false
+}

@@ -1,0 +1,2524 @@
+"""2단계에서 준비한 YouTube VOD 자료를 재사용하는 편집 파이프라인."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import statistics
+import subprocess
+import textwrap
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Callable
+from uuid import uuid4
+
+from app.config import get_media_root
+from app.services.filler_edit import apply_filler_cuts, filler_candidates
+from app.services.sentence_boundaries import split_timed_sentences
+from app.services.recipe_summary import summarize_recipes, save_recipe_files
+from app.services.recipe_thumbnail import describe_recipe_thumbnail
+from app.services.edit_policy import (
+    SHORT_FORM_PROFILES, SHORT_FORM_MAX_SECONDS, SHORT_FORM_SCORE_WEIGHTS,
+    category_target_seconds,
+)
+from app.services.toolchain import ToolchainError, ffmpeg as get_ffmpeg
+from app.services.server_media_service import (
+    AccessTokenSource,
+    ServerMediaError,
+    TranscriptionCancelledError,
+    _access_token,
+    acknowledge_transcription_result,
+    prepare_whisper_audio,
+    transcribe_uploaded_audio,
+    upload_audio_for_transcription,
+)
+
+SUBTITLE_FONT_NAME = "Dotum"
+SUBTITLE_FONT_SIZE = 16
+SUBTITLE_MARGIN_BOTTOM = 12
+SUBTITLE_LINE_WIDTH = 30
+SUBTITLE_MIN_DURATION_SECONDS = 0.08
+WHISPER_SPLIT_MIN_CHARACTERS = 30
+WHISPER_PRIORITY_GAP_SECONDS = 0.5
+WHISPER_ENGINE = "whisperx-aligned-word-v1"
+WHISPER_ALIGNMENT = "ctc-forced-alignment-with-words"
+WHISPER_SPLIT_CONTRACT = "autonomous-subtitle-word-boundary-v6-preserve-words"
+CHAT_REACTION_OFFSET_SECONDS = 3.0
+
+SECTION_SCORE_WEIGHTS = {
+    "chapter_llm_score": 0.15,
+    "llm_score": 0.18,
+    "heatmap_score": 0.25,
+    "chat_score": 0.12,
+    "comment_score": 0.20,
+    "volume_score": 0.10,
+}
+
+WHISPER_PUNCTUATION_PROMPTS = {
+    "ko": "문장은 자연스럽게 이어지고, 의미가 바뀌면 정확히 구분됩니다.",
+    "en": "Sentences flow naturally, and punctuation is used accurately.",
+    "zh": "句子自然连贯，语义变化时会准确断句。",
+    "ja": "文章は自然に続き、意味の変化に合わせて正確に区切られます。",
+}
+
+from app.services.llm_analysis_service import LLMAnalysisError, LLMAnalysisService
+from app.services.youtube_importer import YouTubeImporter, YouTubeImportError
+from app.services.live_youtube_service import (
+    LiveYouTubeError,
+    extract_video_id,
+    load_prepared_transcript,
+    prepared_metadata_paths,
+)
+
+EDIT_GENRES = {"ai_news", "stock", "game"}
+_ATOMIC_WRITE_LOCKS: dict[Path, threading.Lock] = {}
+_ATOMIC_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+class LiveEditPipelineError(RuntimeError):
+    pass
+
+
+class LiveEditCancelled(LiveEditPipelineError):
+    pass
+
+
+def fixed_whisper_initial_prompt(language: str | None) -> str:
+    """Return a content-neutral punctuation example for a known language."""
+
+    return WHISPER_PUNCTUATION_PROMPTS.get(language or "", "")
+
+
+class LiveEditPaused(LiveEditPipelineError):
+    """LLM retry exhaustion with a reusable on-disk request checkpoint."""
+
+    pass
+
+
+def _time_seconds(value: str | int | float) -> float:
+    """Accept prepared JSON seconds as well as legacy WebVTT clock text."""
+
+    if isinstance(value, bool):
+        raise ValueError("시간 값은 숫자여야 합니다.")
+    if isinstance(value, (int, float)):
+        return float(value)
+    parts = str(value).strip().replace(",", ".").split(":")
+    if len(parts) == 1:
+        return float(parts[0])
+    if len(parts) == 2:
+        minutes, seconds = parts
+        return float(minutes) * 60 + float(seconds)
+    if len(parts) != 3:
+        raise ValueError("시간 값 형식이 올바르지 않습니다.")
+    hours, minutes, seconds = parts
+    return float(hours) * 3600 + float(minutes) * 60 + float(seconds)
+
+
+def _whisper_transcript_path(media_root: Path, job_id: str) -> Path:
+    """Return the job-local path used for a prepared Whisper transcript."""
+
+    if not job_id or Path(job_id).name != job_id:
+        raise LiveEditPipelineError("잘못된 편집 작업 ID입니다.")
+    return media_root / "yt-edit" / job_id / f"{job_id}.whisper-transcript.json"
+
+
+def _shared_whisper_source_path(
+    media_root: Path, video_id: str, request_fingerprint: dict[str, Any]
+) -> Path:
+    """Return a video-level WhisperX cache path for one exact STT request."""
+
+    digest = hashlib.sha256(
+        json.dumps(
+            request_fingerprint,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return media_root / "yt-edit" / video_id / "whisper-cache" / f"{digest}.json"
+
+
+def _shared_whisper_transcript_path(
+    media_root: Path,
+    video_id: str,
+    request_fingerprint: dict[str, Any],
+    llm_provider: str,
+) -> tuple[Path, dict[str, Any]]:
+    """같은 원본 전사와 분할 계약이 공유하는 최종 자막 캐시 경로다."""
+
+    split_request = {
+        "source_request": request_fingerprint,
+        "llm_provider": llm_provider,
+        "split_contract": WHISPER_SPLIT_CONTRACT,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            split_request,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    path = (
+        media_root
+        / "yt-edit"
+        / video_id
+        / "whisper-cache"
+        / f"{digest}.transcript.json"
+    )
+    return path, split_request
+
+
+def has_default_whisper_transcript_cache(media_root: Path, video_id: str) -> bool:
+    """기본 STT 설정으로 완료된 영상 공유 캐시가 있는지 확인한다."""
+
+    cache_dir = media_root / "yt-edit" / video_id / "whisper-cache"
+    for path in cache_dir.glob("*.json"):
+        try:
+            candidate = json.loads(path.read_text(encoding="utf-8"))
+            request = candidate.get("request")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            continue
+        if (
+            isinstance(request, dict)
+            and request.get("video_id") == video_id
+            and request.get("language") == "ko"
+            and request.get("initial_prompt") in (None, "")
+            and request.get("hotwords") in (None, "")
+            and request.get("speed") == 1.0
+            and request.get("engine") == WHISPER_ENGINE
+            and request.get("alignment") == WHISPER_ALIGNMENT
+            and candidate.get("engine") == WHISPER_ENGINE
+            and candidate.get("alignment") == WHISPER_ALIGNMENT
+            and isinstance(candidate.get("segments"), list)
+            and candidate["segments"]
+        ):
+            return True
+    return False
+
+
+def _nonspace_length(value: str) -> int:
+    return len(re.sub(r"\s+", "", value))
+
+
+def _comment_timestamp_seconds(text: str) -> list[float]:
+    """댓글 원문에 포함된 모든 MM:SS 또는 HH:MM:SS 시각을 반환한다."""
+
+    values: list[float] = []
+    for match in re.finditer(r"(?<!\d)(?:(\d{1,3}):)?(\d{1,2}):(\d{2})(?!\d)", text):
+        hours, minutes, seconds = match.groups()
+        minute_value, second_value = int(minutes), int(seconds)
+        if second_value >= 60 or hours is not None and minute_value >= 60:
+            continue
+        value = (
+            (int(hours) * 3600 if hours is not None else 0)
+            + minute_value * 60
+            + second_value
+        )
+        if value not in values:
+            values.append(float(value))
+    return values
+
+
+def _apply_timestamp_comment_scores(
+    sections: list[dict[str, Any]],
+    comments: list[dict[str, Any]],
+    scores: list[dict[str, int | float]],
+) -> None:
+    """각 댓글 점수를 댓글의 모든 타임스탬프가 속한 섹션에 부여한다."""
+
+    ordered = sorted(sections, key=lambda item: float(item.get("start", 0)))
+    score_by_index = {item["index"]: item["score"] for item in scores}
+    for index, comment in enumerate(comments):
+        score = score_by_index.get(index)
+        if score is None:
+            continue
+        for timestamp in _comment_timestamp_seconds(str(comment.get("text") or "")):
+            for section_index, section in enumerate(ordered):
+                start, end = float(section["start"]), float(section["end"])
+                is_last = section_index == len(ordered) - 1
+                if start <= timestamp < end or is_last and timestamp == end:
+                    section["comment_score"] = round(
+                        max(
+                            float(section.get("comment_score", 0.0)),
+                            float(score),
+                        ),
+                        3,
+                    )
+                    break
+
+
+def _heatmap_section_score(
+    heatmap: list[dict[str, Any]],
+    section_start: float,
+    section_end: float,
+) -> float | None:
+    """히트맵 표본을 선형 보간해 섹션 범위의 최댓값을 반환한다."""
+
+    points: list[tuple[float, float]] = []
+    for item in heatmap:
+        if not isinstance(item, dict):
+            continue
+        start, end, value = (
+            item.get("start_time"),
+            item.get("end_time"),
+            item.get("value"),
+        )
+        if (
+            not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or not isinstance(value, (int, float))
+            or isinstance(start, bool)
+            or isinstance(end, bool)
+            or isinstance(value, bool)
+            or float(end) < float(start)
+        ):
+            continue
+        points.append(
+            ((float(start) + float(end)) / 2, min(1.0, max(0.0, float(value))))
+        )
+    if not points or section_end < section_start:
+        return None
+    points.sort(key=lambda point: point[0])
+
+    def estimate(timestamp: float) -> float:
+        if timestamp <= points[0][0]:
+            return points[0][1]
+        if timestamp >= points[-1][0]:
+            return points[-1][1]
+        for index in range(1, len(points)):
+            right_time, right_value = points[index]
+            if timestamp <= right_time:
+                left_time, left_value = points[index - 1]
+                if right_time == left_time:
+                    return max(left_value, right_value)
+                ratio = (timestamp - left_time) / (right_time - left_time)
+                return left_value + (right_value - left_value) * ratio
+        return points[-1][1]
+
+    values = [estimate(section_start), estimate(section_end)]
+    values.extend(
+        value
+        for timestamp, value in points
+        if section_start <= timestamp <= section_end
+    )
+    return round(max(values), 6)
+
+
+def _apply_heatmap_scores(
+    sections: list[dict[str, Any]],
+    heatmap: list[dict[str, Any]],
+) -> None:
+    for section in sections:
+        score = _heatmap_section_score(
+            heatmap,
+            float(section.get("start", 0)),
+            float(section.get("end", 0)),
+        )
+        if score is not None:
+            section["heatmap_score"] = score
+
+
+def _percentile(values: list[float], ratio: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    position = min(1.0, max(0.0, ratio)) * (len(ordered) - 1)
+    left = int(position)
+    right = min(left + 1, len(ordered) - 1)
+    fraction = position - left
+    return ordered[left] + (ordered[right] - ordered[left]) * fraction
+
+
+def _normalize_points(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """P50을 0, P95를 1로 두어 영상 내부의 상대 급증을 정규화한다."""
+
+    values = [value for _, value in points]
+    low, high = _percentile(values, 0.5), _percentile(values, 0.95)
+    if high <= low:
+        return [(timestamp, 0.0) for timestamp, _ in points]
+    return [
+        (timestamp, round(min(1.0, max(0.0, (value - low) / (high - low))), 6))
+        for timestamp, value in points
+    ]
+
+
+def _section_point_score(
+    points: list[tuple[float, float]], start: float, end: float
+) -> float | None:
+    """섹션 표본의 상위 10% 평균 70%와 전체 평균 30%를 결합한다."""
+
+    values = [value for timestamp, value in points if start <= timestamp <= end]
+    if not values:
+        return None
+    top_count = max(1, math.ceil(len(values) * 0.1))
+    top_mean = statistics.fmean(sorted(values, reverse=True)[:top_count])
+    return round(0.7 * top_mean + 0.3 * statistics.fmean(values), 6)
+
+
+def _chat_score_points(
+    chat_items: list[dict[str, Any]], duration: float
+) -> list[tuple[float, float]]:
+    """희소 채팅을 30초 이동창과 직전 3분 기준선으로 상대 평가한다."""
+
+    events = sorted(
+        (_adjust_chat_timestamp(float(item["elapsed_seconds"])), str(item["author_id"]))
+        for item in chat_items
+        if isinstance(item, dict)
+        and isinstance(item.get("elapsed_seconds"), (int, float))
+        and item.get("author_id")
+    )
+    if len(events) < 10 or duration <= 0:
+        return []
+
+    def activity(left: float, right: float) -> float:
+        counts: dict[str, int] = {}
+        for timestamp, author_id in events:
+            if left < timestamp <= right:
+                counts[author_id] = min(3, counts.get(author_id, 0) + 1)
+        return 0.5 * sum(counts.values()) + 0.5 * len(counts)
+
+    global_density = activity(-float("inf"), duration) / duration
+    samples: list[tuple[float, float, float]] = []
+    timestamp = 0.0
+    while timestamp <= duration:
+        recent = activity(timestamp - 30, timestamp)
+        baseline = activity(timestamp - 210, timestamp - 30)
+        if timestamp < 30.0:
+            relative = 0.0
+            recent = 0.0
+        else:
+            available_baseline_seconds = min(180.0, timestamp - 30.0)
+            local_density = (
+                baseline / available_baseline_seconds
+                if available_baseline_seconds > 0
+                else global_density
+            )
+            confidence = available_baseline_seconds / 180.0
+            baseline_density = (
+                confidence * local_density + (1.0 - confidence) * global_density
+            )
+            ratio = ((recent + 1) / 30) / max(1 / 30, baseline_density)
+            relative = min(1.0, max(0.0, math.log2(max(1.0, ratio)) / 3))
+        samples.append((timestamp, recent, relative))
+        timestamp += 5
+    recent_values = [recent for _, recent, _ in samples]
+    raw = []
+    for timestamp, recent, relative in samples:
+        rank = sum(value <= recent for value in recent_values) / len(recent_values)
+        raw.append((timestamp, 0.6 * relative + 0.4 * rank))
+    return _normalize_points(raw)
+
+
+def _adjust_chat_timestamp(timestamp: float) -> float:
+    """사람의 반응·입력 지연을 보정하되 원본 저장 시각은 변경하지 않는다."""
+
+    return max(0.0, timestamp - CHAT_REACTION_OFFSET_SECONDS)
+
+
+def _volume_score_points(
+    samples: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """1초 RMS를 3초 평활하고 직전 30초보다 갑자기 커진 구간을 평가한다."""
+
+    if len(samples) < 10:
+        return []
+    smoothed = [
+        (
+            timestamp,
+            statistics.median(
+                value for _, value in samples[max(0, index - 1) : index + 2]
+            ),
+        )
+        for index, (timestamp, _) in enumerate(samples)
+    ]
+    raw: list[tuple[float, float]] = []
+    elevated: list[bool] = []
+    increases: list[float] = []
+    for index, (timestamp, value) in enumerate(smoothed):
+        baseline_values = [item[1] for item in smoothed[max(0, index - 30) : index]]
+        baseline = statistics.median(baseline_values) if baseline_values else value
+        increase = max(0.0, value - baseline)
+        if timestamp < 30.0:
+            # 영상 초반 30초는 지역 기준선을 모으는 워밍업 구간이다. 무음 뒤
+            # 첫 발화나 인트로 음악이 상대 급증으로 과대평가되지 않게 한다.
+            increase = 0.0
+        increases.append(increase)
+        elevated.append(timestamp >= 30.0 and value >= -45.0 and increase >= 3.0)
+    for index, (timestamp, _) in enumerate(smoothed):
+        # 1초짜리 순간 노이즈는 제외하고 최소 두 표본 연속 상승만 인정한다.
+        sustained = elevated[index] and (
+            index > 0
+            and elevated[index - 1]
+            or index + 1 < len(elevated)
+            and elevated[index + 1]
+        )
+        raw.append((timestamp, increases[index] if sustained else 0.0))
+    return _normalize_points(raw)
+
+
+def _extract_volume_samples(source: Path) -> list[tuple[float, float]]:
+    """FFmpeg로 원본 오디오의 1초별 전체 채널 RMS(dBFS)를 읽는다."""
+
+    command = [
+        str(get_ffmpeg()),
+        "-hide_banner",
+        "-nostdin",
+        "-i",
+        str(source),
+        "-vn",
+        "-af",
+        "aresample=48000,asetnsamples=n=48000:p=1,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except (OSError, ToolchainError):
+        return []
+    if completed.returncode != 0:
+        return []
+    samples: list[tuple[float, float]] = []
+    timestamp: float | None = None
+    for line in completed.stdout.splitlines():
+        if match := re.search(r"pts_time:([0-9.]+)", line):
+            timestamp = float(match.group(1))
+        elif timestamp is not None and (
+            match := re.search(
+                r"lavfi\.astats\.Overall\.RMS_level=(-?(?:\d+(?:\.\d+)?|inf))", line
+            )
+        ):
+            value = float(match.group(1))
+            if math.isfinite(value):
+                samples.append((timestamp, value))
+            timestamp = None
+    return samples
+
+
+def _apply_point_scores(
+    sections: list[dict[str, Any]], points: list[tuple[float, float]], field: str
+) -> None:
+    for section in sections:
+        score = _section_point_score(
+            points, float(section["start"]), float(section["end"])
+        )
+        if score is not None:
+            section[field] = score
+
+
+def _apply_final_scores(sections: list[dict[str, Any]], criteria_prompt: str = "") -> None:
+    """사용 가능한 점수의 가중치만 재정규화해 섹션 총점을 계산한다."""
+
+    weights = SHORT_FORM_SCORE_WEIGHTS if criteria_prompt in SHORT_FORM_PROFILES else SECTION_SCORE_WEIGHTS
+    for section in sections:
+        weighted_sum = 0.0
+        available_weight = 0.0
+        for field, weight in weights.items():
+            value = section.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                weighted_sum += min(1.0, max(0.0, float(value))) * weight
+                available_weight += weight
+        if available_weight > 0:
+            section["final_score"] = round(weighted_sum / available_weight, 6)
+
+
+def _word_text_spans(
+    text: str, words: list[dict[str, Any]]
+) -> list[tuple[int, int]] | None:
+    """WhisperX 단어를 원본 세그먼트 문자열에 순서대로 대응시킨다."""
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for word in words:
+        value = str(word.get("word") or "").strip()
+        if not value:
+            return None
+        start = text.find(value, cursor)
+        if start < 0:
+            return None
+        end = start + len(value)
+        spans.append((start, end))
+        cursor = end
+    return spans
+
+
+def _split_whisper_segment(
+    segment: dict[str, Any],
+    analysis_service: LLMAnalysisService,
+    *,
+    cancel_callback: Callable[[], None] | None = None,
+) -> list[dict[str, Any]]:
+    text = str(segment.get("text") or "").strip()
+    words = segment.get("words")
+    if (
+        _nonspace_length(text) < WHISPER_SPLIT_MIN_CHARACTERS
+        or not isinstance(words, list)
+        or len(words) < 2
+    ):
+        return [
+            {
+                "start": float(segment["start"]),
+                "end": float(segment["end"]),
+                "text": text,
+                "words": words,
+            }
+        ]
+    if any(
+        not isinstance(word, dict)
+        or not isinstance(word.get("start"), (int, float))
+        or not isinstance(word.get("end"), (int, float))
+        or not str(word.get("word") or "").strip()
+        for word in words
+    ):
+        return [
+            {
+                "start": float(segment["start"]),
+                "end": float(segment["end"]),
+                "text": text,
+                "words": words,
+            }
+        ]
+    text_spans = _word_text_spans(text, words)
+    if text_spans is None:
+        return [
+            {
+                "start": float(segment["start"]),
+                "end": float(segment["end"]),
+                "text": text,
+                "words": words,
+            }
+        ]
+
+    pause_boundaries = {
+        index
+        for index in range(len(words) - 1)
+        if float(words[index + 1]["start"]) - float(words[index]["end"])
+        >= WHISPER_PRIORITY_GAP_SECONDS
+    }
+    group_ends = [*sorted(pause_boundaries), len(words) - 1]
+    word_ranges: list[dict[str, int]] = []
+    group_start = 0
+    for group_end in group_ends:
+        group_words = words[group_start : group_end + 1]
+        group_text_start = 0 if group_start == 0 else text_spans[group_start][0]
+        group_text_end = (
+            len(text) if group_end == len(words) - 1 else text_spans[group_end + 1][0]
+        )
+        group_text = text[group_text_start:group_text_end].strip()
+        if (
+            _nonspace_length(group_text) >= WHISPER_SPLIT_MIN_CHARACTERS
+            and len(group_words) >= 2
+        ):
+            parts = analysis_service.split_subtitle_words(
+                group_words,
+                cancel_callback=cancel_callback,
+            )
+            word_ranges.extend(
+                {
+                    "start_word": group_start + part["start_word"],
+                    "end_word": group_start + part["end_word"],
+                }
+                for part in parts
+            )
+        else:
+            word_ranges.append({"start_word": group_start, "end_word": group_end})
+        group_start = group_end + 1
+
+    result: list[dict[str, Any]] = []
+    segment_start, segment_end = float(segment["start"]), float(segment["end"])
+    for index, part in enumerate(word_ranges):
+        start_word, end_word = part["start_word"], part["end_word"]
+        if index == 0:
+            start = segment_start
+        elif word_ranges[index - 1]["end_word"] in pause_boundaries:
+            start = float(words[start_word]["start"])
+        else:
+            previous_end = word_ranges[index - 1]["end_word"]
+            start = (
+                float(words[previous_end]["end"]) + float(words[start_word]["start"])
+            ) / 2
+        if index == len(word_ranges) - 1:
+            end = segment_end
+        elif end_word in pause_boundaries:
+            end = float(words[end_word]["end"])
+        else:
+            next_start = word_ranges[index + 1]["start_word"]
+            end = (
+                float(words[end_word]["end"]) + float(words[next_start]["start"])
+            ) / 2
+        start, end = round(start, 3), round(end, 3)
+        if end <= start or start < segment_start or end > segment_end:
+            raise LLMAnalysisError(
+                "Whisper 단어 타임스탬프로 유효한 자막 경계를 만들 수 없습니다."
+            )
+        text_start = 0 if index == 0 else text_spans[start_word][0]
+        text_end = (
+            len(text) if index == len(word_ranges) - 1 else text_spans[end_word + 1][0]
+        )
+        part_text = text[text_start:text_end].strip()
+        if not part_text:
+            raise LLMAnalysisError(
+                "Whisper 단어 범위에서 자막 문장을 만들 수 없습니다."
+            )
+        result.append({"start": start, "end": end, "text": part_text,
+                       "words": words[start_word:end_word + 1]})
+    return result
+
+
+def _split_whisper_segments_parallel(
+    segments: list[dict[str, Any]],
+    analysis_service: LLMAnalysisService,
+    *,
+    cancel_callback: Callable[[], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[dict[str, Any]]:
+    """공급자별 요청 제한 안에서 Whisper 긴 문장 분할을 병렬 수행한다."""
+
+    indexed: list[tuple[int, list[dict[str, Any]]]] = []
+
+    def split(index: int, segment: dict[str, Any]) -> tuple[int, list[dict[str, Any]]]:
+        if cancel_callback:
+            cancel_callback()
+        return index, _split_whisper_segment(
+            segment,
+            analysis_service,
+            cancel_callback=cancel_callback,
+        )
+
+    worker_count = min(
+        max(1, int(getattr(analysis_service, "_max_parallel_requests", 1))),
+        len(segments),
+    )
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(split, index, segment)
+            for index, segment in enumerate(segments)
+        ]
+        for completed, future in enumerate(as_completed(futures), 1):
+            if cancel_callback:
+                cancel_callback()
+            indexed.append(future.result())
+            if progress_callback:
+                progress_callback(completed, len(futures))
+    return [part for _, parts in sorted(indexed) for part in parts]
+
+
+def _ensure_candidate_ids(candidates: list[dict[str, Any]]) -> None:
+    """Give legacy and current candidates unique deterministic IDs in place."""
+
+    seen: set[str] = set()
+    for index, item in enumerate(candidates):
+        candidate_id = str(item.get("segment_id") or "").strip()
+        if not candidate_id or candidate_id in seen:
+            candidate_id = f"segment-{index:04d}"
+            suffix = 1
+            while candidate_id in seen:
+                candidate_id = f"segment-{index:04d}-{suffix}"
+                suffix += 1
+            item["segment_id"] = candidate_id
+        seen.add(candidate_id)
+
+
+def _select_clips(
+    sections: list[dict[str, Any]], target_seconds: int
+) -> list[dict[str, Any]]:
+    """섹션 총점과 정확한 섹션 경계로 목표 길이의 요약본을 선택한다."""
+
+    candidates = [
+        item for item in sections
+        if 0 < float(item["end"]) - float(item["start"]) < math.inf
+    ]
+    unit = 2
+    target = target_seconds * unit
+    upper = (target_seconds + 30) * unit
+    states: dict[int, tuple[float, list[dict[str, Any]]]] = {0: (0.0, [])}
+    for item in candidates:
+        duration = max(1, round((item["end"] - item["start"]) * unit))
+        value = float(item.get("final_score", item.get("llm_score", 0.0)))
+        snapshot = list(states.items())
+        for used, (score, selected) in snapshot:
+            new_used = used + duration
+            if new_used > upper:
+                continue
+            new_score = score + value
+            if new_used not in states or new_score > states[new_used][0]:
+                states[new_used] = (new_score, selected + [item])
+    valid = [
+        (abs(used - target), -score, selected)
+        for used, (score, selected) in states.items()
+        if used >= max(1, target - 30 * unit)
+    ]
+    if not valid:
+        valid = [
+            (abs(used - target), -score, selected)
+            for used, (score, selected) in states.items()
+        ]
+    valid.sort(key=lambda value: (value[0], value[1]))
+    return sorted(valid[0][2], key=lambda item: item["start"])
+
+
+def _selected_groups(
+    ordered: list[dict[str, Any]], selected_ids: set[str]
+) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    previous_index = -2
+    previous_chapter = ""
+    for index, section in enumerate(ordered):
+        section_id = str(section["segment_id"])
+        if section_id not in selected_ids:
+            continue
+        chapter_id = str(section.get("chapter_id") or "")
+        if current and (index != previous_index + 1 or chapter_id != previous_chapter):
+            groups.append(current)
+            current = []
+        current.append(section)
+        previous_index = index
+        previous_chapter = chapter_id
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _select_coherent_clips(
+    sections: list[dict[str, Any]],
+    target_seconds: int,
+    analysis_service: LLMAnalysisService,
+    *,
+    criteria_prompt: str = "",
+    cancel_callback: Callable[[], None] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """고득점 앵커를 보존하면서 최소 필수 관계만 확장한다."""
+
+    # 문장 단위 섹션에는 최소 길이를 두지 않는다. 유효하지 않은 시간만 제외한다.
+    ordered = sorted(
+        (item for item in sections if 0 < float(item["end"]) - float(item["start"]) < math.inf),
+        key=lambda item: float(item["start"]),
+    )
+    if not ordered:
+        return [], []
+    if criteria_prompt in SHORT_FORM_PROFILES:
+        return _select_short_form_clips(
+            ordered, category_target_seconds(criteria_prompt, target_seconds), analysis_service,
+            criteria_prompt=criteria_prompt, cancel_callback=cancel_callback,
+            progress_callback=progress_callback,
+        ), []
+    by_id = {str(item["segment_id"]): item for item in ordered}
+    chapter_sections: dict[str, list[dict[str, Any]]] = {}
+    for item in ordered:
+        chapter_sections.setdefault(str(item.get("chapter_id") or ""), []).append(item)
+    ranked = sorted(
+        ordered,
+        key=lambda item: (-float(item.get("final_score", 0.0)), float(item["start"])),
+    )
+    selected_ids: set[str] = set()
+
+    def duration(ids: set[str]) -> float:
+        return sum(
+            float(by_id[value]["end"]) - float(by_id[value]["start"]) for value in ids
+        )
+
+    def resolve(anchor: dict[str, Any]) -> tuple[str, list[str]]:
+        if cancel_callback:
+            cancel_callback()
+        anchor_id = str(anchor["segment_id"])
+        chapter_id = str(anchor.get("chapter_id") or "")
+        peers = chapter_sections[chapter_id]
+        relation_rows = [
+            {"id": str(item["segment_id"]), "text": str(item.get("text") or "")}
+            for item in peers
+        ]
+        return anchor_id, analysis_service.required_anchor_links(
+            anchor_id, str(anchor.get("chapter_summary") or ""), relation_rows,
+            cancel_callback=cancel_callback
+        )
+
+    total_anchors = len(ranked)
+    processed_anchors = 0
+    provider_limit = max(
+        1, int(getattr(analysis_service, "_max_parallel_requests", 1))
+    )
+    while processed_anchors < total_anchors:
+        if cancel_callback:
+            cancel_callback()
+        remaining = total_anchors - processed_anchors
+        parallel_count = min(provider_limit, math.ceil(remaining / 4))
+        batch = ranked[processed_anchors : processed_anchors + parallel_count]
+        resolved: dict[str, list[str]] = {}
+        with ThreadPoolExecutor(max_workers=parallel_count) as executor:
+            futures = [executor.submit(resolve, anchor) for anchor in batch]
+            for future in as_completed(futures):
+                anchor_id, required_ids = future.result()
+                resolved[anchor_id] = required_ids
+                if progress_callback:
+                    progress_callback(
+                        processed_anchors + len(resolved), total_anchors
+                    )
+        for anchor in batch:
+            anchor_id = str(anchor["segment_id"])
+            selected_ids.update([anchor_id, *resolved[anchor_id]])
+            if duration(selected_ids) > target_seconds:
+                return [
+                    item
+                    for item in ordered
+                    if str(item["segment_id"]) in selected_ids
+                ], []
+        processed_anchors += len(batch)
+    return [item for item in ordered if str(item["segment_id"]) in selected_ids], []
+
+
+def _select_short_form_clips(
+    ordered, target_seconds, analysis_service, *, criteria_prompt,
+    cancel_callback=None, progress_callback=None,
+):
+    """인기 앵커의 도입~결말을 연속 묶음으로 보존하고 3분 내에서 선택한다."""
+    positions = {str(item["segment_id"]): i for i, item in enumerate(ordered)}
+    ranked = sorted(ordered, key=lambda item: (-float(item.get("final_score", 0)), float(item["start"])))
+    selected: set[int] = set()
+    for done, anchor in enumerate(ranked, 1):
+        if cancel_callback:
+            cancel_callback()
+        index = positions[str(anchor["segment_id"])]
+        if index in selected:
+            continue
+        # 3분짜리 단일 문장도 자르지 않는다. 들어갈 수 없는 앵커는 API 호출 전에 제외한다.
+        if float(anchor["end"]) - float(anchor["start"]) > SHORT_FORM_MAX_SECONDS:
+            continue
+        peers = [item for item in ordered
+                 if float(item["end"]) >= float(anchor["start"]) - 90
+                 and float(item["start"]) <= float(anchor["end"]) + 90]
+        required = analysis_service.required_anchor_links(
+            str(anchor["segment_id"]), str(anchor.get("chapter_summary") or ""),
+            [{"id": str(item["segment_id"]), "text": str(item.get("text") or ""),
+              "start": float(item["start"]), "end": float(item["end"])} for item in peers],
+            criteria_prompt=criteria_prompt, cancel_callback=cancel_callback,
+        )
+        nearby_ids = {str(item["segment_id"]) for item in peers}
+        if any(value not in nearby_ids for value in required):
+            raise LLMAnalysisError("숏폼 연결 구간이 제공된 주변 후보 범위를 벗어났습니다.")
+        bundle = {index, *(positions[value] for value in required)}
+        # 챕터 경계여도 바로 이어지는 앞뒤 문장을 최소 문맥으로 보존한다.
+        if index > 0 and float(anchor["start"]) - float(ordered[index - 1]["end"]) <= 2:
+            bundle.add(index - 1)
+        if index + 1 < len(ordered) and float(ordered[index + 1]["start"]) - float(anchor["end"]) <= 2:
+            bundle.add(index + 1)
+        bundle = set(range(min(bundle), max(bundle) + 1))
+        proposed = selected | bundle
+        duration = sum(float(ordered[i]["end"]) - float(ordered[i]["start"]) for i in proposed)
+        if duration <= SHORT_FORM_MAX_SECONDS:
+            selected = proposed
+        if progress_callback:
+            progress_callback(done, len(ranked))
+        if selected and duration <= SHORT_FORM_MAX_SECONDS and duration >= target_seconds:
+            break
+    return [item for i, item in enumerate(ordered) if i in selected]
+
+
+def _srt_timestamp(seconds: float) -> str:
+    milliseconds = max(0, int(round(seconds * 1000)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def write_selected_subtitles(
+    segments: list[dict[str, Any]],
+    clips: list[dict[str, Any]],
+    output: Path,
+) -> int:
+    """Write cleaned source captions on the concatenated edit timeline."""
+
+    entries: list[tuple[float, float, str]] = []
+    timeline_offset = 0.0
+    for clip in clips:
+        clip_start = float(clip["start"])
+        clip_end = float(clip["end"])
+        for segment in segments:
+            start = max(clip_start, float(segment["start"]))
+            end = min(clip_end, float(segment["end"]))
+            text = re.sub(r"\s+", " ", str(segment.get("text", ""))).strip()
+            if end - start < SUBTITLE_MIN_DURATION_SECONDS or not text:
+                continue
+            output_start = timeline_offset + start - clip_start
+            output_end = timeline_offset + end - clip_start
+            if (
+                entries
+                and text == entries[-1][2]
+                and output_start <= entries[-1][1] + 0.2
+            ):
+                entries[-1] = (entries[-1][0], max(entries[-1][1], output_end), text)
+            else:
+                entries.append((output_start, output_end, text))
+        timeline_offset += max(0.0, clip_end - clip_start)
+
+    lines: list[str] = []
+    for index, (start, end, value) in enumerate(entries, start=1):
+        wrapped = "\n".join(
+            textwrap.wrap(
+                value,
+                width=SUBTITLE_LINE_WIDTH,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+        )
+        lines.extend(
+            [
+                str(index),
+                f"{_srt_timestamp(start)} --> {_srt_timestamp(end)}",
+                wrapped,
+                "",
+            ]
+        )
+    output.write_text("\n".join(lines), encoding="utf-8")
+    return len(entries)
+
+
+def _run_ffmpeg(
+    command: list[str],
+    *,
+    progress_callback: Callable[[float], None] | None = None,
+    duration_seconds: float | None = None,
+    cancel_callback: Callable[[], None] | None = None,
+) -> None:
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(
+            [command[0], "-nostdin", "-progress", "pipe:1", "-nostats", *command[1:]],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        raise LiveEditPipelineError(
+            "ffmpeg를 실행할 수 없습니다. PATH에 ffmpeg를 추가하세요."
+        ) from exc
+
+    output_tail: list[str] = []
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output_tail.append(line)
+            if len(output_tail) > 200:
+                del output_tail[:100]
+            if cancel_callback:
+                cancel_callback()
+            if progress_callback and duration_seconds and line.startswith("out_time="):
+                match = re.match(r"out_time=(\d+):(\d+):([\d.]+)", line.strip())
+                if match:
+                    elapsed = (
+                        int(match.group(1)) * 3600
+                        + int(match.group(2)) * 60
+                        + float(match.group(3))
+                    )
+                    progress_callback(min(1.0, elapsed / duration_seconds))
+        returncode = process.wait()
+    except BaseException:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        raise
+    if returncode != 0:
+        raise LiveEditPipelineError(
+            "".join(output_tail)[-3000:] or "ffmpeg 편집에 실패했습니다."
+        )
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    """Write JSON beside its destination and atomically publish it."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_name(f".json-{uuid4().hex}.tmp")
+    with _ATOMIC_WRITE_LOCKS_GUARD:
+        lock = _ATOMIC_WRITE_LOCKS.setdefault(path.resolve(), threading.Lock())
+    try:
+        with lock:
+            with pending.open("w", encoding="utf-8") as output:
+                json.dump(value, output, ensure_ascii=False, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            for attempt in range(5):
+                try:
+                    os.replace(pending, path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def _copy_file_atomic(source: Path, destination: Path) -> None:
+    """Copy a completed render beside its destination, then publish it atomically."""
+
+    pending = destination.with_name(f".copy-{uuid4().hex}.tmp")
+    try:
+        shutil.copyfile(source, pending)
+        os.replace(pending, destination)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def _ffmpeg_binary() -> str:
+    try:
+        return str(get_ffmpeg())
+    except ToolchainError as exc:
+        raise LiveEditPipelineError(str(exc)) from exc
+
+
+# 기본 선택 순서는 실제 GPU 우선순위와 같다. NVIDIA > AMD > Intel.
+_HARDWARE_VIDEO_ENCODERS = ("h264_nvenc", "h264_amf", "h264_qsv")
+
+
+@lru_cache(maxsize=1)
+def _render_encoder_candidates() -> tuple[str | None, ...]:
+    """실제 렌더링에 시도할 GPU 후보와 최종 CPU 폴백을 반환한다."""
+
+    configured = os.getenv("AVE_VIDEO_ENCODER", "auto").strip().lower()
+    if configured == "cpu":
+        return (None,)
+    candidates = (
+        _HARDWARE_VIDEO_ENCODERS if configured in {"", "auto"} else (configured,)
+    )
+    try:
+        completed = subprocess.run(
+            [_ffmpeg_binary(), "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return (None,)
+    if completed.returncode != 0:
+        return (None,)
+    available = completed.stdout + completed.stderr
+    gpu_candidates = tuple(
+        encoder
+        for encoder in candidates
+        if encoder in _HARDWARE_VIDEO_ENCODERS and encoder in available
+    )
+    return (*gpu_candidates, None)
+
+
+def _video_encoding_args(encoder: str | None) -> list[str]:
+    """개발 단계의 빠른 결과 확인용 인코더 옵션. 지원하지 않으면 libx264로 폴백한다."""
+
+    if encoder == "h264_nvenc":
+        return [
+            "-c:v",
+            encoder,
+            "-preset",
+            "p1",
+            "-tune",
+            "hq",
+            "-cq",
+            "23",
+            "-b:v",
+            "0",
+        ]
+    if encoder == "h264_qsv":
+        return ["-c:v", encoder, "-preset", "veryfast", "-global_quality", "23"]
+    if encoder == "h264_amf":
+        return ["-c:v", encoder, "-quality", "speed", "-qp_i", "23", "-qp_p", "23"]
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+
+
+def _hardware_decoding_args(encoder: str | None) -> list[str]:
+    """GPU 렌더링에서만 FFmpeg가 적합한 하드웨어 디코더를 선택하게 한다.
+
+    출력 포맷을 GPU 프레임으로 강제하지 않아 자막·trim 등 CPU 필터와의 호환성을
+    지킨다. 드라이버 또는 필터가 이를 지원하지 않으면 상위 렌더러가 CPU 작업을
+    처음부터 다시 수행한다.
+    """
+
+    return ["-hwaccel", "auto"] if encoder else []
+
+
+def _render_acceleration_label(encoder: str | None) -> str:
+    """사용자 진행 메시지와 완료 이력에 남길 실제 렌더링 방식을 반환한다."""
+
+    labels = {
+        "h264_nvenc": "NVIDIA GPU (NVENC)",
+        "h264_amf": "AMD GPU (AMF)",
+        "h264_qsv": "Intel GPU (Quick Sync)",
+    }
+    return labels.get(encoder or "", "CPU (libx264)")
+
+
+def _subtitle_filter(subtitles: Path) -> str:
+    if not subtitles.is_file():
+        raise LiveEditPipelineError(
+            f"FFmpeg 자막 입력 파일을 찾을 수 없습니다: {subtitles}"
+        )
+    # Windows filtergraph에서는 드라이브 구분자와 경로 구분자 모두 FFmpeg
+    # 이스케이프가 필요하다. libass가 실제 Windows 경로를 받도록 backslash를
+    # 두 번 이스케이프한다.
+    filter_path = (
+        str(subtitles.resolve())
+        .replace("\\", r"\\")
+        .replace(":", r"\:")
+        .replace("'", r"\'")
+    )
+    return (
+        f"subtitles=filename='{filter_path}':"
+        f"force_style='FontName={SUBTITLE_FONT_NAME},FontSize={SUBTITLE_FONT_SIZE},"
+        f"Outline=1,Shadow=0,MarginV={SUBTITLE_MARGIN_BOTTOM}'"
+    )
+
+
+def render_final(
+    source: Path,
+    clips: list[dict[str, Any]],
+    output: Path,
+    subtitles: Path | None = None,
+    progress_callback: Callable[[float], None] | None = None,
+    status_callback: Callable[[str], None] | None = None,
+    cancel_callback: Callable[[], None] | None = None,
+) -> str:
+    candidates = _render_encoder_candidates()
+    for index, encoder in enumerate(candidates):
+        # 출력 stem에는 이미 작업 ID와 UUID가 있다. 이를 다시 붙이면
+        # Windows의 경로 길이 제한을 넘으므로 시도별 독립 이름을 사용한다.
+        attempt_output = output.with_name(
+            f"render-{uuid4().hex}{output.suffix}"
+        )
+        if status_callback:
+            if encoder:
+                status_callback(
+                    f"하드웨어 가속 렌더링을 시도합니다: {_render_acceleration_label(encoder)} 인코딩, 입력 하드웨어 디코딩 자동 시도"
+                )
+            else:
+                status_callback(
+                    "사용 가능한 GPU 렌더링에 실패하여 CPU 렌더링을 시도합니다."
+                )
+        try:
+            _render_final(
+                source,
+                clips,
+                attempt_output,
+                subtitles,
+                progress_callback,
+                cancel_callback,
+                encoder,
+            )
+            _copy_file_atomic(attempt_output, output)
+            return _render_acceleration_label(encoder)
+        except LiveEditCancelled:
+            raise
+        except LiveEditPipelineError:
+            if encoder is None:
+                raise
+            next_encoder = candidates[index + 1]
+            if status_callback:
+                status_callback(
+                    f"{_render_acceleration_label(encoder)} 렌더링에 실패하여 {_render_acceleration_label(next_encoder)} 렌더링으로 다시 시도합니다."
+                )
+        finally:
+            attempt_output.unlink(missing_ok=True)
+    raise LiveEditPipelineError("렌더링 인코더를 선택하지 못했습니다.")
+
+
+def _render_filler_edit(source, clips, output, subtitles, *, encoder,
+                        progress_callback, cancel_callback):
+    """짧은 컷에서 오디오 프레임 반올림이 누적되지 않도록 샘플 단위 trim을 사용한다."""
+    intervals = sorted((float(c["start"]), float(c["end"])) for c in clips)
+
+    def balanced_sum(parts):
+        while len(parts) > 1:
+            parts = [f"({parts[i]}+{parts[i + 1]})" if i + 1 < len(parts) else parts[i]
+                     for i in range(0, len(parts), 2)]
+        return parts[0] if parts else "0"
+
+    selection = balanced_sum([f"gte(t,{start:.6f})*lt(t,{end:.6f})" for start, end in intervals])
+    gaps = balanced_sum([
+        f"{start - intervals[i - 1][1]:.6f}*gte(PTS*TB,{start:.6f})"
+        for i, (start, _) in enumerate(intervals) if i
+    ])
+    video_label = "cutv" if subtitles and subtitles.is_file() and subtitles.stat().st_size else "v"
+    filters = [f"[0:v]select='{selection}',setpts='(PTS*TB-{intervals[0][0]:.6f}-({gaps}))/TB'[{video_label}]"]
+    filters.append(f"[0:a]asplit={len(intervals)}" + "".join(f"[srca{i}]" for i in range(len(intervals))))
+    for i, (start, end) in enumerate(intervals):
+        filters.append(f"[srca{i}]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[a{i}]")
+    filters.append("".join(f"[a{i}]" for i in range(len(intervals))) + f"concat=n={len(intervals)}:v=0:a=1[a]")
+    if video_label == "cutv":
+        filters.append(f"[cutv]{_subtitle_filter(subtitles)}[v]")
+    # 수백 개의 미세 컷도 Windows 명령줄 길이 제한에 걸리지 않도록 파일로 전달한다.
+    script = output.parent / f"{uuid4().hex}.filters.txt"
+    try:
+        script.write_text(";".join(filters), encoding="utf-8")
+        _run_ffmpeg([
+            _ffmpeg_binary(), "-y", *_hardware_decoding_args(encoder),
+            "-t", f"{intervals[-1][1]:.6f}", "-i", str(source),
+            "-/filter_complex", str(script), "-map", "[v]", "-map", "[a]",
+            *_video_encoding_args(encoder), "-fps_mode", "vfr", "-c:a", "aac",
+            "-b:a", "160k", "-movflags", "+faststart", str(output),
+        ], progress_callback=progress_callback,
+           duration_seconds=sum(end - start for start, end in intervals), cancel_callback=cancel_callback)
+    finally:
+        script.unlink(missing_ok=True)
+
+
+def _render_final(
+    source: Path,
+    clips: list[dict[str, Any]],
+    output: Path,
+    subtitles: Path | None = None,
+    progress_callback: Callable[[float], None] | None = None,
+    cancel_callback: Callable[[], None] | None = None,
+    encoder: str | None = None,
+) -> None:
+    if any(clip.get("filler_edited") for clip in clips):
+        _render_filler_edit(source, clips, output, subtitles, encoder=encoder,
+                            progress_callback=progress_callback, cancel_callback=cancel_callback)
+        if progress_callback:
+            progress_callback(1.0)
+        return
+    ffmpeg = _ffmpeg_binary()
+    # 같은 입력 패드를 여러 trim 필터에서 재사용하면 많은 구간에서 프레임이
+    # 각 소비자로 분산되어 영상 스트림만 조기에 끝날 수 있다. 원본은 한 번만
+    # 순차 디코딩하고 선택된 시간 범위의 프레임만 남긴 뒤 타임스탬프를 압축한다.
+    intervals: list[tuple[float, float]] = []
+    ordered_ranges = sorted(
+        (float(clip["start"]), float(clip["end"])) for clip in clips
+    )
+    for start, end in ordered_ranges:
+        if end <= start:
+            continue
+        if intervals and start <= intervals[-1][1]:
+            intervals[-1] = (intervals[-1][0], max(intervals[-1][1], end))
+        else:
+            intervals.append((start, end))
+    if not intervals:
+        raise LiveEditPipelineError("렌더링할 유효한 영상 구간이 없습니다.")
+
+    expressions = [
+        f"between(t\\,{start:.6f}\\,{end:.6f})" for start, end in intervals
+    ]
+    # FFmpeg는 a+b+c+...를 왼쪽으로 깊게 중첩된 AST로 만든다. 선택 구간이
+    # 많으면 필터 초기화 중 메모리 오류가 나므로 같은 합을 균형 트리로 구성한다.
+    while len(expressions) > 1:
+        expressions = [
+            (
+                f"({expressions[index]}+{expressions[index + 1]})"
+                if index + 1 < len(expressions)
+                else expressions[index]
+            )
+            for index in range(0, len(expressions), 2)
+        ]
+    selection = expressions[0]
+    has_subtitles = bool(
+        subtitles and subtitles.exists() and subtitles.stat().st_size > 0
+    )
+    selected_video_label = "selectedv" if has_subtitles else "v"
+    filter_parts = [
+        f"[0:v]select='{selection}',setpts=N/FRAME_RATE/TB[{selected_video_label}]",
+        f"[0:a]aselect='{selection}',asetpts=N/SR/TB[a]",
+    ]
+    if has_subtitles:
+        filter_parts.append(f"[selectedv]{_subtitle_filter(subtitles)}[v]")
+    filter_graph = ";".join(filter_parts)
+    duration_seconds = sum(
+        max(0.0, float(clip["end"]) - float(clip["start"])) for clip in clips
+    )
+    _run_ffmpeg(
+        [
+            ffmpeg,
+            "-y",
+            *_hardware_decoding_args(encoder),
+            # select/aselect만 사용하면 마지막 선택 구간이 끝난 뒤에도 원본
+            # 전체를 디코딩한다. 출력 진행률은 이미 98%인데 긴 원본을 끝까지
+            # 훑는 것처럼 보이지 않도록 필요한 마지막 시점에서 입력을 닫는다.
+            "-t",
+            f"{intervals[-1][1]:.6f}",
+            "-i",
+            str(source),
+            "-filter_complex",
+            filter_graph,
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
+            *_video_encoding_args(encoder),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ],
+        progress_callback=progress_callback,
+        duration_seconds=duration_seconds,
+        cancel_callback=cancel_callback,
+    )
+    if progress_callback:
+        progress_callback(1.0)
+
+
+class LiveEditPipeline:
+    def __init__(self, media_root: Path | None = None):
+        self.media_root = (media_root or get_media_root()).resolve()
+
+    def _prepare_filler_render(self, job_id, segments, clips, criteria_prompt, provider,
+                               server_access_token, report, cancel_callback):
+        cuts, missing = [], 0
+        if criteria_prompt == "ai_news":
+            candidates, missing = filler_candidates(segments)
+            # 긴 방송 전체가 아닌 실제로 렌더링할 구간만 LLM에 보낸다.
+            candidates = [candidate for candidate in candidates if any(
+                float(clip["start"]) <= candidate["start"] < candidate["end"] <= float(clip["end"])
+                for clip in clips
+            )]
+            report(0, f"선택 영상의 추임새 후보 {len(candidates)}개를 확인합니다. "
+                   f"단어 시간 부족 자막 {missing}개는 내부 컷을 생략합니다.")
+            if candidates:
+                checkpoint_path = self.media_root / "yt-edit" / job_id / f"{job_id}.llm-checkpoint.json"
+                try:
+                    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8")) if checkpoint_path.is_file() else {}
+                except (OSError, json.JSONDecodeError):
+                    checkpoint = {}
+                if not isinstance(checkpoint, dict):
+                    checkpoint = {}
+                agent = LLMAnalysisService(
+                    provider=provider, server_access_token=server_access_token,
+                    checkpoint=checkpoint,
+                    checkpoint_callback=lambda: _write_json_atomic(checkpoint_path, checkpoint),
+                )
+                try:
+                    cuts = agent.detect_fillers(
+                        candidates, cancel_callback=cancel_callback,
+                        progress_callback=lambda done, total: report(0, f"추임새 판별 중 ({done}/{total})"),
+                    )
+                except LLMAnalysisError as exc:
+                    raise LiveEditPipelineError(f"추임새 판별을 완료하지 못했습니다: {exc}") from exc
+        edited, cleaned, summary = apply_filler_cuts(segments, clips, cuts)
+        if summary["guard_triggered"]:
+            report(0, "추임새 제거량이 선택 영상의 20%를 넘어 원본 선택 구간을 보존합니다.")
+        elif criteria_prompt == "ai_news":
+            report(0, f"추임새 {summary['removed_count']}개 ({summary['removed_seconds']:.2f}초)를 영상·자막에서 제외합니다.")
+        return edited, cleaned, {"filler_cuts": cuts, "filler_missing_timing": missing, "filler_summary": summary}
+
+    def load_script_segments(
+        self,
+        *,
+        job_id: str,
+        vod_url: str,
+        transcription_source: str,
+        transcript_language: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """선택한 준비 완료 스크립트를 문장 단위 미리보기 형식으로 읽는다."""
+
+        try:
+            video_id = extract_video_id(vod_url)
+        except LiveYouTubeError as exc:
+            raise LiveEditPipelineError(str(exc)) from exc
+        source_kind = {
+            "youtube_caption": "captions",
+            "youtube_subtitle": "subtitles",
+        }.get(transcription_source)
+        try:
+            if source_kind:
+                if not transcript_language:
+                    raise LiveEditPipelineError("선택한 스크립트 언어를 지정하세요.")
+                rows = load_prepared_transcript(
+                    video_id, source_kind, transcript_language
+                )
+            elif transcription_source == "whisper_api":
+                payload = json.loads(
+                    _whisper_transcript_path(self.media_root, job_id).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                rows = payload["segments"]
+            else:
+                raise LiveEditPipelineError("지원하지 않는 스크립트 소스입니다.")
+            segments = [
+                {
+                    "id": index,
+                    "start": float(row["start"]),
+                    "end": float(row["end"]),
+                    "text": str(row["text"]),
+                }
+                for index, row in enumerate(rows)
+                if isinstance(row, dict) and row.get("text")
+            ]
+        except LiveEditPipelineError:
+            raise
+        except (
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise LiveEditPipelineError(
+                "선택한 스크립트 파일을 읽지 못했습니다."
+            ) from exc
+        if not segments:
+            raise LiveEditPipelineError(
+                "시간표시가 있는 스크립트 문장을 찾지 못했습니다."
+            )
+        return segments
+
+    def prepare_whisper_transcript(
+        self,
+        *,
+        job_id: str,
+        vod_url: str,
+        llm_provider: str,
+        stt_language: str | None,
+        stt_initial_prompt: str | None,
+        stt_hotwords: str | None,
+        stt_speed: float,
+        server_access_token: AccessTokenSource,
+        progress_callback: Callable[[int, str], None] | None = None,
+        cancel_callback: Callable[[], None] | None = None,
+        whisper_job_started_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        def check_cancelled() -> None:
+            if cancel_callback:
+                cancel_callback()
+
+        check_cancelled()
+        video_id = extract_video_id(vod_url)
+        transcript_path = _whisper_transcript_path(self.media_root, job_id)
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path = transcript_path.parent / f"{job_id}.whisper-source.json"
+        stt_initial_prompt = (
+            fixed_whisper_initial_prompt(stt_language) if stt_initial_prompt else ""
+        )
+        source_audio_path = YouTubeImporter(self.media_root).prepare_best_audio(
+            vod_url, video_id
+        )
+        source_audio_stat = source_audio_path.stat()
+        request_fingerprint = {
+            "video_id": video_id,
+            "audio_size": source_audio_stat.st_size,
+            "audio_mtime_ns": source_audio_stat.st_mtime_ns,
+            "language": stt_language,
+            "initial_prompt": stt_initial_prompt,
+            "hotwords": stt_hotwords,
+            "speed": stt_speed,
+            "engine": WHISPER_ENGINE,
+            "alignment": WHISPER_ALIGNMENT,
+        }
+        shared_source_path = _shared_whisper_source_path(
+            self.media_root, video_id, request_fingerprint
+        )
+        whisper_segments: list[dict[str, Any]] = []
+        saved_source: dict[str, Any] | None = None
+        for candidate_path in (source_path, shared_source_path):
+            try:
+                candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+                if (
+                    candidate.get("request") == request_fingerprint
+                    and candidate.get("engine") == WHISPER_ENGINE
+                    and candidate.get("alignment") == WHISPER_ALIGNMENT
+                    and isinstance(candidate.get("segments"), list)
+                    and candidate["segments"]
+                ):
+                    saved_source = candidate
+                    whisper_segments = candidate["segments"]
+                    break
+            except (OSError, json.JSONDecodeError, AttributeError):
+                continue
+        if saved_source is not None:
+            _write_json_atomic(source_path, saved_source)
+        if not whisper_segments:
+            whisper_audio_path = prepare_whisper_audio(
+                source_audio_path, prepared_metadata_paths(video_id)["whisper_audio"]
+            )
+            check_cancelled()
+            if progress_callback:
+                progress_callback(20, "Whisper 전사용 오디오를 준비했습니다.")
+            uploaded = upload_audio_for_transcription(
+                whisper_audio_path, server_access_token
+            )
+            check_cancelled()
+            if progress_callback:
+                progress_callback(25, "Whisper API로 음성을 전사하는 중입니다.")
+            remote_job_id: str | None = None
+
+            def started(value: str) -> None:
+                nonlocal remote_job_id
+                remote_job_id = value
+                if whisper_job_started_callback:
+                    whisper_job_started_callback(value)
+
+            result = transcribe_uploaded_audio(
+                uploaded.file_id,
+                server_access_token,
+                client_job_id=job_id,
+                server_job_id=None,
+                language=stt_language,
+                initial_prompt=stt_initial_prompt,
+                hotwords=stt_hotwords,
+                speed=stt_speed,
+                progress_callback=lambda progress, message: (
+                    check_cancelled(),
+                    progress_callback and progress_callback(min(80, progress), message),
+                ),
+                job_started_callback=started,
+            )
+            check_cancelled()
+            if (
+                result.get("engine") != WHISPER_ENGINE
+                or result.get("alignment") != WHISPER_ALIGNMENT
+            ):
+                raise LiveEditPipelineError(
+                    "WhisperX 단어 강제 정렬 API가 아닌 전사 결과를 받았습니다."
+                )
+            whisper_segments = result.get("segments", [])
+            if not whisper_segments:
+                raise LiveEditPipelineError("Whisper 전사 결과에 세그먼트가 없습니다.")
+            saved_source = {
+                "request": request_fingerprint,
+                "language": result.get("language"),
+                "engine": result.get("engine"),
+                "alignment": result.get("alignment"),
+                "segments": whisper_segments,
+            }
+            _write_json_atomic(shared_source_path, saved_source)
+            _write_json_atomic(source_path, saved_source)
+            if remote_job_id:
+                try:
+                    acknowledge_transcription_result(
+                        remote_job_id, _access_token(server_access_token)
+                    )
+                except ServerMediaError:
+                    pass
+        shared_transcript_path, split_request = _shared_whisper_transcript_path(
+            self.media_root, video_id, request_fingerprint, llm_provider
+        )
+        for candidate_path in (transcript_path, shared_transcript_path):
+            try:
+                candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+                if (
+                    candidate.get("request") == split_request
+                    and isinstance(candidate.get("segments"), list)
+                    and candidate["segments"]
+                ):
+                    _write_json_atomic(transcript_path, candidate)
+                    if candidate_path != shared_transcript_path:
+                        _write_json_atomic(shared_transcript_path, candidate)
+                    if progress_callback:
+                        progress_callback(100, "저장된 Whisper 문장 분할 결과를 불러왔습니다.")
+                    return {
+                        "job_id": job_id,
+                        "video_id": video_id,
+                        "segment_count": len(candidate["segments"]),
+                    }
+            except (OSError, json.JSONDecodeError, AttributeError):
+                continue
+        checkpoint_path = transcript_path.parent / f"{job_id}.llm-checkpoint.json"
+        try:
+            checkpoint = (
+                json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                if checkpoint_path.is_file()
+                else {}
+            )
+        except (OSError, json.JSONDecodeError):
+            checkpoint = {}
+        if not isinstance(checkpoint, dict):
+            checkpoint = {}
+
+        def save_checkpoint() -> None:
+            _write_json_atomic(checkpoint_path, checkpoint)
+
+        needs_split = any(
+            _nonspace_length(str(segment.get("text") or ""))
+            >= WHISPER_SPLIT_MIN_CHARACTERS
+            and isinstance(segment.get("words"), list)
+            and len(segment["words"]) >= 2
+            for segment in whisper_segments
+        )
+        analysis_service = (
+            LLMAnalysisService(
+                provider=llm_provider,
+                server_access_token=_access_token(server_access_token),
+                checkpoint=checkpoint,
+                checkpoint_callback=save_checkpoint,
+            )
+            if needs_split
+            else None
+        )
+        try:
+            if analysis_service is None:
+                segments = [
+                    {
+                        "start": float(segment["start"]),
+                        "end": float(segment["end"]),
+                        "text": str(segment["text"]).strip(),
+                        "words": segment.get("words"),
+                    }
+                    for segment in whisper_segments
+                ]
+            else:
+                segments = _split_whisper_segments_parallel(
+                    whisper_segments,
+                    analysis_service,
+                    cancel_callback=cancel_callback,
+                    progress_callback=lambda done, total: (
+                        progress_callback(
+                            80 + int(19 * done / max(1, total)),
+                            f"긴 Whisper 문장을 병렬 분할하는 중입니다. ({done}/{total})",
+                        )
+                        if progress_callback
+                        else None
+                    ),
+                )
+        except LLMAnalysisError as exc:
+            raise LiveEditPaused(
+                f"LLM 자막 분할 요청에 실패했습니다: {exc}"
+            ) from exc
+        transcript = {"request": split_request, "segments": segments}
+        _write_json_atomic(shared_transcript_path, transcript)
+        _write_json_atomic(transcript_path, transcript)
+        if progress_callback:
+            progress_callback(100, "Whisper 전사를 완료했습니다.")
+        return {"job_id": job_id, "video_id": video_id, "segment_count": len(segments)}
+
+    def run(
+        self,
+        *,
+        job_id: str | None = None,
+        vod_url: str,
+        genre: str = "ai_news",
+        criteria_prompt: str = "ai_news",
+        llm_provider: str = "deepseek",
+        target_seconds: int = 600,
+        chapter_split_mode: str = "automatic",
+        use_timestamp_comments: bool = False,
+        use_chat_score: bool = False,
+        transcription_source: str = "youtube_caption",
+        transcript_language: str | None = None,
+        stt_language: str | None = "ko",
+        stt_initial_prompt: str | None = None,
+        stt_hotwords: str | None = None,
+        stt_speed: float = 1.0,
+        defer_render: bool = True,
+        stop_after_structure: bool = False,
+        progress_callback: Callable[[int, str], None] | None = None,
+        cancel_callback: Callable[[], None] | None = None,
+        whisper_progress_callback: Callable[[int, str], None] | None = None,
+        whisper_preparing_callback: Callable[[], None] | None = None,
+        whisper_job_started_callback: Callable[[str], None] | None = None,
+        server_access_token: str | None = None,
+        server_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        def report(progress: int, message: str) -> None:
+            if progress_callback:
+                progress_callback(progress, message)
+
+        if target_seconds < 60 or target_seconds > 7200:
+            raise LiveEditPipelineError(
+                "target_seconds는 60초에서 7200초 사이여야 합니다."
+            )
+        target_seconds = category_target_seconds(criteria_prompt, target_seconds)
+        if genre not in EDIT_GENRES:
+            raise LiveEditPipelineError(
+                "genre는 ai_news, stock 또는 game이어야 합니다."
+            )
+
+        job_id = job_id or uuid4().hex
+        if Path(job_id).name != job_id:
+            raise LiveEditPipelineError("잘못된 편집 작업 ID입니다.")
+        output_dir = self.media_root / "yt-edit" / job_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        report(5, "1·2단계에서 준비한 원본과 스크립트를 확인하는 중입니다.")
+        importer = YouTubeImporter(self.media_root)
+        imported = importer.find_complete_cached_import(
+            vod_url, job_id=f"edit-{job_id}"
+        )
+        if imported is None:
+            raise LiveEditPipelineError(
+                "1·2단계에서 준비한 원본 영상을 찾지 못했습니다."
+            )
+        report(18, "1·2단계에서 준비한 원본 영상과 스크립트를 재사용합니다.")
+        source = Path(imported.get("video_path", ""))
+        if not source.is_absolute():
+            source = (Path.cwd() / source).resolve()
+        if not source.exists():
+            raise LiveEditPipelineError("yt-dlp가 원본 영상을 저장하지 못했습니다.")
+
+        try:
+            video_id = extract_video_id(vod_url)
+        except LiveYouTubeError as exc:
+            raise LiveEditPipelineError(str(exc)) from exc
+        source_kind = {
+            "youtube_caption": "captions",
+            "youtube_subtitle": "subtitles",
+        }.get(transcription_source)
+        raw_segments: list[dict[str, Any]] = []
+        if source_kind:
+            if not transcript_language:
+                raise LiveEditPipelineError(
+                    "2단계에서 선택한 스크립트 언어를 지정하세요."
+                )
+            try:
+                parsed_rows = load_prepared_transcript(
+                    video_id, source_kind, transcript_language
+                )
+                raw_segments = [
+                    {
+                        "start": _time_seconds(row["start"]),
+                        "end": _time_seconds(row["end"]),
+                        "text": row["text"],
+                        "words": row.get("words"),
+                    }
+                    for row in parsed_rows
+                    if isinstance(row, dict) and row.get("text")
+                ]
+            except (
+                OSError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise LiveEditPipelineError(
+                    "2단계 스크립트 파일 형식이 올바르지 않습니다."
+                ) from exc
+        if transcription_source == "whisper_api":
+            transcript_path = _whisper_transcript_path(self.media_root, job_id)
+            try:
+                payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+                raw_segments = [
+                    {
+                        "start": float(item["start"]),
+                        "end": float(item["end"]),
+                        "text": str(item["text"]),
+                        "words": item.get("words"),
+                    }
+                    for item in payload["segments"]
+                    if isinstance(item, dict) and item.get("text")
+                ]
+            except (
+                OSError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise LiveEditPipelineError(
+                    "2단계에서 준비한 Whisper 전사 파일을 찾지 못했습니다."
+                ) from exc
+        if False:  # Whisper 원격 전사는 2단계 준비 작업에서만 수행한다.
+            if whisper_preparing_callback:
+                whisper_preparing_callback()
+            report(22, "음원을 AVE 서버에 올리는 중입니다.")
+            try:
+                source_audio_path = YouTubeImporter(self.media_root).prepare_best_audio(
+                    vod_url, video_id
+                )
+                whisper_audio_path = prepare_whisper_audio(
+                    source_audio_path,
+                    prepared_metadata_paths(video_id)["whisper_audio"],
+                )
+                uploaded_audio = upload_audio_for_transcription(
+                    whisper_audio_path, server_access_token or ""
+                )
+                report(
+                    25,
+                    "Whisper API로 음성을 전사하는 중입니다. 처음 요청은 모델 준비로 오래 걸릴 수 있습니다.",
+                )
+                whisper_remote_job_id: str | None = None
+
+                def record_whisper_job(remote_job_id: str) -> None:
+                    nonlocal whisper_remote_job_id
+                    whisper_remote_job_id = remote_job_id
+                    if whisper_job_started_callback:
+                        whisper_job_started_callback(remote_job_id)
+
+                transcription_result = transcribe_uploaded_audio(
+                    uploaded_audio.file_id,
+                    server_access_token or "",
+                    client_job_id=job_id,
+                    server_job_id=server_job_id,
+                    language=stt_language,
+                    initial_prompt=stt_initial_prompt,
+                    hotwords=stt_hotwords,
+                    speed=stt_speed,
+                    progress_callback=whisper_progress_callback,
+                    job_started_callback=record_whisper_job,
+                )
+                raw_segments = [
+                    {
+                        "start": float(segment["start"]),
+                        "end": float(segment["end"]),
+                        "text": str(segment["text"]),
+                    }
+                    for segment in transcription_result["segments"]
+                    if isinstance(segment, dict)
+                ]
+                _write_json_atomic(
+                    output_dir / f"{job_id}.whisper-transcript.json",
+                    {"segments": raw_segments},
+                )
+                if whisper_remote_job_id:
+                    try:
+                        acknowledge_transcription_result(
+                            whisper_remote_job_id, server_access_token or ""
+                        )
+                    except ServerMediaError:
+                        pass
+            except TranscriptionCancelledError as exc:
+                raise LiveEditCancelled(str(exc)) from exc
+            except ServerMediaError as exc:
+                raise LiveEditPipelineError(str(exc)) from exc
+        if not raw_segments:
+            raise LiveEditPipelineError(
+                "자막 파일은 있지만 시간표시 문장을 읽지 못했습니다."
+            )
+
+        checkpoint_path = output_dir / f"{job_id}.llm-checkpoint.json"
+        try:
+            checkpoint = (
+                json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                if checkpoint_path.is_file()
+                else {}
+            )
+        except (OSError, json.JSONDecodeError):
+            checkpoint = {}
+        if not isinstance(checkpoint, dict):
+            checkpoint = {}
+        checkpoint["transcription_source"] = transcription_source
+
+        def save_checkpoint() -> None:
+            _write_json_atomic(checkpoint_path, checkpoint)
+
+        analysis_service = LLMAnalysisService(
+            provider=llm_provider,
+            server_access_token=server_access_token,
+            checkpoint=checkpoint,
+            checkpoint_callback=save_checkpoint,
+        )
+        report(22, "구두점·의미 기준으로 문장을 분리하는 중입니다.")
+        try:
+            raw_segments = split_timed_sentences(
+                raw_segments,
+                semantic_splitter=lambda text: analysis_service.split_unpunctuated_sentences(
+                    text, cancel_callback=cancel_callback
+                ),
+            )
+        except LLMAnalysisError as exc:
+            raise LiveEditPaused(f"LLM 의미 기반 문장 분할을 완료하지 못했습니다: {exc}") from exc
+        except (ValueError, KeyError, TypeError) as exc:
+            raise LiveEditPipelineError(f"문장 분할에 실패했습니다: {exc}") from exc
+        checkpoint["transcript_ids"] = [item["id"] for item in raw_segments]
+        if criteria_prompt == "cooking_food":
+            try:
+                report(23, "제목·썸네일·전체 자막 흐름으로 주 요리를 먼저 판별합니다.")
+                metadata_file = Path(str(imported.get("metadata_path") or ""))
+                try:
+                    recipe_metadata = json.loads(metadata_file.read_text(encoding="utf-8")) if metadata_file.is_file() else {}
+                except (OSError, ValueError):
+                    recipe_metadata = {}
+                if not isinstance(recipe_metadata, dict):
+                    recipe_metadata = {}
+                thumbnail = describe_recipe_thumbnail(
+                    analysis_service, self.media_root / "yt-data" / video_id / "thumbnails",
+                    cancel_callback=cancel_callback,
+                )
+                if thumbnail["status"] != "analyzed":
+                    report(23, "썸네일 분석을 사용할 수 없어 제목·전체 자막으로 주 요리를 판별합니다.")
+                recipe_context = {
+                    "title": str(recipe_metadata.get("title") or imported.get("title") or ""),
+                    "description": str(recipe_metadata.get("description") or "")[:2000],
+                    "thumbnail": thumbnail,
+                }
+                recipes = summarize_recipes(
+                    analysis_service, raw_segments, video_context=recipe_context, cancel_callback=cancel_callback,
+                    progress_callback=lambda done, total: report(
+                        23, f"메뉴별 레시피와 조리 순서를 정리하는 중입니다. ({done}/{total})"
+                    ),
+                )
+                if cancel_callback:
+                    cancel_callback()
+                save_recipe_files(output_dir, recipes)
+            except LLMAnalysisError as exc:
+                raise LiveEditPaused(f"메뉴별 레시피 정리를 완료하지 못했습니다: {exc}") from exc
+        save_checkpoint()
+        _write_json_atomic(
+            output_dir / f"{job_id}.analysis-transcript.json",
+            {"segments": raw_segments},
+        )
+        estimated_count = sum(bool(row.get("timing_estimated")) for row in raw_segments)
+        report(22, f"구두점·의미 기준 {len(raw_segments):,}문장으로 분리했습니다. 시간 추정 {estimated_count:,}문장.")
+        try:
+            uploader_chapters = None
+            if chapter_split_mode == "uploader":
+                metadata_path = Path(str(imported.get("metadata_path") or ""))
+                if not metadata_path.is_absolute():
+                    metadata_path = (Path.cwd() / metadata_path).resolve()
+                try:
+                    uploader_rows = (
+                        json.loads(metadata_path.read_text(encoding="utf-8")).get("chapters")
+                        or []
+                    )
+                except (OSError, json.JSONDecodeError, AttributeError):
+                    uploader_rows = []
+                uploader_chapters = []
+                for chapter_index, chapter in enumerate(uploader_rows):
+                    start = float(chapter.get("start_time", 0))
+                    end = float(chapter.get("end_time", float("inf")))
+                    chapter_ids = [
+                        int(item["id"])
+                        for item in raw_segments
+                        if start
+                        <= (float(item["start"]) + float(item["end"])) / 2
+                        < end
+                    ]
+                    if chapter_ids:
+                        uploader_chapters.append(
+                            {
+                                "start_id": min(chapter_ids),
+                                "end_id": max(chapter_ids),
+                                "summary": str(
+                                    chapter.get("title") or f"챕터 {chapter_index + 1}"
+                                ),
+                                "score": 500,
+                            }
+                        )
+                if not uploader_chapters:
+                    raise LiveEditPipelineError(
+                        "업로더가 제공한 챕터를 찾을 수 없습니다."
+                    )
+            structure = analysis_service.structure_transcript(
+                raw_segments,
+                chapters=uploader_chapters,
+                progress_callback=lambda done, total, label: report(
+                    25 + int(25 * done / max(1, total)), f"LLM {label} ({done}/{total})"
+                ),
+                cancel_callback=cancel_callback,
+            )
+        except LLMAnalysisError as exc:
+            raise LiveEditPaused(
+                f"LLM 챕터·섹션 분할을 완료하지 못했습니다: {exc}"
+            ) from exc
+        subtitle_by_id = {int(item["id"]): item for item in raw_segments}
+        candidates: list[dict[str, Any]] = []
+        chapters: list[dict[str, Any]] = []
+        for index, chapter in enumerate(structure["chapters"]):
+            first, last = (
+                subtitle_by_id[chapter["start_id"]],
+                subtitle_by_id[chapter["end_id"]],
+            )
+            chapter_id = f"chapter-{index:02d}"
+            chapter_sections: list[dict[str, Any]] = []
+            for section_index, section in enumerate(
+                section
+                for section in structure["sections"]
+                if section["chapter_index"] == index
+            ):
+                section_first = subtitle_by_id[section["start_id"]]
+                section_last = subtitle_by_id[section["end_id"]]
+                section_id = f"{chapter_id}-section-{section_index:02d}"
+                section_text_segments = [
+                    str(item["text"])
+                    for item in raw_segments
+                    if section["start_id"] <= int(item["id"]) <= section["end_id"]
+                ]
+                text = " ".join(section_text_segments)
+                chapter_sections.append(
+                    {
+                        "section_id": section_id,
+                        "start": float(section_first["start"]),
+                        "end": float(section_last["end"]),
+                        "segment_ids": [section_id],
+                        "text": text,
+                        "text_segments": section_text_segments,
+                        "timing_estimated": bool(section_first.get("timing_estimated")),
+                    }
+                )
+                candidates.append(
+                    {
+                        "segment_id": section_id,
+                        "start": float(section_first["start"]),
+                        "end": float(section_last["end"]),
+                        "text": text,
+                        "text_segments": section_text_segments,
+                        "timing_estimated": bool(section_first.get("timing_estimated")),
+                        "chapter_id": chapter_id,
+                        "section_id": section_id,
+                        "chapter_summary": chapter["summary"],
+                        "chapter_llm_score": round(float(chapter["score"]) / 1000, 3),
+                    }
+                )
+            chapters.append(
+                {
+                    "chapter_id": chapter_id,
+                    "summary": chapter["summary"],
+                    "llm_score": round(float(chapter["score"]) / 1000, 3),
+                    "start": float(first["start"]),
+                    "end": float(last["end"]),
+                    "sections": chapter_sections,
+                }
+            )
+        report(55, "LLM 챕터 구성과 마침표 기준 문장 섹션 구성을 완료했습니다.")
+        try:
+            scored = analysis_service.score_sections(
+                candidates,
+                genre=genre,
+                criteria_prompt=criteria_prompt,
+                progress_callback=lambda done, total, label: report(
+                    55 + int(25 * done / max(1, total)), f"LLM {label} ({done}/{total})"
+                ),
+                cancel_callback=cancel_callback,
+            )
+        except LLMAnalysisError as exc:
+            raise LiveEditPaused(
+                f"LLM 섹션 중요도 평가를 완료하지 못했습니다: {exc}"
+            ) from exc
+        report(76, f"LLM이 섹션 {len(scored):,}개의 중요도를 평가했습니다.")
+        metadata_path = Path(str(imported.get("metadata_path") or ""))
+        if not metadata_path.is_absolute():
+            metadata_path = (Path.cwd() / metadata_path).resolve()
+        heatmap: list[dict[str, Any]] = []
+        if metadata_path.is_file():
+            try:
+                stored_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                stored_heatmap = (
+                    stored_metadata.get("heatmap")
+                    if isinstance(stored_metadata, dict)
+                    else None
+                )
+                if isinstance(stored_heatmap, list):
+                    heatmap = [
+                        item for item in stored_heatmap if isinstance(item, dict)
+                    ]
+            except (OSError, json.JSONDecodeError):
+                heatmap = []
+        _apply_heatmap_scores(scored, heatmap)
+        if heatmap:
+            report(78, "히트맵 점수를 섹션별로 집계했습니다.")
+        # 음량 분석은 LLM 계약 오류와 무관한 고정 영상 단위 작업이다. 이후 LLM
+        # 단계에서 일시중지되면 같은 MP3를 다시 분석하지 않도록 점을 보존한다.
+        volume_cache = checkpoint.setdefault("volume_score_points", {})
+        cached_volume_points = volume_cache.get(video_id)
+        if isinstance(cached_volume_points, list) and all(
+            isinstance(item, list)
+            and len(item) == 2
+            and all(isinstance(value, (int, float)) for value in item)
+            for item in cached_volume_points
+        ):
+            volume_points = [
+                (float(item[0]), float(item[1])) for item in cached_volume_points
+            ]
+        else:
+            report(79, "원본 오디오의 음량 변화를 분석하는 중입니다.")
+            try:
+                volume_audio = importer.prepare_best_audio(vod_url, video_id)
+                volume_points = _volume_score_points(
+                    _extract_volume_samples(volume_audio)
+                )
+            except (YouTubeImportError, OSError):
+                volume_points = []
+            volume_cache[video_id] = [list(item) for item in volume_points]
+            save_checkpoint()
+        _apply_point_scores(scored, volume_points, "volume_score")
+        if cached_volume_points is None:
+            report(84, "원본 오디오의 음량 점수를 섹션별로 집계했습니다.")
+
+        chat_path = prepared_metadata_paths(video_id)["chat_times"]
+        chat_items: list[dict[str, Any]] = []
+        if use_chat_score and chat_path.is_file():
+            try:
+                loaded_chat = json.loads(chat_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_chat, list):
+                    chat_items = [
+                        item for item in loaded_chat if isinstance(item, dict)
+                    ]
+            except (OSError, json.JSONDecodeError):
+                chat_items = []
+        chat_points = _chat_score_points(
+            chat_items, float(imported.get("duration") or 0.0)
+        )
+        _apply_point_scores(scored, chat_points, "chat_score")
+        if use_chat_score:
+            report(86, "채팅 반응 점수를 섹션별로 집계했습니다.")
+        timestamp_comments: list[dict[str, Any]] = []
+        timestamp_comments_path = (
+            prepared_metadata_paths(video_id)["directory"]
+            / f"{video_id}.comments-timestamps.json"
+        )
+        if use_timestamp_comments and timestamp_comments_path.is_file():
+            try:
+                loaded_comments = json.loads(
+                    timestamp_comments_path.read_text(encoding="utf-8")
+                )
+                if isinstance(loaded_comments, list):
+                    timestamp_comments = [
+                        comment
+                        for comment in loaded_comments
+                        if isinstance(comment, dict)
+                        and _comment_timestamp_seconds(str(comment.get("text") or ""))
+                    ]
+            except (OSError, json.JSONDecodeError) as exc:
+                raise LiveEditPipelineError(
+                    "타임스탬프 댓글 파일 형식이 올바르지 않습니다."
+                ) from exc
+        if timestamp_comments:
+            try:
+                comment_scores = analysis_service.score_timestamp_comments(
+                    timestamp_comments,
+                    cancel_callback=cancel_callback,
+                )
+            except LLMAnalysisError as exc:
+                raise LiveEditPaused(
+                    f"LLM 타임스탬프 댓글 평가를 완료하지 못했습니다: {exc}"
+                ) from exc
+            _apply_timestamp_comment_scores(scored, timestamp_comments, comment_scores)
+            report(
+                89,
+                f"LLM이 타임스탬프 댓글 {len(timestamp_comments):,}개의 목적을 평가했습니다.",
+            )
+        _apply_final_scores(scored, criteria_prompt)
+        if criteria_prompt in SHORT_FORM_PROFILES and not heatmap:
+            report(90, "히트맵이 없어 나머지 점수를 재정규화해 숏폼 후보를 선택합니다.")
+        # Keep the completed request checkpoint with the job. Cancelled and
+        # failed job files are preserved locally even though they are not
+        # restored automatically.
+        report(90, "분석 점수를 모두 준비했습니다.")
+        # Stable IDs let the browser send a compact, auditable selection back
+        # without trusting client-provided timestamps or text.
+        _ensure_candidate_ids(scored)
+        duration = float(imported.get("duration") or 0.0)
+        if stop_after_structure:
+            interim_plan = {
+                "vod_url": vod_url,
+                "genre": genre,
+                "criteria_prompt": criteria_prompt,
+                "llm_provider": llm_provider,
+                "transcription_source": transcription_source,
+                "target_seconds": target_seconds,
+                "use_timestamp_comments": use_timestamp_comments,
+                "use_chat_score": use_chat_score,
+                "source_video_path": str(source.resolve()),
+                "source_duration_seconds": duration,
+                "candidates": scored,
+                "chapters": chapters,
+                "recommended_segment_ids": [],
+                "selected_segment_ids": [],
+                "clips": [],
+            }
+            return {
+                "job_id": job_id,
+                "vod_url": vod_url,
+                "transcription_source": transcription_source,
+                "script_segments": raw_segments,
+                "chapters": chapters,
+                "analysis_plan": {**interim_plan, "script_segments": raw_segments},
+                "awaiting_scoring": True,
+            }
+        try:
+            selected, selection_reviews = _select_coherent_clips(
+                scored,
+                target_seconds,
+                analysis_service,
+                criteria_prompt=criteria_prompt,
+                cancel_callback=cancel_callback,
+                progress_callback=lambda done, total: report(
+                    90 + int(8 * done / max(1, total)),
+                    f"핵심 지점의 최소 필수 원인·결과를 연결하는 중입니다. ({done}/{total})",
+                ),
+            )
+        except LLMAnalysisError as exc:
+            raise LiveEditPaused(
+                f"LLM 요약 구간 관계 분석을 완료하지 못했습니다: {exc}"
+            ) from exc
+        recommended_segment_ids = [str(item["segment_id"]) for item in selected]
+        clips = selected
+        if not clips:
+            if criteria_prompt in SHORT_FORM_PROFILES:
+                raise LiveEditPipelineError("앞뒤 문맥을 보존하면서 3분 안에 넣을 수 있는 장면이 없습니다. 구간을 검토해 주세요.")
+            raise LiveEditPipelineError("편집할 하이라이트 구간을 선택하지 못했습니다.")
+        render_segments = raw_segments
+        filler_metadata = {}
+        if not defer_render:
+            clips, render_segments, filler_metadata = self._prepare_filler_render(
+                job_id, raw_segments, clips, criteria_prompt, llm_provider, server_access_token,
+                lambda _, message: report(94, message), cancel_callback,
+            )
+
+        report(94, f"최종 하이라이트 {len(clips):,}개 구간을 선택했습니다.")
+        plan = {
+            "vod_url": vod_url,
+            "genre": genre,
+            "criteria_prompt": criteria_prompt,
+            "llm_provider": llm_provider,
+            "transcription_source": transcription_source,
+            "target_seconds": target_seconds,
+            "use_timestamp_comments": use_timestamp_comments,
+            "use_chat_score": use_chat_score,
+            "source_video_path": str(source.resolve()),
+            "rendered_filename": "edited.mp4",
+            "source_duration_seconds": duration,
+            "candidates": scored,
+            "chapters": chapters,
+            "recommended_segment_ids": recommended_segment_ids,
+            "selected_segment_ids": recommended_segment_ids,
+            "clips": clips,
+            "selection_reviews": selection_reviews,
+            **filler_metadata,
+        }
+        _write_json_atomic(
+            output_dir / f"{job_id}.analysis-plan.json",
+            {**plan, "script_segments": raw_segments},
+        )
+
+        base_result = {
+            "recipe_available": criteria_prompt == "cooking_food",
+            "job_id": job_id,
+            "vod_url": vod_url,
+            "vod_video_id": imported.get("job_id"),
+            "genre": genre,
+            "criteria_prompt": criteria_prompt,
+            "llm_provider": llm_provider,
+            "source_video_path": str(source),
+            "transcription_source": transcription_source,
+            "subtitles_burned_in": False,
+            "rendered_video_path": None,
+            "target_seconds": target_seconds,
+            "selected_duration_seconds": round(
+                sum(item["end"] - item["start"] for item in clips), 3
+            ),
+            # 분석 자료는 작업 폴더와 활성 작업 응답에 보관한다. 선택 렌더링 뒤
+            # SQLite에는 LocalJobStore가 최소 완료 계획만 남긴다.
+            "analysis_plan": {**plan, "script_segments": raw_segments},
+            "recommended_segment_ids": recommended_segment_ids,
+            "clips": clips,
+            "awaiting_selection": defer_render,
+        }
+        if defer_render:
+            report(100, "AI 분석이 완료되었습니다. 웹에서 원하는 구간을 선택하세요.")
+            return base_result
+
+        rendered = output_dir / f"{job_id}.edited.mp4"
+        render_id = uuid4().hex
+        pending_output = output_dir / f"{job_id}.edited.{render_id}.pending.mp4"
+        subtitles = output_dir / f"{job_id}.render-input.{render_id}.srt"
+        subtitle_count = write_selected_subtitles(render_segments, clips, subtitles)
+        rendering_backend = render_final(
+            source,
+            clips,
+            pending_output,
+            subtitles,
+            status_callback=lambda message: report(90, message),
+            cancel_callback=cancel_callback,
+        )
+        _copy_file_atomic(pending_output, rendered)
+        report(100, f"AI 영상 편집이 완료되었습니다. 최종 렌더링: {rendering_backend}")
+        return {
+            **base_result,
+            "subtitles_burned_in": subtitle_count > 0,
+            "rendered_filename": rendered.name,
+            "rendered_video_path": str(rendered.resolve()),
+            "awaiting_selection": False,
+        }
+
+    def get_segment_review(self, job_id: str, plan: dict[str, Any]) -> dict[str, Any]:
+        """Return browser-safe candidates and the current user selection."""
+
+        candidates = plan.get("candidates") or []
+        if not candidates:
+            raise LiveEditPipelineError("검토할 AI 후보 구간 파일을 찾을 수 없습니다.")
+        _ensure_candidate_ids(candidates)
+
+        selected_ids = [str(value) for value in plan.get("selected_segment_ids") or []]
+        recommended_ids = [
+            str(value) for value in plan.get("recommended_segment_ids") or selected_ids
+        ]
+        selected_set = set(selected_ids)
+        candidate_by_id = {str(item["segment_id"]): item for item in candidates}
+        chapters = []
+        for chapter in plan.get("chapters") or []:
+            sections = []
+            for section in chapter.get("sections") or []:
+                candidate = candidate_by_id.get(str(section.get("section_id")))
+                if not candidate:
+                    continue
+                review_section = {
+                    **section,
+                    "text": candidate.get("text", ""),
+                    "selected": str(candidate["segment_id"]) in selected_set,
+                }
+                for score_field in (
+                    "final_score",
+                    "llm_score",
+                    "heatmap_score",
+                    "volume_score",
+                    "chat_score",
+                    "comment_score",
+                ):
+                    if isinstance(
+                        candidate.get(score_field), (int, float)
+                    ) and not isinstance(candidate.get(score_field), bool):
+                        review_section[score_field] = candidate[score_field]
+                sections.append(review_section)
+            chapters.append({**chapter, "sections": sections})
+        clips = plan.get("clips") or []
+        return {
+            "job_id": job_id,
+            "genre": plan.get("genre", "ai_news"),
+            "target_seconds": int(plan.get("target_seconds") or 0),
+            "selected_segment_ids": selected_ids,
+            "recommended_segment_ids": recommended_ids,
+            "chapters": chapters,
+            "selected_duration_seconds": round(
+                sum(float(item["end"]) - float(item["start"]) for item in clips),
+                3,
+            ),
+            "revision": int(plan.get("revision") or 0),
+            "source_video_url": f"/api/youtube/edit/{job_id}/media/source",
+            "rendered_video_url": f"/api/youtube/edit/{job_id}/media/rendered",
+        }
+
+    def rerender_from_selection(
+        self,
+        job_id: str,
+        segment_ids: list[str],
+        *,
+        plan: dict[str, Any],
+        server_access_token: str | None = None,
+        progress_callback: Callable[[int, str], None] | None = None,
+        cancel_callback: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        """Render an existing analysis again from user-selected candidates."""
+
+        def report(progress: int, message: str) -> None:
+            if progress_callback:
+                progress_callback(progress, message)
+
+        if not job_id or Path(job_id).name != job_id:
+            raise LiveEditPipelineError("잘못된 편집 작업 ID입니다.")
+        output_dir = self.media_root / "yt-edit" / job_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        candidates = plan.get("candidates") or []
+        if not candidates:
+            raise LiveEditPipelineError(
+                "이 작업에는 선택 가능한 후보 구간이 없습니다. AI 분석을 다시 실행하세요."
+            )
+
+        _ensure_candidate_ids(candidates)
+        requested_ids = list(dict.fromkeys(str(value) for value in segment_ids))
+        if not requested_ids:
+            raise LiveEditPipelineError("한 개 이상의 구간을 선택하세요.")
+        by_id = {str(item.get("segment_id")): item for item in candidates}
+        unknown = [value for value in requested_ids if value not in by_id]
+        if unknown:
+            raise LiveEditPipelineError("존재하지 않는 후보 구간이 포함되어 있습니다.")
+
+        source = Path(str(plan.get("source_video_path", "")))
+        if not source.is_absolute():
+            source = (Path.cwd() / source).resolve()
+        if not source.exists():
+            raise LiveEditPipelineError("다시 편집할 원본 영상을 찾을 수 없습니다.")
+
+        report(0, "선택한 구간을 시간순으로 정리하는 중입니다.")
+        selected = sorted(
+            (by_id[value] for value in requested_ids),
+            key=lambda item: float(item["start"]),
+        )
+        canonical_ids = [str(item["segment_id"]) for item in selected]
+        if plan.get("criteria_prompt") in SHORT_FORM_PROFILES and sum(
+            float(item["end"]) - float(item["start"]) for item in selected
+        ) > SHORT_FORM_MAX_SECONDS:
+            raise LiveEditPipelineError("예능·게임은 최대 3분입니다. 선택 구간을 180초 이하로 줄여 주세요.")
+        clips = selected
+        if not clips:
+            raise LiveEditPipelineError(
+                "선택한 구간에서 유효한 편집 범위를 만들지 못했습니다."
+            )
+
+        raw_segments = plan.get("script_segments")
+        if not isinstance(raw_segments, list):
+            raise LiveEditPipelineError("메모리의 원본 스크립트를 찾을 수 없습니다.")
+
+        clips, render_segments, filler_metadata = self._prepare_filler_render(
+            job_id, raw_segments, clips, plan.get("criteria_prompt"),
+            plan.get("llm_provider", "deepseek"), server_access_token, report, cancel_callback,
+        )
+
+        report(0, "선택한 구간에 맞춰 자막 시간축을 다시 만드는 중입니다.")
+        revision = int(plan.get("revision") or 0) + 1
+        output = output_dir / f"{job_id}.edited.mp4"
+        render_id = uuid4().hex
+        pending_output = output_dir / f"{job_id}.edited.{render_id}.pending.mp4"
+        report(
+            0, f"사용자가 선택한 {len(canonical_ids):,}개 구간을 렌더링하는 중입니다."
+        )
+
+        def report_render_progress(fraction: float) -> None:
+            percent = max(0, min(98, int(round(float(fraction) * 98))))
+            report(percent, f"영상 렌더링 진행률 {percent}%")
+
+        def report_render_status(message: str) -> None:
+            report(0, message)
+
+        pending_subtitles = output_dir / f"{job_id}.render-input.{render_id}.srt"
+        subtitle_count = write_selected_subtitles(
+            render_segments, clips, pending_subtitles
+        )
+        rendering_backend = render_final(
+            source,
+            clips,
+            pending_output,
+            pending_subtitles,
+            progress_callback=report_render_progress,
+            status_callback=report_render_status,
+            cancel_callback=cancel_callback,
+        )
+
+        report(99, "렌더링 결과 파일을 마무리하는 중입니다.")
+        _copy_file_atomic(pending_output, output)
+        plan.update(
+            {
+                "clips": clips,
+                "selected_segment_ids": canonical_ids,
+                "subtitle_count": subtitle_count,
+                **filler_metadata,
+                "revision": revision,
+                "rendered_filename": output.name,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        _write_json_atomic(output_dir / f"{job_id}.analysis-plan.json", plan)
+        report(
+            100,
+            f"선택한 구간으로 영상을 다시 만들었습니다. 최종 렌더링: {rendering_backend}",
+        )
+        return {
+            **self.get_segment_review(job_id, plan),
+            "rendered_video_path": str(output.resolve()),
+            "recipe_available": plan.get("criteria_prompt") == "cooking_food" and (output_dir / "recipes.json").is_file(),
+            "rendered_filename": output.name,
+            "message": "선택한 구간으로 영상을 다시 생성했습니다.",
+            "clips": clips,
+            **filler_metadata,
+        }

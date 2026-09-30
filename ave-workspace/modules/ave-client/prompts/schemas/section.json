@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sections"
+  ],
+  "properties": {
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "start_id",
+          "end_id"
+        ],
+        "properties": {
+          "start_id": {
+            "type": "integer"
+          },
+          "end_id": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  }
+}
