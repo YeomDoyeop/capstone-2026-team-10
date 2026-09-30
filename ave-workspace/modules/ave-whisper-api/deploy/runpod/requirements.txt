@@ -1,0 +1,4 @@
+whisperx==3.8.6
+transformers==4.57.6
+requests==2.32.5
+runpod==1.8.1
