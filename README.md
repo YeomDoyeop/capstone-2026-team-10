@@ -160,7 +160,7 @@ OpusClip, Vizard 등 기존 서비스는 숏폼 클립 제작을 중심으로 �
 
 ### 6.1. 프로젝트 소개 자료
 
-> 프로젝트 소개 PPT 또는 PDF 링크 : [졸업과제 발표자료.pptx](./졸업과제_발표자료.pptx)
+> 프로젝트 소개 PPT 또는 PDF 링크 : [capstone-2026-team10_발표자료.pptx](./capstone-2026-team10_발표자료.pptx)
 
 
 ### 6.2. 시연 영상
