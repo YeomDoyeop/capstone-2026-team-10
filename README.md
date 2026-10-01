@@ -1,237 +1,213 @@
-# Template for Capstone
-이 레파지토리는 학생들이 캡스톤 프로젝트 결과물을 위한 레파지토리 생성시에 참고할 내용들을 담고 있습니다.
-1. 레파지토리 생성
-2. 레파지토리 구성
-3. 레파지토리 제출 
-4. README.md 가이드라인
-5. README.md 작성팁
+# 풀 버전 라이브 스트리밍 영상을 롱폼 영상으로 요약해주는 서비스
 
----
+장시간의 YouTube 영상에서 핵심 구간을 추천하고, 사용자의 선택을 반영하여 자막이 포함된 롱폼 편집 영상을 제작하는 서비스입니다.
 
-## 1. 레파지토리 생성
-- [https://classroom.github.com/a/i3v_IYnd]
-- 위 Github Classroom 링크에 접속해 본인 조의 github 레파지토리를 생성하세요.
+## 1. 프로젝트 배경
 
-<img width="1171" height="592" alt="image" src="https://github.com/user-attachments/assets/22919da2-dee5-4ca8-98f1-3dd63d7a6013" />
+### 1.1. 국내외 시장 현황 및 문제점
 
+1인 미디어와 라이브 스트리밍 시장이 성장하면서 장시간 방송 영상의 편집 수요가 증가하고 있습니다. 그러나 주요 장면을 직접 탐색하고 편집하는 과정에는 많은 시간과 비용이 필요합니다.
 
-- 레포지토리 생성 시 팀명은 `TEAM-{조 번호}` 형식으로 생성하세요.
-- 예를 들어, 2026년도 3조의 팀명은 `TEAM-03` 입니다.
-- 이 경우 `Capstone2026-team-03`이란 이름으로 레파지토리가 생성됩니다.
+OpusClip, Vizard 등 기존 서비스는 숏폼 클립 제작을 중심으로 활용되어, 방송의 흐름을 유지하는 롱폼 요약 영상 제작에는 추가 편집이 필요할 수 있습니다.
 
----
+### 1.2. 필요성과 기대효과
 
-## 2. 레파지토리 구성
-- 레파지토리 내에 README.md 파일 생성하고 아래의 가이드라인과 작성팁을 참고하여 README.md 파일을 작성하세요. (이 레파지토리의 SAMPLE_README.md 참조)
-- 레파지토리 내에 docs 디렉토리를 생성하고 docs 디렉토리 내에는 과제 수행 하면서 작성한 각종 보고서, 발표자료를 올려둡니다. (이 레파지토리의 docs 디렉토리 참조)
-- 그 밖에 레파지토리의 폴더 구성은 과제 결과물에 따라 자유롭게 구성하되 가급적 코드의 목적이나 기능에 따라 디렉토리를 나누어 구성하세요.
+- 주요 구간 탐색과 영상 편집에 필요한 시간 절감
+- 개인 창작자 및 소규모 제작자의 편집 부담 완화
+- 시청자가 방송의 핵심 내용을 빠르게 파악하도록 지원
+- 기존 라이브 스트리밍 콘텐츠의 재활용 효율 향상
 
----
+## 2. 개발 목표
 
-## 3. 레파지토리 제출 
+### 2.1. 목표 및 세부 내용
 
-- **`[주의]` 레파지토리 제출**은 해당 레파지토리의 ownership을 **학과 계정**으로 넘기는 것이므로 되돌릴 수 없습니다.
-- **레파지토리 제출** 전, 더 이상 수정 사항이 없는지 다시 한번 확인하세요.
-- github 레파지토리에서 Settings > General > Danger zone > Transfer 클릭
-  <img src="https://github.com/user-attachments/assets/cb2361d4-e07e-4b5d-9116-aa80dddd8a8b" alt="소유주 변경 경로" width="500" />
-  
-- [ Specify an organization or username ]에 'PNUCSE'를 입력하고 확인 메세지를 입력하세요.
-  <img src="https://github.com/user-attachments/assets/7c63955d-dcfe-4ac3-bdb6-7d2620575f3a" alt="소유주 변경" width="400" />
+종료된 라이브 스트리밍 영상과 일반 YouTube 영상을 분석하여, 사용자가 설정한 목표 길이를 기준으로 롱폼 편집본을 제작합니다.
 
----
+주요 기능은 다음과 같습니다.
 
-## 4. README.md 가이드 라인
-- README 파일 작성시에 아래의 5가지 항목의 내용은 필수적으로 포함해야 합니다.
-- 아래의 항목이외에 프로젝트의 이해를 돕기 위한 내용을 추가해도 됩니다.
-- SAMPLE_README.md 이 단순한 형태의 예제이니 참고하세요.
+- 영상 및 분석용 부가 자료 수집
+- 자막 활용 및 음성 전사
+- AI 기반 챕터·섹션 분할 및 중요도 분석
+- 주요 구간과 문맥 연결 구간 추천
+- 사용자 선택에 따른 편집 구간 수정
+- 자막 합성 및 최종 영상 렌더링
 
-```markdown
-### 1. 프로젝트 배경
-#### 1.1. 국내외 시장 현황 및 문제점
-> 시장 조사 및 기존 문제점 서술
+### 2.2. 기존 서비스 대비 차별성
 
-#### 1.2. 필요성과 기대효과
-> 왜 이 프로젝트가 필요한지, 기대되는 효과 등
+| 구분 | 본 프로젝트의 특징 |
+|---|---|
+| 결과물 | 여러 핵심 구간을 연결한 하나의 롱폼 편집본 제작 |
+| 분석 자료 | 스크립트, 댓글, 채팅, 음량, 히트맵 활용 |
+| 문맥 유지 | 핵심 장면 이해에 필요한 연결 구간 추가 |
+| 사용자 참여 | AI 추천 결과를 직접 검토하고 수정 |
+| 처리 구조 | 사용자 PC에서 영상 다운로드 및 렌더링 수행 |
 
-### 2. 개발 목표
-#### 2.1. 목표 및 세부 내용
-> 전체적인 개발 목표, 주요 기능 및 기획 내용
+### 2.3. 사회적 가치 도입 계획
 
-#### 2.2. 기존 서비스 대비 차별성 
-> 유사 서비스 비교 및 차별점 부각
+편집 인력과 비용이 부족한 소규모 창작자의 콘텐츠 제작을 지원합니다.
 
-#### 2.3. 사회적 가치 도입 계획 
-> 프로젝트의 공공성, 지속 가능성, 환경 보호 등
-### 3. 시스템 설계
-#### 3.1. 시스템 구성도
-> 이미지 혹은 텍스트로 시스템 아키텍쳐 작성
->
-#### 3.2. 사용 기술
-> 프론트엔드, 백엔드, API 등 구체 기술 스택
+원본 영상과 결과물을 사용자 PC에 보관하여 중앙 서버의 저장 및 전송 부담을 줄입니다. 또한 필요한 경우에만 원격 GPU를 활용하여 자원 사용의 효율성을 높입니다. 환경적 효과는 향후 실제 자원 사용량을 측정하여 확인할 계획입니다.
 
-### 4. 개발 결과
-#### 4.1. 전체 시스템 흐름도
-> 기능 흐름 설명 및 도식화 가능
->
-#### 4.2. 기능 설명 및 주요 기능 명세서
-> 주요 기능에 대한 상세 설명, 각 기능의 입력/출력 및 설명
->
-#### 4.3. 디렉토리 구조
->
-#### 4.4. 산업체 멘토링 의견 및 반영 사항
-> 멘토 피드백과 적용한 사례 정리
+## 3. 시스템 설계
 
-### 5. 설치 및 실행 방법
->
-#### 5.1. 설치절차 및 실행 방법
-> 설치 명령어 및 준비 사항, 실행 명령어, 포트 정보 등
-#### 5.2. 오류 발생 시 해결 방법
-> 선택 사항, 자주 발생하는 오류 및 해결책 등
+### 3.1. 시스템 구성도
 
-### 6. 소개 자료 및 시연 영상
-#### 6.1. 프로젝트 소개 자료
-> PPT 등
-#### 6.2. 시연 영상
-> 영상 링크 또는 주요 장면 설명
+| 구성 요소 | 주요 역할 |
+|---|---|
+| 웹 브라우저 | 영상 입력, 분석 설정, 추천 결과 확인 및 편집 |
+| 사용자 PC | 영상 수집, 점수 계산, 렌더링 및 로컬 저장 |
+| Azure 중앙 서버 | 인증, 외부 AI 요청 중계 및 작업 이력 관리 |
+| RunPod | WhisperX 기반 음성 전사 및 시간 정렬 |
+| YouTube | 원본 영상 및 부가 자료 제공 |
+| Gemini·DeepSeek | 스크립트 분석 및 문맥 연결 구간 판단 |
+| Supabase | 사용자 인증 및 완료 작업 이력 저장 |
 
-### 7. 팀 구성
-#### 7.1. 팀원별 소개 및 역할 분담
->
-#### 7.2. 팀원 별 참여 후기
-> 개별적으로 느낀 점, 협업, 기술적 어려움 극복 사례 등
+### 3.2. 사용 기술
 
-### 8. 참고 문헌 및 출처
+| 분야 | 기술 |
+|---|---|
+| 프론트엔드 | React |
+| 백엔드 | Python, FastAPI |
+| 통신 | REST API, SSE |
+| 영상 수집 | yt-dlp |
+| 영상 처리 | FFmpeg, FFprobe |
+| AI 분석 | Gemini API, DeepSeek API |
+| 음성 전사 | WhisperX |
+| 인증 | Google 로그인, Supabase Auth |
+| 데이터베이스 | Supabase, SQLite |
+| 서버 및 배포 | Azure VM, RunPod, Docker Compose, Caddy, PyInstaller |
 
-```
+## 4. 개발 결과
 
-## 5. README.md 작성팁 
-* 마크다운 언어를 이용해 README.md 파일을 작성할 때 참고할 수 있는 마크다운 언어 문법을 공유합니다.  
-* 다양한 예제와 보다 자세한 문법은 [이 문서](https://www.markdownguide.org/basic-syntax/)를 참고하세요.
+### 4.1. 전체 시스템 흐름도
 
-### 5.1. 헤더 Header
-```
-# This is a Header 1
-## This is a Header 2
-### This is a Header 3
-#### This is a Header 4
-##### This is a Header 5
-###### This is a Header 6
-####### This is a Header 7 은 지원되지 않습니다.
-```
-<br />
+1. Google 계정 로그인
+2. YouTube URL 입력 및 분석 자료 선택
+3. 영상과 부가 자료 수집
+4. 자막 선택 또는 WhisperX 음성 전사
+5. AI 기반 챕터·섹션 구성 및 중요도 평가
+6. 구간별 종합 점수 계산
+7. 주요 구간 및 문맥 연결 구간 추천
+8. 사용자 선택 수정 및 확정
+9. 자막 합성, 영상 렌더링 및 결과 저장
 
-### 5.2. 인용문 BlockQuote
-```
-> This is a first blockqute.
->	> This is a second blockqute.
->	>	> This is a third blockqute.
-```
-> This is a first blockqute.
->	> This is a second blockqute.
->	>	> This is a third blockqute.
-<br />
+### 4.2. 기능 설명 및 주요 기능 명세서
 
-### 5.3. 목록 List
-* **Ordered List**
-```
-1. first
-2. second
-3. third  
-```
-1. first
-2. second
-3. third
-<br />
+| 기능 | 입력 | 출력 및 설명 |
+|---|---|---|
+| 영상·자료 수집 | YouTube URL, 수집 항목 | 원본 영상, 메타데이터, 자막, 댓글, 채팅 등 |
+| 스크립트 생성 | 자막 또는 영상 음성 | 시간 정보가 포함된 스크립트 |
+| AI 내용 분석 | 스크립트, 판단 기준 | 챕터·섹션 구성 및 중요도 점수 |
+| 주요 구간 추천 | 분석 점수, 목표 길이 | 주요 장면 및 문맥 연결 구간 |
+| 사용자 편집 | 추천 결과, 사용자 선택 | 최종 포함 구간 |
+| 영상 렌더링 | 확정 구간, 스크립트 | 자막이 합성된 롱폼 편집 영상 |
 
-* **Unordered List**
-```
-* 하나
-  * 둘
+**지원 범위**
 
-+ 하나
-  + 둘
+- 일반 YouTube 영상 및 종료된 라이브 스트리밍 다시보기
+- 진행 중인 실시간 방송은 지원하지 않음
+- 목표 길이: 1분부터 최대 120분까지 설정 가능
+- 목표 길이는 원본 영상 길이를 초과할 수 없음
+- 문맥 연결 구간과 사용자 선택에 따라 실제 결과 길이는 달라질 수 있음
 
-- 하나
-  - 둘
-```
-* 하나
-  * 둘
+### 4.3. 디렉토리 구조
 
-+ 하나
-  + 둘
+| 경로 | 설명 |
+|---|---|
+| `ave-workspace/setup.bat` | 개발 저장소 구성 스크립트 |
+| `ave-workspace/modules/ave-client` | 사용자 인터페이스 및 로컬 영상 처리 |
+| `ave-workspace/modules/ave-server` | 인증, AI 요청 중계 및 작업 이력 관리 |
+| `ave-workspace/modules/ave-whisper-api` | 원격 음성 전사 및 시간 정렬 |
+| `ave-workspace/modules/ave-dist` | Windows 배포본 및 외부 도구 업데이터 제작 |
 
-- 하나
-  - 둘
-<br />
+### 4.4. 산업체 멘토링 의견 및 반영 사항
 
-### 5.4. 코드 CodeBlock
-* 코드 블럭 이용 '``'
-```
-여러줄 주석 "```" 이용
-"```
-#include <stdio.h>
-int main(void){
-  printf("Hello world!");
-  return 0;
-}
-```"
+> 추가 작성 필요: 원문에 산업체 멘토링 기록이 없습니다.
 
-단어 주석 "`" 이용
-"`Hello world`"
+| 멘토링 의견 | 반영 사항 |
+|---|---|
+| 1. 독자적인 모델 구축 방안 검토, 2. 하이라이트 추출 테스트 및 도메인 별 검증 방안, 3. 수동 편집 기능 추가 제안, 4. 서비스 타켓 명확화 및 저작권 대첵 수립 필요 | 영상의 장르 별 프롬프트 차별화 도입, 편집 후 반영할 스크립트 수정 가능 |
 
-* 큰 따움표(") 없이 사용하세요.
-``` 
-<br />
+## 5. 설치 및 실행 방법
 
-### 5.5. 링크 Link
-```
-[Title](link)
-[부산대학교 정보컴퓨터공학부](https://cse.pusan.ac.kr/cse/index..do)
+### 5.1. 설치절차 및 실행 방법
 
-<link>
-<https://cse.pusan.ac.kr/cse/index..do>
-``` 
-[부산대학교 정보컴퓨터공학부](https://cse.pusan.ac.kr/cse/index..do)
+#### 사용자 실행
 
-<https://cse.pusan.ac.kr/cse/index..do>
-<br />
+1. Windows용 포터블 ZIP 배포본을 다운로드합니다.
+2. 압축을 해제하고 클라이언트 실행 파일을 실행합니다.
+3. 브라우저 화면에서 Google 계정으로 로그인합니다.
+4. YouTube URL을 입력하고 분석 및 편집을 진행합니다.
 
-### 5.6. 강조 Highlighting
-```
-*single asterisks*
-_single underscores_
-**double asterisks**
-__double underscores__
-~~cancelline~~
-```
-*single asterisks* <br />
-_single underscores_ <br />
-**double asterisks** <br />
-__double underscores__ <br />
-~~cancelline~~  <br />
-<br />
+#### 개발 환경 구성
 
-### 5.7. 이미지 Image
-```
-<img src="image URL" width="600px" title="Title" alt="Alt text"></img>
-![Alt text](image URL "Optional title")
-```
-- 웹에서 작성한다면 README.md 내용 안으로 이미지를 드래그 앤 드롭하면 이미지가 생성됩니다.
-- 웹이 아닌 로컬에서 작성한다면, github issue에 이미지를 드래그 앤 드롭하여 image url 을 얻을 수 있습니다. (URL만 복사하고 issue는 제출 안 함.)
-  <img src="https://github.com/user-attachments/assets/0fe3bff1-7a2b-4df3-b230-cac4ef5f6d0b" alt="이슈에 image 올림" width="600" />
-  <img src="https://github.com/user-attachments/assets/251c6d42-b36b-4ad4-9cfa-fa2cc67a9a50" alt="image url 복사" width="600" />
+워크스페이스 루트에서 다음 명령을 실행하여 저장소를 구성합니다.
 
+    .\setup.bat
 
-### 5.8. 유튜브 영상 추가
-```markdown
-[![영상 이름](유튜브 영상 썸네일 URL)](유튜브 영상 URL)
-[![부산대학교 정보컴퓨터공학부 소개](http://img.youtube.com/vi/zh_gQ_lmLqE/0.jpg)](https://www.youtube.com/watch?v=zh_gQ_lmLqE)    
-```
-[![부산대학교 정보컴퓨터공학부 소개](http://img.youtube.com/vi/zh_gQ_lmLqE/0.jpg)](https://www.youtube.com/watch?v=zh_gQ_lmLqE)    
+이 스크립트는 저장소 구성만 수행합니다. 각 모듈의 의존성 설치와 환경 설정은 별도로 필요합니다.
 
-- 이때 유튜브 영상 썸네일 URL은 유투브 영상 URL로부터 다음과 같이 얻을 수 있습니다.
+> 추가 작성 필요: 배포본 링크, 실행 파일명, 모듈별 설치·실행 명령어, 환경변수 및 포트 정보
 
-- `Youtube URL`: https://www.youtube.com/watch?v={동영상 ID}
-- `Youtube Thumbnail URL`: http://img.youtube.com/vi/{동영상 ID}/0.jpg 
-- 예를 들어, https://www.youtube.com/watch?v=zh_gQ_lmLqE 라고 하면 썸네일의 주소는 http://img.youtube.com/vi/zh_gQ_lmLqE/0.jpg 이다.
+### 5.2. 오류 발생 시 해결 방법
+
+| 상황 | 확인 및 대응 |
+|---|---|
+| 영상 수집 실패 | URL과 영상 공개 상태 확인, yt-dlp 갱신 |
+| 자막·캡션 부재 | WhisperX 음성 전사 선택 |
+| 일부 분석 자료 부재 | 확보된 자료만으로 분석 진행 |
+| 완료 이력 동기화 실패 | 로컬 결과 영상 확인 및 서버 연결 상태 점검 |
+
+## 6. 소개 자료 및 시연 영상
+
+### 6.1. 프로젝트 소개 자료
+
+> 추가 작성 필요: 프로젝트 소개 PPT 또는 PDF 링크
+
+소개 자료에는 프로젝트 배경, 시스템 구성, 주요 기능 및 사용자 화면을 포함합니다.
+
+### 6.2. 시연 영상
+
+> 시연 영상 링크: [![2026 전기 졸업과제 10 아무거나] (http://img.youtube.com/vi/EX_gG5MmzW8/0.jpg)] (https://www.youtube.com/watch?v=EX_gG5MmzW8)
+
+주요 시연 내용:
+
+- 영상 URL 입력 및 자료 수집
+- AI 분석 및 주요 구간 추천
+- 사용자 편집 구간 수정
+- 최종 영상 렌더링 및 결과 확인
+
+## 7. 팀 구성
+
+### 7.1. 팀원별 소개 및 역할 분담
+
+| 이름 | 학번 | 역할 |
+|---|---|---|
+| 김영빈 | 201724429 | UI/UX 화면 설계, Whisper STT 모델 연동 및 대사 추출, 요약 영상 결과 조회 대시보드,클라우드 환경 서버 배포 |
+| 손재우 | 202155567 |  OpenCV/MoviePy 영상 컷 및 병합, FastAPI 서버 및 AI 파이프라인 연동, 청크 분할 및 비동기 처리, 영상 처리 속도 최적화 |
+| 염도엽 | 202155573 | LLM 문맥 요약 프롬프팅, 모델 디버깅 및 영상 길이 조절 파라미터 수정, DB 연동 |
+
+- **지도교수:** 전상률 교수
+
+### 7.2. 팀원 별 참여 후기
+
+#### 김영빈
+
+> 
+
+#### 손재우
+
+> 
+
+#### 염도엽
+
+> 재밌는 아이디어지만 과정에 정확성이나 의도와 다른 부분이 많아서 어려웠지만 계속된 수정으로 괜찮은 결과가 나와서 좋았다.
+
+## 8. 참고 문헌 및 출처
+
+1. 송정은, 「유튜버 1인당 연 수입 7천만, 4년 만에 25%↑…상위 1%는 13억」, [연합뉴스](https://www.yna.co.kr/view/AKR20260215024600002), 2026.02.16.
+2. 강석영, 「[편집에 2~3일 걸리는데] 10분 영상 단가, 분당 고작 1만원」, [매일노동뉴스](https://www.labortoday.co.kr/news/articleView.html?idxno=218669), 2023.12.06.
+3. [OpusClip — How OpusClip Works](https://www.opus.pro/how-does-opus-clip-work)
+4. [Vizard — AI Video Editing and Clipping Tool](https://vizard.ai/)
+5. [Descript — Generate Short Clips From Any Video with AI](https://www.descript.com/clips)
 
