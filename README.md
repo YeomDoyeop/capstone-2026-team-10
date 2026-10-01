@@ -160,12 +160,12 @@ OpusClip, Vizard 등 기존 서비스는 숏폼 클립 제작을 중심으로 �
 
 ### 6.1. 프로젝트 소개 자료
 
-> 프로젝트 소개 PPT 또는 PDF 링크 : 
+> 프로젝트 소개 PPT 또는 PDF 링크 : [졸업과제 발표자료.pptx](./졸업과제_발표자료.pptx)
 
 
 ### 6.2. 시연 영상
 
-> 시연 영상 링크: [![2026 전기 졸업과제 10 아무거나] (http://img.youtube.com/vi/EX_gG5MmzW8/0.jpg)] (https://www.youtube.com/watch?v=EX_gG5MmzW8)
+> 시연 영상 링크: [![2026 전기 졸업과제 10 아무거나](https://img.youtube.com/vi/EX_gG5MmzW8/0.jpg)](https://www.youtube.com/watch?v=EX_gG5MmzW8)
 
 주요 시연 내용:
 
